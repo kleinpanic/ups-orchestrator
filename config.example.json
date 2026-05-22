@@ -16,8 +16,16 @@
           "host": "fileserver.lan",
           "user": "youruser",
           "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 50,
-          "runtime_below": 600
+          "battery_below": 50
+        },
+        {
+          "name": "bigserver-serial",
+          "kind": "serial",
+          "enabled": false,
+          "device": "/dev/ttyUSB0",
+          "baud": 115200,
+          "cmd": "sudo /sbin/shutdown -h now",
+          "battery_below": 50
         },
         {
           "name": "this-host",

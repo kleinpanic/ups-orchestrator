@@ -50,11 +50,16 @@ def make_deps(
         calls.append("local")
         return local_rc, "", "" if local_rc == 0 else "boom"
 
+    def _serial(target: ShutdownTarget) -> tuple[int, str, str]:
+        calls.append(target.name)
+        return 0, "", ""
+
     deps = Deps(
         notifier=notifier,
         read_snapshot=lambda _name: snapshot,
         ssh_shutdown=_ssh,
         local_shutdown=_local,
+        serial_shutdown=_serial,
         now=lambda: now,
         countdown_every=countdown_every,
     )

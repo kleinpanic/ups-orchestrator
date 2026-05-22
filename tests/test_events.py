@@ -111,6 +111,27 @@ def test_target_not_fired_above_threshold() -> None:
     assert calls == []
 
 
+def test_serial_target_fires() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB", charge=40), countdown_every=0)
+    serial = ShutdownTarget(
+        name="r630", kind="serial", enabled=True, device="/dev/ttyUSB0", battery_below=50
+    )
+    dispatch("tick", make_ups(targets=(serial,)), UpsState(onbatt_since=1), deps)
+    assert calls == ["r630"]
+
+
+def test_serial_counts_as_remote_for_local_last() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB", charge=8), countdown_every=0)
+    targets = (
+        ShutdownTarget(name="r630", kind="serial", enabled=True, device="/dev/x", battery_below=50),
+        _local("pi", battery_below=10),
+    )
+    dispatch("tick", make_ups(targets=targets), UpsState(onbatt_since=1), deps)
+    assert calls == ["r630", "local"]  # serial (remote) before local
+
+
 def test_local_fires_after_remote() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=8), countdown_every=0)

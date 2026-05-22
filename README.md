@@ -18,11 +18,16 @@ run against two USB-attached units, but nothing is hard-coded to a model).
   `deploy/upssched-cmd.sh` to `ups-orchestrator <event> $UPSNAME`, which posts a
   labelled embed per UPS.
 - **Unified shutdown targets, local last.** Each UPS lists any number of
-  `shutdown_targets` — `remote` machines (shut down over SSH) and/or the `local`
-  host — each firing when its battery `battery_below` (%) **or** `runtime_below`
-  (sec) threshold is crossed. The daemon always sequences `local` targets *after*
-  every enabled remote on that UPS, so the watcher host dies last. NUT's
-  `upsmon SHUTDOWNCMD` stays as a low-battery backstop. All targets off by default.
+  `shutdown_targets`, each firing when its battery `battery_below` (%) **or**
+  `runtime_below` (sec) threshold is crossed:
+  - `remote` — over SSH (`host` may be an `ssh_config` alias; omit `user`).
+  - `serial` — over a serial console (`device`+`baud`) to a passwordless/
+    auto-login getty. **Network-independent**, so it still works during an outage
+    when SSH can't reach the box — the right primary path for power loss.
+  - `local` — this host; always sequenced *after* every enabled remote/serial
+    target on the UPS, so the watcher host dies last.
+
+  NUT's `upsmon SHUTDOWNCMD` stays as a low-battery backstop. All targets off by default.
 - **Configurable poll loop, decoupled from webhooks.** A `systemd --user` service
   (`ups-orchestrator watch`) polls every `poll_seconds` to evaluate shutdown
   thresholds; the on-battery countdown posts on its own `countdown_every_seconds`

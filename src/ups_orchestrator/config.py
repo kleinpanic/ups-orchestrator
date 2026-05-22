@@ -46,23 +46,32 @@ def _opt_int(value: object) -> int | None:
 
 @dataclass(frozen=True)
 class ShutdownTarget:
-    """A machine to shut down when its UPS runs low on battery — either a
-    ``remote`` host (over SSH) or the ``local`` host this daemon runs on. A UPS
-    may list any number; all disabled by default.
+    """A machine to shut down when its UPS runs low on battery.
 
-    Triggers fire when **either** threshold is crossed: battery charge at or
-    below ``battery_below`` (%), or estimated runtime at or below
-    ``runtime_below`` (seconds). A target with neither set never auto-fires.
+    ``kind``:
+      * ``remote`` — over SSH (``host`` may be an ``ssh_config`` alias; omit
+        ``user`` to use just the alias, e.g. ``ssh mt``).
+      * ``serial`` — over a serial console (``device`` + ``baud``); the command
+        is written to a passwordless/auto-login getty. Network-independent, so it
+        still works during an outage when SSH can't reach the box.
+      * ``local`` — the host this daemon runs on.
+
+    A UPS may list any number; all disabled by default. Triggers fire when
+    **either** threshold is crossed: battery charge at or below ``battery_below``
+    (%), or estimated runtime at or below ``runtime_below`` (seconds). A target
+    with neither set never auto-fires.
 
     The orchestrator always sequences ``local`` targets **after** every enabled
-    ``remote`` target on the same UPS, so the watcher host dies last.
+    remote/serial target on the same UPS, so the watcher host dies last.
     """
 
     name: str
-    kind: str = "remote"  # "remote" | "local"
+    kind: str = "remote"  # "remote" | "serial" | "local"
     enabled: bool = False
     host: str = ""
     user: str = ""
+    device: str = ""  # serial: e.g. /dev/ttyUSB0
+    baud: int = 115200  # serial baud rate
     cmd: str = "sudo /sbin/shutdown -h now"
     battery_below: int | None = None
     runtime_below: int | None = None
@@ -70,6 +79,10 @@ class ShutdownTarget:
     @property
     def is_local(self) -> bool:
         return self.kind.lower() == "local"
+
+    @property
+    def is_serial(self) -> bool:
+        return self.kind.lower() == "serial"
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> ShutdownTarget:
@@ -79,6 +92,8 @@ class ShutdownTarget:
             enabled=bool(data.get("enabled", False)),
             host=str(data.get("host", "")),
             user=str(data.get("user", "")),
+            device=str(data.get("device", "")),
+            baud=_as_int(data.get("baud"), 115200),
             cmd=str(data.get("cmd", "sudo /sbin/shutdown -h now")),
             battery_below=_opt_int(data.get("battery_below")),
             runtime_below=_opt_int(data.get("runtime_below")),

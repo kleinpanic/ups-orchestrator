@@ -36,16 +36,18 @@ LOG = logging.getLogger("ups_orchestrator.events")
 # --- default side effects (overridable in tests) -----------------------------
 
 
+def ssh_dest(target: ShutdownTarget) -> str:
+    """SSH destination: ``user@host`` if a user is set, else just ``host``.
+
+    Leaving ``user`` empty lets ``host`` be an ``ssh_config`` Host alias (e.g.
+    ``mt``), so connection details (real hostname, port, key) live in
+    ``~/.ssh/config`` rather than the orchestrator config.
+    """
+    return f"{target.user}@{target.host}" if target.user else target.host
+
+
 def _default_ssh_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
-    cmd = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=10",
-        f"{target.user}@{target.host}",
-        target.cmd,
-    ]
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_dest(target), target.cmd]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
@@ -53,6 +55,28 @@ def _default_ssh_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
 def _default_local_shutdown(cmd: str) -> tuple[int, str, str]:
     proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=20, check=False)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
+    """Send ``cmd`` to a serial console (assumes a passwordless/auto-login getty).
+
+    Network-independent: works during an outage when SSH can't reach the box.
+    Fire-and-forget — we can't easily read the far end back, so success means the
+    bytes were written.
+    """
+    try:
+        subprocess.run(
+            ["stty", "-F", target.device, str(target.baud), "raw", "-echo"],
+            timeout=5,
+            check=False,
+        )
+        with open(target.device, "wb", buffering=0) as port:
+            port.write(b"\r")  # nudge the shell to a fresh prompt
+            time.sleep(0.5)
+            port.write((target.cmd + "\n").encode())
+        return 0, "", ""
+    except OSError as exc:
+        return 1, "", str(exc)
 
 
 @dataclass
@@ -63,6 +87,7 @@ class Deps:
     read_snapshot: Callable[[str], UpsSnapshot] = read_snapshot
     ssh_shutdown: Callable[[ShutdownTarget], tuple[int, str, str]] = _default_ssh_shutdown
     local_shutdown: Callable[[str], tuple[int, str, str]] = _default_local_shutdown
+    serial_shutdown: Callable[[ShutdownTarget], tuple[int, str, str]] = _default_serial_shutdown
     now: Callable[[], int] = field(default_factory=lambda: lambda: int(time.time()))
     countdown_every: int = 60  # seconds between on-battery countdown posts; 0 = off
 
@@ -212,10 +237,13 @@ def _target_should_fire(target: ShutdownTarget, snap: UpsSnapshot) -> bool:
 def _fire_target(ups: UpsConfig, state: UpsState, deps: Deps, target: ShutdownTarget) -> None:
     if target.is_local:
         rc, _out, err = deps.local_shutdown(target.cmd)
-        where = "this host"
+        where = "this host (local)"
+    elif target.is_serial:
+        rc, _out, err = deps.serial_shutdown(target)
+        where = f"serial {target.device}"
     else:
         rc, _out, err = deps.ssh_shutdown(target)
-        where = f"{target.user}@{target.host}"
+        where = f"{ssh_dest(target)} (ssh)"
     state.shutdowns_sent.append(target.name)
     if rc == 0:
         deps.notifier.send(
