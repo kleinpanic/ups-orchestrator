@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ups-orchestrator"
-version = "0.2.0"
+version = "0.4.0"
 description = "NUT-driven UPS power-event monitor that reports per-UPS status to Discord and shuts the host down on low battery."
 readme = "README.md"
 requires-python = ">=3.11"

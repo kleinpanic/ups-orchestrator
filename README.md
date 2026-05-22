@@ -1,13 +1,31 @@
-# ⚡ ups-orchestrator
+# ups-orchestrator ⚡
 
-NUT-driven UPS power-event monitor for a homelab. It turns
-[Network UPS Tools](https://networkupstools.org/) power events into **beautiful,
-per-UPS Discord embeds** — on-battery alerts, a runtime-remaining countdown,
-power-restored summaries, and low-battery warnings — while leaving the *actual*
-protective shutdown to NUT's own `upsmon`.
+**NUT-driven UPS power-event monitor with beautiful per-UPS Discord embeds**
 
-Works with any NUT-supported UPS, and monitors **any number** of them (built and
-run against two USB-attached units, but nothing is hard-coded to a model).
+<p align="center">
+  <em>Multi-UPS · NUT-event alerts · battery-threshold shutdown (serial / ssh / local) · zero runtime deps</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/kleinpanic/ups-orchestrator/actions/workflows/ci.yml"><img src="https://github.com/kleinpanic/ups-orchestrator/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776ab?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/runtime%20deps-0-3fb950" alt="Zero runtime deps">
+  <img src="https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white" alt="Ruff">
+  <img src="https://img.shields.io/badge/types-mypy%20strict-2a6db2" alt="mypy strict">
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
+</p>
+
+It turns [Network UPS Tools](https://networkupstools.org/) power events into
+**beautiful, per-UPS Discord embeds** — on-battery alerts, a runtime-remaining
+countdown, power-restored summaries, and low-battery warnings — while leaving
+the *actual* protective shutdown of the host to NUT's own `upsmon`, and
+optionally shutting down the machines a UPS powers (over **serial**, **SSH**, or
+**locally**) when its battery runs low.
+
+Works with any NUT-supported UPS, and monitors **any number** of them — nothing
+is hard-coded to a model.
+
+📖 **Full docs: the [project wiki](https://github.com/kleinpanic/ups-orchestrator/wiki).**
 
 ## Design
 
@@ -34,13 +52,48 @@ run against two USB-attached units, but nothing is hard-coded to a model).
   cadence (0 = off). Discord *alerts* stay NUT-event-driven — polling never gates
   them.
 
+```mermaid
+flowchart LR
+    PWR["⚡ Utility power"] -->|USB| UPS["🔋 UPS(es)"]
+    UPS --> HOST["Host · NUT server"]
+    HOST --> UPSD["upsd"] --> UPSMON["upsmon"]
+
+    UPSMON -->|low battery| SDC["SHUTDOWNCMD<br/>(protects this host)"]
+    UPSMON -->|"NUT events"| SCHED["upssched<br/>→ upssched-cmd.sh"]
+    SCHED --> ORCH["ups-orchestrator"]
+    WATCH["watch loop<br/>(poll every poll_seconds)"] -->|"battery thresholds"| ORCH
+
+    ORCH -->|"alerts + countdown"| DISCORD["🟦 Discord embeds"]
+    ORCH --> SER["serial → console"]
+    ORCH --> SSHX["ssh → host / alias"]
+    ORCH --> LOC["local · last"]
+
+    classDef nut fill:#0b3d2e,stroke:#34d399,color:#d1fae5;
+    classDef orch fill:#1e1b4b,stroke:#a5b4fc,color:#eef2ff;
+    classDef sink fill:#0c4a6e,stroke:#38bdf8,color:#e0f2fe;
+    class UPSD,UPSMON,SCHED,SDC nut
+    class ORCH,WATCH orch
+    class DISCORD,SER,SSHX,LOC sink
 ```
-utility power ──▶ UPS ──USB──▶ host (NUT server)
-                               │
-                  upsd ──▶ upsmon ──┬─▶ SHUTDOWNCMD            (NUT protects this host)
-                                    └─▶ upssched ─▶ upssched-cmd.sh
-                                                     └─▶ ups-orchestrator ─▶ 🟦 Discord
-                                                                          └─▶ SSH shutdown_targets
+
+Two paths run independently: Discord *alerts* come from **NUT events**
+(`upssched`), while battery-threshold *shutdowns* come from the **poll loop**
+(`watch`). Each shutdown target picks its own transport — serial console
+(network-independent, best during an outage), SSH (a host or `ssh_config`
+alias), or the local host. The shutdown order is fixed below:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as watch (poll)
+    participant U as UPS
+    participant R as serial / ssh targets
+    participant L as local host
+    Note over W,U: every poll_seconds while on battery
+    U-->>W: charge 50% (remote threshold)
+    W->>R: shut down remote / serial targets
+    U-->>W: charge 15% (local threshold)
+    W->>L: shut down local — only after every remote was sent
 ```
 
 ## Notifications
@@ -85,13 +138,14 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
     "ups1": {
       "label": "Rack UPS",
       "shutdown_targets": [
+        { "name": "bigserver", "kind": "serial", "enabled": false,
+          "device": "/dev/ttyUSB0", "baud": 115200,
+          "cmd": "sudo /sbin/shutdown -h now", "battery_below": 50 },
         { "name": "fileserver", "kind": "remote", "enabled": false,
-          "host": "fileserver.lan", "user": "youruser",
-          "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 50, "runtime_below": 600 },
+          "host": "mt", "cmd": "sudo /sbin/shutdown -h now",
+          "battery_below": 50 },
         { "name": "this-host", "kind": "local", "enabled": false,
-          "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 15, "runtime_below": 120 }
+          "cmd": "sudo /sbin/shutdown -h now", "battery_below": 15 }
       ]
     },
     "ups2": { "label": "Desk UPS", "shutdown_targets": [] }
@@ -99,9 +153,17 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
 }
 ```
 
-A target fires when **either** `battery_below` (charge %) or `runtime_below`
-(seconds) is crossed; omit both and it only fires on an explicit `remote_shutdown`.
-`local` targets need passwordless shutdown (set up by `deploy/install.sh`).
+Per target:
+- **`kind`** — `serial` (`device`+`baud`, to a passwordless/auto-login getty;
+  network-independent), `remote` (`host` is a hostname *or* `ssh_config` alias;
+  omit `user` for `ssh <alias>`), or `local`.
+- **Trigger** — fires when **either** `battery_below` (charge %) or
+  `runtime_below` (seconds) is crossed; omit both and it only fires on an
+  explicit `remote_shutdown`.
+- **Ordering** — `local` targets always run *after* every enabled serial/remote
+  target on the UPS, so the watcher host dies last.
+- `local` targets need passwordless shutdown (set up by `deploy/install.sh`);
+  `serial`/`remote` need a passwordless console/SSH on the far end.
 
 Config path resolves to `$UPS_ORCH_CONFIG`, else `/etc/ups-orchestrator/config.json`,
 else `<repo>/config.json`. State resolves similarly via `$UPS_ORCH_STATE` /
@@ -156,7 +218,14 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/ruff check . && .venv/bin/mypy && .venv/bin/pytest
 ```
 
-CI runs ruff + mypy(strict) + pytest on every push/PR across Python 3.11–3.13.
+CI runs ruff + mypy(strict) + pytest on every push/PR across Python 3.11–3.13
+(read-only — it never writes to the repo). Tagging `vX.Y.Z` triggers a release
+(builds the wheel + sdist, generates notes, publishes a GitHub Release).
+
+## Docs & contributing
+
+- 📖 [Wiki](https://github.com/kleinpanic/ups-orchestrator/wiki) — full guides (synced from [`docs/`](docs/))
+- 📝 [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md)
 
 ## License
 
