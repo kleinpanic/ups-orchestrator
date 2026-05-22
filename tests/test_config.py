@@ -42,7 +42,7 @@ def test_no_upses_raises(tmp_path: Path) -> None:
         Config.load(p, env={})
 
 
-def test_per_ups_defaults_and_r630(tmp_path: Path) -> None:
+def test_per_ups_defaults_and_targets(tmp_path: Path) -> None:
     p = _write(
         tmp_path,
         {
@@ -50,12 +50,16 @@ def test_per_ups_defaults_and_r630(tmp_path: Path) -> None:
                 "u1": {
                     "label": "Rack",
                     "shutdown_pi_on_lowbatt": True,
-                    "r630_shutdown": {
-                        "enabled": True,
-                        "host": "h",
-                        "user": "u",
-                        "delay_seconds": 120,
-                    },
+                    "shutdown_targets": [
+                        {
+                            "name": "srv",
+                            "enabled": True,
+                            "host": "h",
+                            "user": "u",
+                            "delay_seconds": 120,
+                        },
+                        {"name": "nas", "host": "n", "user": "u"},
+                    ],
                 }
             }
         },
@@ -64,6 +68,10 @@ def test_per_ups_defaults_and_r630(tmp_path: Path) -> None:
     u1 = cfg.ups("u1")
     assert u1 is not None
     assert u1.shutdown_pi_on_lowbatt is True
-    assert u1.r630.enabled is True
-    assert u1.r630.delay_seconds == 120
+    assert len(u1.shutdown_targets) == 2
+    first = u1.shutdown_targets[0]
+    assert first.name == "srv"
+    assert first.enabled is True
+    assert first.delay_seconds == 120
+    assert u1.shutdown_targets[1].enabled is False  # default
     assert cfg.ups("missing") is None

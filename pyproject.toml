@@ -16,7 +16,7 @@ keywords = ["nut", "ups", "discord", "monitoring", "homelab"]
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/kleinpanic93/ups-orchestrator"
+Repository = "https://github.com/kleinpanic/ups-orchestrator"
 
 [project.scripts]
 ups-orchestrator = "ups_orchestrator.cli:main"

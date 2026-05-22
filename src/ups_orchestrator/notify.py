@@ -136,7 +136,7 @@ class DiscordWebhookNotifier:
                     data=data,
                     headers={
                         "Content-Type": "application/json",
-                        "User-Agent": "ups-orchestrator (+https://github.com/kleinpanic93/ups-orchestrator)",
+                        "User-Agent": "ups-orchestrator (+https://github.com/kleinpanic/ups-orchestrator)",
                     },
                     method="POST",
                 )

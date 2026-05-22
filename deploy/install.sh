@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-RUN_USER="${SUDO_USER:-klein}"
+RUN_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "${USER:-root}")}"
 VENV=/opt/ups-orchestrator/venv
 
 echo ">> backing up /etc/nut"
@@ -39,8 +39,9 @@ setfacl -m u:"$RUN_USER":r  /etc/ups-orchestrator/config.json
 setfacl -R -m u:"$RUN_USER":rwx /var/lib/ups-orchestrator
 setfacl -d -m u:"$RUN_USER":rwx /var/lib/ups-orchestrator
 
-echo ">> NUT: registering second UPS in ups.conf (idempotent)"
-grep -q '^\[cyberpower2\]' /etc/nut/ups.conf || cat "$REPO/deploy/nut/ups.conf.snippet" >> /etc/nut/ups.conf
+echo ">> NUT: appending UPS sections to ups.conf (idempotent; edit the snippet's"
+echo "   vendorid/productid first — see deploy/nut/ups.conf.snippet)"
+grep -q '^\[ups2\]' /etc/nut/ups.conf || cat "$REPO/deploy/nut/ups.conf.snippet" >> /etc/nut/ups.conf
 
 cat <<EOF
 

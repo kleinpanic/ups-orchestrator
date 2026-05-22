@@ -5,29 +5,26 @@
   "discord_avatar_url": "",
   "poll_on_battery_seconds": 60,
   "upses": {
-    "cyberpower": {
-      "label": "Rack UPS — CyberPower PR1500LCDRT2U",
+    "ups1": {
+      "label": "Rack UPS",
       "shutdown_pi_on_lowbatt": false,
       "min_runtime_seconds_shutdown_pi": 300,
-      "r630_shutdown": {
-        "enabled": false,
-        "host": "192.168.1.133",
-        "user": "mt",
-        "cmd": "sudo /sbin/shutdown -h now",
-        "delay_seconds": 300
-      }
+      "shutdown_targets": [
+        {
+          "name": "fileserver",
+          "enabled": false,
+          "host": "fileserver.lan",
+          "user": "youruser",
+          "cmd": "sudo /sbin/shutdown -h now",
+          "delay_seconds": 300
+        }
+      ]
     },
-    "cyberpower2": {
-      "label": "Desk UPS — CyberPower CP1500 AVR",
+    "ups2": {
+      "label": "Desk UPS",
       "shutdown_pi_on_lowbatt": false,
       "min_runtime_seconds_shutdown_pi": 300,
-      "r630_shutdown": {
-        "enabled": false,
-        "host": "192.168.1.133",
-        "user": "mt",
-        "cmd": "sudo /sbin/shutdown -h now",
-        "delay_seconds": 300
-      }
+      "shutdown_targets": []
     }
   }
 }

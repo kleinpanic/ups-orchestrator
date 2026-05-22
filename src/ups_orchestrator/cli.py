@@ -5,7 +5,7 @@ Usage::
     ups-orchestrator <event> [ups_name]
 
 ``event`` is one of: onbatt, online, lowbatt, commbad, commok, tick,
-shutdown_r630. ``ups_name`` is the NUT device name; NUT exposes it to the
+remote_shutdown. ``ups_name`` is the NUT device name; NUT exposes it to the
 dispatcher as the ``UPSNAME`` environment variable. For the periodic ``tick``
 event the UPS name may be omitted, in which case every configured UPS is checked.
 

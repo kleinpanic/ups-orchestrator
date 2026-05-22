@@ -9,7 +9,7 @@ never clobber each other.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -18,14 +18,16 @@ class UpsState:
     """Mutable per-UPS bookkeeping."""
 
     onbatt_since: int | None = None
-    r630_shutdown_sent: bool = False
+    shutdowns_sent: list[str] = field(default_factory=list)
     last_tick_notified: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
+        raw_sent = data.get("shutdowns_sent", [])
+        sent = [str(x) for x in raw_sent] if isinstance(raw_sent, list) else []
         return cls(
             onbatt_since=_opt_int(data.get("onbatt_since")),
-            r630_shutdown_sent=bool(data.get("r630_shutdown_sent", False)),
+            shutdowns_sent=sent,
             last_tick_notified=_opt_int(data.get("last_tick_notified")),
         )
 

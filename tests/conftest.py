@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ups_orchestrator.config import R630Config, UpsConfig
+from ups_orchestrator.config import ShutdownTarget, UpsConfig
 from ups_orchestrator.events import Deps
 from ups_orchestrator.notify import Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot
@@ -19,13 +19,16 @@ class FakeNotifier(Notifier):
 
 
 def make_ups(
-    name: str = "ups1", *, shutdown_pi: bool = False, r630: R630Config | None = None
+    name: str = "ups1",
+    *,
+    shutdown_pi: bool = False,
+    targets: tuple[ShutdownTarget, ...] = (),
 ) -> UpsConfig:
     return UpsConfig(
         name=name,
         label=f"Test {name}",
         shutdown_pi_on_lowbatt=shutdown_pi,
-        r630=r630 or R630Config(),
+        shutdown_targets=targets,
     )
 
 
@@ -42,8 +45,8 @@ def make_deps(
     def _shutdown_pi() -> None:
         calls.append("pi")
 
-    def _ssh(_r630: R630Config) -> tuple[int, str, str]:
-        calls.append("ssh")
+    def _ssh(target: ShutdownTarget) -> tuple[int, str, str]:
+        calls.append(target.name)
         return ssh_rc, "", "" if ssh_rc == 0 else "boom"
 
     deps = Deps(

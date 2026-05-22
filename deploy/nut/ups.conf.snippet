@@ -1,17 +1,20 @@
-# Append to /etc/nut/ups.conf — both CyberPower UPSes on local USB.
-# The two devices are distinguished by USB productid (0601 vs 0501).
+# Append to /etc/nut/ups.conf — one [section] per UPS on local USB.
+#
+# Find each UPS's USB vendor/product id with `lsusb` (e.g. "ID 1234:abcd").
+# Multiple same-brand units are distinguished by productid; add `serial = ...`
+# only if two units share the same product id. Pick any [section] name you like
+# (it becomes the NUT device name used in config.json + upsmon.conf).
 
-[cyberpower]
+[ups1]
   driver = usbhid-ups
   port = auto
-  vendorid = 0764
-  productid = 0601
-  serial = CYBMY7000053
-  desc = "Rack UPS — CyberPower PR1500LCDRT2U"
+  vendorid = VVVV
+  productid = PPPP
+  desc = "Rack UPS"
 
-[cyberpower2]
+[ups2]
   driver = usbhid-ups
   port = auto
-  vendorid = 0764
-  productid = 0501
-  desc = "Desk UPS — CyberPower CP1500 AVR"
+  vendorid = VVVV
+  productid = PPPP
+  desc = "Desk UPS"

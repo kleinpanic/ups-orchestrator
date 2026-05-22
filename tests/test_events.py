@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from conftest import FakeNotifier, make_deps, make_ups, snap
-from ups_orchestrator.config import R630Config
+from ups_orchestrator.config import ShutdownTarget
 from ups_orchestrator.events import dispatch, fmt_duration
 from ups_orchestrator.notify import Level
 from ups_orchestrator.state import UpsState
@@ -64,23 +64,24 @@ def test_tick_countdown_when_on_battery() -> None:
     assert "still on battery" in notifier.sent[0].title
 
 
-def test_tick_triggers_deferred_r630_after_delay() -> None:
+def test_tick_triggers_target_shutdown_after_delay() -> None:
     notifier = FakeNotifier()
-    r630 = R630Config(enabled=True, host="h", user="u", delay_seconds=300)
+    target = ShutdownTarget(name="srv", enabled=True, host="h", user="u", delay_seconds=300)
     deps, calls = make_deps(notifier, snap("OB"), now=1000)
     state = UpsState(onbatt_since=600)  # 400s elapsed > 300s delay
-    dispatch("tick", make_ups(r630=r630), state, deps)
-    assert "ssh" in calls
-    assert state.r630_shutdown_sent is True
+    dispatch("tick", make_ups(targets=(target,)), state, deps)
+    assert "srv" in calls
+    assert "srv" in state.shutdowns_sent
 
 
-def test_tick_no_r630_before_delay() -> None:
+def test_tick_no_target_shutdown_before_delay() -> None:
     notifier = FakeNotifier()
-    r630 = R630Config(enabled=True, host="h", user="u", delay_seconds=300)
+    target = ShutdownTarget(name="srv", enabled=True, host="h", user="u", delay_seconds=300)
     deps, calls = make_deps(notifier, snap("OB"), now=1000)
     state = UpsState(onbatt_since=900)  # only 100s elapsed
-    dispatch("tick", make_ups(r630=r630), state, deps)
-    assert "ssh" not in calls
+    dispatch("tick", make_ups(targets=(target,)), state, deps)
+    assert "srv" not in calls
+    assert state.shutdowns_sent == []
 
 
 def test_unknown_event_returns_false() -> None:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -31,9 +31,12 @@ def _as_int(value: object, default: int) -> int:
 
 
 @dataclass(frozen=True)
-class R630Config:
-    """Optional remote-server graceful-shutdown settings (disabled by default)."""
+class ShutdownTarget:
+    """A remote machine to gracefully shut down (over SSH) after a grace period
+    on battery. Disabled by default. A UPS may have any number of these — e.g.
+    every server it powers."""
 
+    name: str
     enabled: bool = False
     host: str = ""
     user: str = ""
@@ -41,8 +44,9 @@ class R630Config:
     delay_seconds: int = 300
 
     @classmethod
-    def from_dict(cls, data: dict[str, object]) -> R630Config:
+    def from_dict(cls, data: dict[str, object]) -> ShutdownTarget:
         return cls(
+            name=str(data.get("name", data.get("host", "target"))),
             enabled=bool(data.get("enabled", False)),
             host=str(data.get("host", "")),
             user=str(data.get("user", "")),
@@ -57,22 +61,26 @@ class UpsConfig:
 
     name: str
     label: str
-    shutdown_pi_on_lowbatt: bool = True
+    shutdown_pi_on_lowbatt: bool = False
     min_runtime_seconds_shutdown_pi: int = 300
-    r630: R630Config = field(default_factory=R630Config)
+    shutdown_targets: tuple[ShutdownTarget, ...] = ()
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, object]) -> UpsConfig:
-        r630_raw = data.get("r630_shutdown", {})
-        r630 = R630Config.from_dict(r630_raw if isinstance(r630_raw, dict) else {})
+        raw_targets = data.get("shutdown_targets", [])
+        targets = (
+            tuple(ShutdownTarget.from_dict(t) for t in raw_targets if isinstance(t, dict))
+            if isinstance(raw_targets, list)
+            else ()
+        )
         return cls(
             name=name,
             label=str(data.get("label", name)),
-            shutdown_pi_on_lowbatt=bool(data.get("shutdown_pi_on_lowbatt", True)),
+            shutdown_pi_on_lowbatt=bool(data.get("shutdown_pi_on_lowbatt", False)),
             min_runtime_seconds_shutdown_pi=_as_int(
                 data.get("min_runtime_seconds_shutdown_pi"), 300
             ),
-            r630=r630,
+            shutdown_targets=targets,
         )
 
 

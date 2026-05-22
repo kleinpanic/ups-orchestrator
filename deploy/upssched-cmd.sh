@@ -17,7 +17,7 @@ fi
 ORCH="/usr/local/bin/ups-orchestrator"
 
 case "$1" in
-  onbatt|online|lowbatt|commbad|commok|tick|shutdown_r630)
+  onbatt|online|lowbatt|commbad|commok|tick|remote_shutdown)
     exec "$ORCH" "$1" "${UPSNAME:-}"
     ;;
   *)
