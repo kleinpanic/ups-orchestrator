@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ups-orchestrator"
+version = "0.2.0"
+description = "NUT-driven UPS power-event monitor that reports per-UPS status to Discord and shuts the host down on low battery."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "klein" }]
+keywords = ["nut", "ups", "discord", "monitoring", "homelab"]
+# Runtime is intentionally dependency-free: Discord delivery uses stdlib urllib,
+# UPS data comes from the `upsc` CLI shipped with NUT.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/kleinpanic93/ups-orchestrator"
+
+[project.scripts]
+ups-orchestrator = "ups_orchestrator.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ups_orchestrator"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

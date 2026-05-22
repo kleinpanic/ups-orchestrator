@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Runtime state and local secrets — never commit these.
+# The live config holds environment/host specifics; only config.example.json is tracked.
+state.json
+config.json
+config.local.json
+*.local.json
+*.env
+!*.env.example
+.env

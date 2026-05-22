@@ -1,0 +1,21 @@
+# Append/merge into /etc/nut/upsmon.conf
+#
+# Monitor BOTH UPSes. Replace the password with the one in /etc/nut/upsd.users
+# (do NOT commit real credentials). `master`/`primary` means this host manages
+# the UPS shutdown sequence.
+
+MONITOR cyberpower@localhost  1 upsmon CHANGE_ME primary
+MONITOR cyberpower2@localhost 1 upsmon CHANGE_ME primary
+
+# Route notifications through upssched (which calls the orchestrator).
+NOTIFYCMD /sbin/upssched
+
+# EXEC = run NOTIFYCMD; keep SYSLOG for journald visibility.
+NOTIFYFLAG ONLINE   SYSLOG+EXEC
+NOTIFYFLAG ONBATT   SYSLOG+EXEC
+NOTIFYFLAG LOWBATT  SYSLOG+EXEC
+NOTIFYFLAG COMMBAD  SYSLOG+EXEC
+NOTIFYFLAG COMMOK   SYSLOG+EXEC
+
+# NUT performs the real shutdown when battery is critical.
+SHUTDOWNCMD "/sbin/shutdown -h now"

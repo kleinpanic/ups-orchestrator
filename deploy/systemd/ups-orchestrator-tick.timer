@@ -1,0 +1,13 @@
+# Install to /etc/systemd/system/ups-orchestrator-tick.timer
+# Fires the tick every minute. The handler is a no-op unless a UPS is on battery,
+# so this is cheap to run continuously.
+[Unit]
+Description=Run ups-orchestrator tick every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

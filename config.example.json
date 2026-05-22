@@ -1,0 +1,33 @@
+{
+  "discord_webhook_env": "UPS_DISCORD_WEBHOOK",
+  "discord_webhook_url": "",
+  "discord_username": "UPS Orchestrator",
+  "discord_avatar_url": "",
+  "poll_on_battery_seconds": 60,
+  "upses": {
+    "cyberpower": {
+      "label": "Rack UPS — CyberPower PR1500LCDRT2U",
+      "shutdown_pi_on_lowbatt": false,
+      "min_runtime_seconds_shutdown_pi": 300,
+      "r630_shutdown": {
+        "enabled": false,
+        "host": "192.168.1.133",
+        "user": "mt",
+        "cmd": "sudo /sbin/shutdown -h now",
+        "delay_seconds": 300
+      }
+    },
+    "cyberpower2": {
+      "label": "Desk UPS — CyberPower CP1500 AVR",
+      "shutdown_pi_on_lowbatt": false,
+      "min_runtime_seconds_shutdown_pi": 300,
+      "r630_shutdown": {
+        "enabled": false,
+        "host": "192.168.1.133",
+        "user": "mt",
+        "cmd": "sudo /sbin/shutdown -h now",
+        "delay_seconds": 300
+      }
+    }
+  }
+}

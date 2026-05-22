@@ -1,0 +1,22 @@
+# /etc/nut/upssched.conf
+#
+# FIX: CMDSCRIPT must point at a path the `nut` user can actually reach. The
+# previous deployment pointed under /home (0700, unreadable by `nut`) AND at a
+# non-existent lowercase "python" dir, so every event silently no-opped. The
+# dispatcher is installed to /usr/local/bin by deploy/install.sh.
+#
+# Notification-only model: each event is forwarded straight to the orchestrator
+# via EXECUTE. The actual protective shutdown is handled by upsmon's SHUTDOWNCMD,
+# not here. The on-battery runtime countdown is handled by the systemd
+# `ups-orchestrator-tick.timer`, not by an upssched timer.
+
+CMDSCRIPT /usr/local/bin/upssched-cmd.sh
+PIPEFN /run/nut/upssched.pipe
+LOCKFN /run/nut/upssched.lock
+
+# Apply to every UPS (*) — UPSNAME is passed through to the orchestrator.
+AT ONBATT  * EXECUTE onbatt
+AT ONLINE  * EXECUTE online
+AT LOWBATT * EXECUTE lowbatt
+AT COMMBAD * EXECUTE commbad
+AT COMMOK  * EXECUTE commok
