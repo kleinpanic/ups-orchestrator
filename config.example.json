@@ -3,27 +3,34 @@
   "discord_webhook_url": "",
   "discord_username": "UPS Orchestrator",
   "discord_avatar_url": "",
-  "poll_on_battery_seconds": 60,
+  "poll_seconds": 30,
+  "countdown_every_seconds": 60,
   "upses": {
     "ups1": {
       "label": "Rack UPS",
-      "shutdown_pi_on_lowbatt": false,
-      "min_runtime_seconds_shutdown_pi": 300,
       "shutdown_targets": [
         {
           "name": "fileserver",
+          "kind": "remote",
           "enabled": false,
           "host": "fileserver.lan",
           "user": "youruser",
           "cmd": "sudo /sbin/shutdown -h now",
-          "delay_seconds": 300
+          "battery_below": 50,
+          "runtime_below": 600
+        },
+        {
+          "name": "this-host",
+          "kind": "local",
+          "enabled": false,
+          "cmd": "sudo /sbin/shutdown -h now",
+          "battery_below": 15,
+          "runtime_below": 120
         }
       ]
     },
     "ups2": {
       "label": "Desk UPS",
-      "shutdown_pi_on_lowbatt": false,
-      "min_runtime_seconds_shutdown_pi": 300,
       "shutdown_targets": []
     }
   }

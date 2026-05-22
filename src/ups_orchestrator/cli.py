@@ -1,16 +1,16 @@
-"""Command-line entry point invoked by NUT's ``upssched`` (and a systemd timer).
+"""Command-line entry point.
 
-Usage::
+Modes::
 
-    ups-orchestrator <event> [ups_name]
+    ups-orchestrator <nut-event> [ups]   # NUT upssched path: onbatt/online/
+                                          # lowbatt/commbad/commok/remote_shutdown
+    ups-orchestrator tick [ups]          # one poll iteration (shutdown checks + countdown)
+    ups-orchestrator watch               # long-running poll loop (systemd --user service)
+    ups-orchestrator status [--watch]    # terminal status table
 
-``event`` is one of: onbatt, online, lowbatt, commbad, commok, tick,
-remote_shutdown. ``ups_name`` is the NUT device name; NUT exposes it to the
-dispatcher as the ``UPSNAME`` environment variable. For the periodic ``tick``
-event the UPS name may be omitted, in which case every configured UPS is checked.
-
-The process **always exits 0** — a misbehaving handler must never wedge NUT's
-event pipeline. Failures are logged.
+NUT exposes the active UPS to event handlers via the ``UPSNAME`` environment
+variable. The process **always exits 0** on the event path so a misbehaving
+handler never wedges NUT's pipeline; failures are logged.
 """
 
 from __future__ import annotations
@@ -18,10 +18,14 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import socket
 import sys
+import time
 from pathlib import Path
+from types import FrameType
 
+from ups_orchestrator import status as status_view
 from ups_orchestrator.config import Config
 from ups_orchestrator.events import Deps, dispatch
 from ups_orchestrator.notify import build_notifier
@@ -35,7 +39,6 @@ _VAR_STATE = Path("/var/lib/ups-orchestrator/state.json")
 
 
 def _config_path() -> Path:
-    """Resolve config: ``$UPS_ORCH_CONFIG`` → ``/etc/ups-orchestrator`` → ``<repo>``."""
     env = os.environ.get("UPS_ORCH_CONFIG")
     if env:
         return Path(env).expanduser()
@@ -45,7 +48,6 @@ def _config_path() -> Path:
 
 
 def _state_path() -> Path:
-    """Resolve state: ``$UPS_ORCH_STATE`` → ``/var/lib/ups-orchestrator`` → ``<repo>``."""
     env = os.environ.get("UPS_ORCH_STATE")
     if env:
         return Path(env).expanduser()
@@ -54,46 +56,38 @@ def _state_path() -> Path:
     return _BASE / "state.json"
 
 
-def _resolve_ups_name(cli_value: str | None) -> str | None:
-    """CLI arg wins; otherwise fall back to NUT's ``UPSNAME`` env var."""
-    if cli_value:
-        return cli_value
-    env = os.environ.get("UPSNAME", "").strip()
-    return env or None
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="ups-orchestrator", description=__doc__)
-    parser.add_argument("event", help="NUT event / timer name")
-    parser.add_argument("ups_name", nargs="?", help="NUT UPS name (else $UPSNAME)")
-    parser.add_argument("--config", type=Path, default=None, help="Override config path")
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(
-        level=getattr(logging, os.environ.get("UPS_ORCH_LOGLEVEL", "INFO").upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
+def _load_config() -> Config | None:
     try:
-        cfg = Config.load(args.config or _config_path())
+        return Config.load(_config_path())
     except (OSError, ValueError) as exc:
         LOG.error("Failed to load config: %s", exc)
-        return 0  # never break NUT
+        return None
 
+
+def _build_deps(cfg: Config) -> Deps:
     notifier = build_notifier(
         cfg.webhook_url,
         username=cfg.discord_username,
         avatar_url=cfg.discord_avatar_url,
         host=socket.gethostname(),
     )
-    deps = Deps(notifier=notifier)
+    return Deps(notifier=notifier, countdown_every=cfg.countdown_every_seconds)
+
+
+def _resolve_ups_name(cli_value: str | None) -> str | None:
+    if cli_value:
+        return cli_value
+    return os.environ.get("UPSNAME", "").strip() or None
+
+
+def _cmd_event(event: str, ups_name: str | None) -> int:
+    cfg = _load_config()
+    if cfg is None:
+        return 0
+    deps = _build_deps(cfg)
     store = StateStore(_state_path())
 
-    ups_name = _resolve_ups_name(args.ups_name)
-    event = args.event.lower()
-
-    # `tick` with no UPS name → sweep every configured UPS.
+    # `tick` with no UPS name sweeps every configured UPS.
     targets = [ups_name] if ups_name else (list(cfg.upses) if event == "tick" else [])
     if not targets:
         LOG.error("No UPS name provided for event %r (set arg or $UPSNAME)", event)
@@ -113,8 +107,74 @@ def main(argv: list[str] | None = None) -> int:
         store.save()
     except OSError as exc:
         LOG.warning("Failed to persist state: %s", exc)
-
     return 0
+
+
+def _cmd_watch() -> int:
+    cfg = _load_config()
+    if cfg is None:
+        return 0
+    deps = _build_deps(cfg)
+    store = StateStore(_state_path())
+    interval = max(5, cfg.poll_seconds)
+
+    stop = False
+
+    def _sig(_signum: int, _frame: FrameType | None) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+    LOG.info("watch: polling %d UPS(es) every %ds", len(cfg.upses), interval)
+    while not stop:
+        for name, ups in cfg.upses.items():
+            try:
+                dispatch("tick", ups, store.get(name), deps)
+            except Exception:  # noqa: BLE001
+                LOG.exception("tick failed for UPS %s", name)
+        try:
+            store.save()
+        except OSError as exc:
+            LOG.warning("Failed to persist state: %s", exc)
+        # Sleep in short slices so SIGTERM is honoured promptly.
+        for _ in range(interval):
+            if stop:
+                break
+            time.sleep(1)
+    LOG.info("watch: stopped")
+    return 0
+
+
+def _cmd_status(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator status")
+    parser.add_argument("--watch", action="store_true", help="live-refresh until Ctrl-C")
+    parser.add_argument("--interval", type=float, default=2.0, help="refresh seconds (--watch)")
+    args = parser.parse_args(argv)
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    return status_view.run(cfg, watch=args.watch, interval=args.interval)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    logging.basicConfig(
+        level=getattr(logging, os.environ.get("UPS_ORCH_LOGLEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    if not args:
+        LOG.error("usage: ups-orchestrator <event|tick|watch|status> [...]")
+        return 0
+
+    mode = args[0].lower()
+    if mode == "status":
+        return _cmd_status(args[1:])
+    if mode == "watch":
+        return _cmd_watch()
+    return _cmd_event(mode, _resolve_ups_name(args[1] if len(args) > 1 else None))
 
 
 if __name__ == "__main__":

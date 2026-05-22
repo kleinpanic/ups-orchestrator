@@ -30,28 +30,58 @@ def _as_int(value: object, default: int) -> int:
     return default
 
 
+def _opt_int(value: object) -> int | None:
+    """Coerce to int, or ``None`` if absent/blank/invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 @dataclass(frozen=True)
 class ShutdownTarget:
-    """A remote machine to gracefully shut down (over SSH) after a grace period
-    on battery. Disabled by default. A UPS may have any number of these — e.g.
-    every server it powers."""
+    """A machine to shut down when its UPS runs low on battery — either a
+    ``remote`` host (over SSH) or the ``local`` host this daemon runs on. A UPS
+    may list any number; all disabled by default.
+
+    Triggers fire when **either** threshold is crossed: battery charge at or
+    below ``battery_below`` (%), or estimated runtime at or below
+    ``runtime_below`` (seconds). A target with neither set never auto-fires.
+
+    The orchestrator always sequences ``local`` targets **after** every enabled
+    ``remote`` target on the same UPS, so the watcher host dies last.
+    """
 
     name: str
+    kind: str = "remote"  # "remote" | "local"
     enabled: bool = False
     host: str = ""
     user: str = ""
     cmd: str = "sudo /sbin/shutdown -h now"
-    delay_seconds: int = 300
+    battery_below: int | None = None
+    runtime_below: int | None = None
+
+    @property
+    def is_local(self) -> bool:
+        return self.kind.lower() == "local"
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> ShutdownTarget:
         return cls(
             name=str(data.get("name", data.get("host", "target"))),
+            kind=str(data.get("kind", "remote")).lower(),
             enabled=bool(data.get("enabled", False)),
             host=str(data.get("host", "")),
             user=str(data.get("user", "")),
             cmd=str(data.get("cmd", "sudo /sbin/shutdown -h now")),
-            delay_seconds=_as_int(data.get("delay_seconds"), 300),
+            battery_below=_opt_int(data.get("battery_below")),
+            runtime_below=_opt_int(data.get("runtime_below")),
         )
 
 
@@ -61,8 +91,6 @@ class UpsConfig:
 
     name: str
     label: str
-    shutdown_pi_on_lowbatt: bool = False
-    min_runtime_seconds_shutdown_pi: int = 300
     shutdown_targets: tuple[ShutdownTarget, ...] = ()
 
     @classmethod
@@ -76,10 +104,6 @@ class UpsConfig:
         return cls(
             name=name,
             label=str(data.get("label", name)),
-            shutdown_pi_on_lowbatt=bool(data.get("shutdown_pi_on_lowbatt", False)),
-            min_runtime_seconds_shutdown_pi=_as_int(
-                data.get("min_runtime_seconds_shutdown_pi"), 300
-            ),
             shutdown_targets=targets,
         )
 
@@ -89,8 +113,9 @@ class Config:
     """Top-level configuration for all monitored UPSes."""
 
     webhook_url: str
-    poll_on_battery_seconds: int
     upses: dict[str, UpsConfig]
+    poll_seconds: int = 30
+    countdown_every_seconds: int = 60
     discord_username: str = "UPS Orchestrator"
     discord_avatar_url: str = ""
 
@@ -125,8 +150,10 @@ class Config:
 
         return cls(
             webhook_url=webhook,
-            poll_on_battery_seconds=_as_int(raw.get("poll_on_battery_seconds"), 60),
             upses=upses,
+            # poll_on_battery_seconds is the pre-0.3 name; honoured for back-compat.
+            poll_seconds=_as_int(raw.get("poll_seconds", raw.get("poll_on_battery_seconds")), 30),
+            countdown_every_seconds=_as_int(raw.get("countdown_every_seconds"), 60),
             discord_username=str(raw.get("discord_username", "UPS Orchestrator")),
             discord_avatar_url=str(raw.get("discord_avatar_url", "")),
         )

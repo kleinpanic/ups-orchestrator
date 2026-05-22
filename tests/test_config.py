@@ -42,23 +42,23 @@ def test_no_upses_raises(tmp_path: Path) -> None:
         Config.load(p, env={})
 
 
-def test_per_ups_defaults_and_targets(tmp_path: Path) -> None:
+def test_per_ups_targets_parse(tmp_path: Path) -> None:
     p = _write(
         tmp_path,
         {
             "upses": {
                 "u1": {
                     "label": "Rack",
-                    "shutdown_pi_on_lowbatt": True,
                     "shutdown_targets": [
                         {
                             "name": "srv",
+                            "kind": "remote",
                             "enabled": True,
                             "host": "h",
                             "user": "u",
-                            "delay_seconds": 120,
+                            "battery_below": 50,
                         },
-                        {"name": "nas", "host": "n", "user": "u"},
+                        {"name": "pi", "kind": "local", "enabled": True, "runtime_below": 120},
                     ],
                 }
             }
@@ -67,11 +67,19 @@ def test_per_ups_defaults_and_targets(tmp_path: Path) -> None:
     cfg = Config.load(p, env={})
     u1 = cfg.ups("u1")
     assert u1 is not None
-    assert u1.shutdown_pi_on_lowbatt is True
     assert len(u1.shutdown_targets) == 2
-    first = u1.shutdown_targets[0]
-    assert first.name == "srv"
-    assert first.enabled is True
-    assert first.delay_seconds == 120
-    assert u1.shutdown_targets[1].enabled is False  # default
+    srv, pi = u1.shutdown_targets
+    assert srv.name == "srv" and srv.is_local is False and srv.battery_below == 50
+    assert srv.runtime_below is None
+    assert pi.is_local is True and pi.runtime_below == 120 and pi.battery_below is None
     assert cfg.ups("missing") is None
+
+
+def test_poll_defaults_and_backcompat(tmp_path: Path) -> None:
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    assert Config.load(p, env={}).poll_seconds == 30
+    # pre-0.3 name still honoured
+    p2 = _write(tmp_path, {"poll_on_battery_seconds": 15, "upses": {"u1": {"label": "U1"}}})
+    cfg2 = Config.load(p2, env={})
+    assert cfg2.poll_seconds == 15
+    assert cfg2.countdown_every_seconds == 60

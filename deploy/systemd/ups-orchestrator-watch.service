@@ -1,0 +1,19 @@
+# Install to ~/.config/systemd/user/ups-orchestrator-watch.service  (systemd --user; no sudo)
+#
+# Long-running poll loop: every `poll_seconds` (from config.json) it checks each
+# UPS and fires due shutdown_targets + posts the on-battery countdown. Runs as
+# your user; reads the shared env file (you must be in the `nut` group, or have
+# the ACL set by deploy/install.sh, to read /etc/ups-orchestrator.env). Enable
+# linger so it runs while logged out.
+[Unit]
+Description=ups-orchestrator poll loop (battery-threshold shutdowns + countdown)
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ups-orchestrator.env
+ExecStart=/usr/local/bin/ups-orchestrator watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

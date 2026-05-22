@@ -3,8 +3,9 @@
 #
 # Installs the orchestrator to a system venv reachable by the NUT `nut` user
 # (the repo lives under a 0700 home, which `nut` cannot enter), wires config/
-# state/secret under /etc + /var/lib, and grants the run-user (for the --user
-# tick timer) access via ACLs. NUT config files are reviewed/merged by hand.
+# state/secret under /etc + /var/lib, grants the run-user (for the --user watch
+# service) access via ACLs, and allows it passwordless shutdown for local
+# shutdown_targets. NUT config files are reviewed/merged by hand.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,12 +33,20 @@ if [ ! -f /etc/ups-orchestrator.env ]; then
   echo "   >>> EDIT /etc/ups-orchestrator.env with your real webhook <<<"
 fi
 
-echo ">> ACLs so '$RUN_USER' (the --user tick timer) can read config/env + write state"
+echo ">> ACLs so '$RUN_USER' (the --user watch service) can read config/env + write state"
 setfacl -m u:"$RUN_USER":r  /etc/ups-orchestrator.env
 setfacl -m u:"$RUN_USER":rx /etc/ups-orchestrator
 setfacl -m u:"$RUN_USER":r  /etc/ups-orchestrator/config.json
 setfacl -R -m u:"$RUN_USER":rwx /var/lib/ups-orchestrator
 setfacl -d -m u:"$RUN_USER":rwx /var/lib/ups-orchestrator
+
+echo ">> sudoers: allow '$RUN_USER' passwordless shutdown (for local shutdown_targets)"
+cat > /etc/sudoers.d/ups-orchestrator <<SUDOERS
+# Lets the --user watch service power off THIS host for a local shutdown_target.
+$RUN_USER ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown, /sbin/poweroff, /usr/bin/systemctl poweroff
+SUDOERS
+chmod 0440 /etc/sudoers.d/ups-orchestrator
+visudo -cf /etc/sudoers.d/ups-orchestrator >/dev/null && echo "   sudoers OK" || { echo "   sudoers INVALID — removing"; rm -f /etc/sudoers.d/ups-orchestrator; }
 
 echo ">> NUT: appending UPS sections to ups.conf (idempotent; edit the snippet's"
 echo "   vendorid/productid first — see deploy/nut/ups.conf.snippet)"
@@ -47,11 +56,11 @@ cat <<EOF
 
 Almost done. Review & apply the remaining NUT snippets by hand, then restart:
   - /etc/nut/upssched.conf : use deploy/nut/upssched.conf.snippet (fixes CMDSCRIPT)
-  - /etc/nut/upsmon.conf   : add MONITOR for cyberpower2 (deploy/nut/upsmon.conf.snippet)
+  - /etc/nut/upsmon.conf   : add a MONITOR line per UPS (deploy/nut/upsmon.conf.snippet)
 
   systemctl restart nut-driver-enumerator nut-server nut-monitor
-  upsc -l            # expect: cyberpower AND cyberpower2
+  upsc -l            # expect all your UPSes listed
 
-Then enable the on-battery countdown timer (NO sudo):
-  deploy/install-user-timer.sh
+Then enable the poll loop (NO sudo):
+  deploy/install-user-service.sh
 EOF

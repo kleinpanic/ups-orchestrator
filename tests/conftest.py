@@ -21,15 +21,9 @@ class FakeNotifier(Notifier):
 def make_ups(
     name: str = "ups1",
     *,
-    shutdown_pi: bool = False,
     targets: tuple[ShutdownTarget, ...] = (),
 ) -> UpsConfig:
-    return UpsConfig(
-        name=name,
-        label=f"Test {name}",
-        shutdown_pi_on_lowbatt=shutdown_pi,
-        shutdown_targets=targets,
-    )
+    return UpsConfig(name=name, label=f"Test {name}", shutdown_targets=targets)
 
 
 def make_deps(
@@ -38,23 +32,31 @@ def make_deps(
     *,
     now: int = 1000,
     ssh_rc: int = 0,
+    local_rc: int = 0,
+    countdown_every: int = 60,
 ) -> tuple[Deps, list[str]]:
-    """Build Deps wired to fakes; returns (deps, shutdown_calls)."""
-    calls: list[str] = []
+    """Build Deps wired to fakes; returns (deps, shutdown_calls).
 
-    def _shutdown_pi() -> None:
-        calls.append("pi")
+    ``calls`` records remote target names and the literal ``"local"`` for the
+    local host, in the order they fire.
+    """
+    calls: list[str] = []
 
     def _ssh(target: ShutdownTarget) -> tuple[int, str, str]:
         calls.append(target.name)
         return ssh_rc, "", "" if ssh_rc == 0 else "boom"
 
+    def _local(_cmd: str) -> tuple[int, str, str]:
+        calls.append("local")
+        return local_rc, "", "" if local_rc == 0 else "boom"
+
     deps = Deps(
         notifier=notifier,
         read_snapshot=lambda _name: snapshot,
-        shutdown_pi=_shutdown_pi,
         ssh_shutdown=_ssh,
+        local_shutdown=_local,
         now=lambda: now,
+        countdown_every=countdown_every,
     )
     return deps, calls
 
