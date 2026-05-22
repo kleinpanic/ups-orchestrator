@@ -1,6 +1,6 @@
 # ups-orchestrator ⚡
 
-**NUT-driven UPS power-event monitor with beautiful per-UPS Discord embeds**
+**NUT-driven UPS power-event monitor with per-UPS Discord embeds**
 
 <p align="center">
   <em>Multi-UPS · NUT-event alerts · battery-threshold shutdown (serial / ssh / local) · zero runtime deps</em>
@@ -16,14 +16,14 @@
 </p>
 
 It turns [Network UPS Tools](https://networkupstools.org/) power events into
-**beautiful, per-UPS Discord embeds** — on-battery alerts, a runtime-remaining
-countdown, power-restored summaries, and low-battery warnings — while leaving
-the *actual* protective shutdown of the host to NUT's own `upsmon`, and
-optionally shutting down the machines a UPS powers (over **serial**, **SSH**, or
-**locally**) when its battery runs low.
+**per-UPS Discord embeds** for on-battery alerts, a runtime-remaining countdown,
+power-restored summaries, and low-battery warnings. NUT's own `upsmon` still
+handles the host's protective shutdown, and the orchestrator can also shut down
+UPS-powered machines over **serial**, **SSH**, or **locally** when a battery runs
+low.
 
-Works with any NUT-supported UPS, and monitors **any number** of them — nothing
-is hard-coded to a model.
+Works with any NUT-supported UPS and monitors **any number** of them. Nothing is
+hard-coded to a model.
 
 📖 **Full docs: the [project wiki](https://github.com/kleinpanic/ups-orchestrator/wiki).**
 
@@ -34,22 +34,23 @@ is hard-coded to a model.
 - **NUT `upssched` → orchestrator → Discord.** `upsmon` fires
   `ONBATT`/`ONLINE`/`LOWBATT`/`COMMBAD`/`COMMOK`, `upssched` passes them through
   `deploy/upssched-cmd.sh` to `ups-orchestrator <event> $UPSNAME`, which posts a
-  labelled embed per UPS.
+  labeled embed for that UPS.
 - **Unified shutdown targets, local last.** Each UPS lists any number of
-  `shutdown_targets`, each firing when its battery `battery_below` (%) **or**
+  `shutdown_targets`. A target fires when its battery `battery_below` (%) **or**
   `runtime_below` (sec) threshold is crossed:
-  - `remote` — over SSH (`host` may be an `ssh_config` alias; omit `user`).
-  - `serial` — over a serial console (`device`+`baud`) to a passwordless/
+  - `remote`: over SSH (`host` may be an `ssh_config` alias; omit `user`).
+  - `serial`: over a serial console (`device`+`baud`) to a passwordless/
     auto-login getty. **Network-independent**, so it still works during an outage
-    when SSH can't reach the box — the right primary path for power loss.
-  - `local` — this host; always sequenced *after* every enabled remote/serial
-    target on the UPS, so the watcher host dies last.
+    when SSH can't reach the box. That makes it the right primary path for power
+    loss.
+  - `local`: this host; always runs *after* every enabled remote/serial target on
+    the UPS, so the watcher host dies last.
 
   NUT's `upsmon SHUTDOWNCMD` stays as a low-battery backstop. All targets off by default.
 - **Configurable poll loop, decoupled from webhooks.** A `systemd --user` service
   (`ups-orchestrator watch`) polls every `poll_seconds` to evaluate shutdown
   thresholds; the on-battery countdown posts on its own `countdown_every_seconds`
-  cadence (0 = off). Discord *alerts* stay NUT-event-driven — polling never gates
+  cadence (0 = off). Discord *alerts* stay NUT-event-driven; polling never gates
   them.
 
 ```mermaid
@@ -78,7 +79,7 @@ flowchart LR
 
 Two paths run independently: Discord *alerts* come from **NUT events**
 (`upssched`), while battery-threshold *shutdowns* come from the **poll loop**
-(`watch`). Each shutdown target picks its own transport — serial console
+(`watch`). Each shutdown target picks its own transport: serial console
 (network-independent, best during an outage), SSH (a host or `ssh_config`
 alias), or the local host. The shutdown order is fixed below:
 
@@ -99,9 +100,9 @@ sequenceDiagram
 ## Notifications
 
 Embeds are rendered to the Discord spec with zero third-party dependencies
-(stdlib `urllib`): a branded author line, severity colour, a unicode battery
-gauge (`▰▰▰▰▰▰▰▱▱▱ 72%`), inline status fields, a host/UPS footer, and a native
-timestamp. Delivery is non-fatal (a down webhook never wedges NUT) and honours
+(stdlib `urllib`): author line, severity colour, a unicode battery gauge
+(`▰▰▰▰▰▰▰▱▱▱ 72%`), inline status fields, a host/UPS footer, and a native
+timestamp. Delivery is non-fatal (a down webhook never blocks NUT) and honours
 HTTP 429 `retry_after`.
 
 | Event | Embed |
@@ -113,20 +114,21 @@ HTTP 429 `retry_after`.
 | `commbad` / `commok` | 🔌 comms lost / restored |
 | (target due) | 🛑 **shutdown sent to `<target>`** |
 
-The notifier sits behind a `Notifier` protocol, so a future **Discord bot** is a
-drop-in replacement — implement `Notifier.send`, no event-logic changes.
+The notifier sits behind a `Notifier` protocol, so a future **Discord bot** can
+replace the webhook by implementing `Notifier.send`; the event logic does not
+need to change.
 
 ## Configuration
 
-Copy the template and fill it in (the webhook is **never** committed — it comes
-from an environment variable):
+Copy the template and fill it in. The webhook is **never** committed; it comes
+from an environment variable.
 
 ```bash
 cp config.example.json config.json
 export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
 ```
 
-`config.json` (no secrets) — keys under `upses` are your NUT device names:
+`config.json` has no secrets. Keys under `upses` are your NUT device names:
 
 ```jsonc
 {
@@ -154,13 +156,13 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
 ```
 
 Per target:
-- **`kind`** — `serial` (`device`+`baud`, to a passwordless/auto-login getty;
+- **`kind`**: `serial` (`device`+`baud`, to a passwordless/auto-login getty;
   network-independent), `remote` (`host` is a hostname *or* `ssh_config` alias;
   omit `user` for `ssh <alias>`), or `local`.
-- **Trigger** — fires when **either** `battery_below` (charge %) or
+- **Trigger**: fires when **either** `battery_below` (charge %) or
   `runtime_below` (seconds) is crossed; omit both and it only fires on an
   explicit `remote_shutdown`.
-- **Ordering** — `local` targets always run *after* every enabled serial/remote
+- **Ordering**: `local` targets always run *after* every enabled serial/remote
   target on the UPS, so the watcher host dies last.
 - `local` targets need passwordless shutdown (set up by `deploy/install.sh`);
   `serial`/`remote` need a passwordless console/SSH on the far end.
@@ -208,7 +210,7 @@ deploy/install-user-service.sh
 | `/etc/sudoers.d/ups-orchestrator` | passwordless shutdown for `local` targets |
 
 > Live config under `/etc` and `/etc/nut` holds your real device ids / IPs and
-> stays on the machine — it is not part of this repo (and `config.json` is
+> stays on the machine; it is not part of this repo (and `config.json` is
 > gitignored).
 
 ## Develop
@@ -219,14 +221,14 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
 CI runs ruff + mypy(strict) + pytest on every push/PR across Python 3.11–3.13
-(read-only — it never writes to the repo). Tagging `vX.Y.Z` triggers a release
+(read-only; it never writes to the repo). Tagging `vX.Y.Z` triggers a release
 (builds the wheel + sdist, generates notes, publishes a GitHub Release).
 
 ## Docs & contributing
 
-- 📖 [Wiki](https://github.com/kleinpanic/ups-orchestrator/wiki) — full guides (synced from [`docs/`](docs/))
+- 📖 [Wiki](https://github.com/kleinpanic/ups-orchestrator/wiki): full guides (synced from [`docs/`](docs/))
 - 📝 [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

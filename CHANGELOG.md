@@ -9,7 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.4.0] — 2026-05-21
 
 ### Added
-- **`serial` shutdown target** — shut a UPS-powered machine down over a serial
+- **`serial` shutdown target**: shut a UPS-powered machine down over a serial
   console (`device` + `baud`) into a passwordless/auto-login getty.
   Network-independent, so it works during an outage when SSH can't reach the box.
 - SSH remote targets accept an `ssh_config` Host alias (omit `user` → `ssh <alias>`).
@@ -20,8 +20,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `status` command: per-UPS terminal table (alive/dead, battery gauge, runtime,
   load, input) with a live `--watch` refresh.
-- Unified `shutdown_targets`: each `local` or `remote`, firing on a battery
-  charge-% **or** runtime-seconds threshold; `local` targets always sequenced
+- Unified `shutdown_targets`: each `local` or `remote`, fired by a battery
+  charge-% **or** runtime-seconds threshold; `local` targets always run
   after every enabled remote (the watcher host dies last).
 - `watch` poll loop as a `systemd --user` service, polling every `poll_seconds`;
   configurable on-battery countdown (`countdown_every_seconds`, 0 = off).
@@ -34,7 +34,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - Rewrote the single-file NUT power-event script into a typed, tested package
-  (`ups_orchestrator`): zero runtime deps, beautiful Discord embeds, multi-UPS,
+  (`ups_orchestrator`): zero runtime deps, Discord embeds, multi-UPS,
   ruff + mypy(strict) + pytest, GitHub Actions CI, system deployment scripts.
 
 [Unreleased]: https://github.com/kleinpanic/ups-orchestrator/compare/v0.4.0...HEAD

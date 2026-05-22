@@ -1,6 +1,6 @@
 # Configuration
 
-Config is a single JSON file. It holds no secrets — the Discord webhook comes
+Config is a single JSON file. It holds no secrets; the Discord webhook comes
 from an environment variable, so the file itself is safe to keep around.
 
 The orchestrator looks for the config in this order: `$UPS_ORCH_CONFIG`, then
@@ -24,7 +24,7 @@ The orchestrator looks for the config in this order: `$UPS_ORCH_CONFIG`, then
 
 Each key under `upses` is a NUT device name (whatever you called it in
 `ups.conf`). A UPS has a `label` (used in the embeds) and a list of
-`shutdown_targets` — see [Shutdown Targets](Shutdown-Targets).
+`shutdown_targets`; see [Shutdown Targets](Shutdown-Targets).
 
 ```json
 {

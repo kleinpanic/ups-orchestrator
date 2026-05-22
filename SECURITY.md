@@ -20,7 +20,7 @@ rather than a public issue. You'll get a response as soon as practical.
 - **`local` shutdown targets** rely on a `sudoers.d` rule granting the run user
   passwordless `shutdown`/`poweroff` only. Review `deploy/install.sh`.
 - **`serial` shutdown targets** assume a passwordless/auto-login getty on the
-  target's serial console. Scope that auto-login to the **serial tty only** —
+  target's serial console. Scope that auto-login to the **serial tty only**;
   it must not weaken SSH or the physical console. (SSH should remain key-only.)
 - **`remote` (SSH) targets** use `BatchMode` key auth; prefer an `ssh_config`
   alias so host/port/key stay in `~/.ssh/config`, and a dedicated key with only

@@ -20,13 +20,13 @@ rule for local shutdowns.
 
 ## 2. Wire up NUT
 
-Apply the snippets in `deploy/nut/` (review them first — set your UPS names and
+Apply the snippets in `deploy/nut/` (review them first; set your UPS names and
 USB ids):
 
-- `ups.conf` — one section per UPS.
-- `upssched.conf` — points `CMDSCRIPT` at `/usr/local/bin/upssched-cmd.sh` and
+- `ups.conf`: one section per UPS.
+- `upssched.conf`: points `CMDSCRIPT` at `/usr/local/bin/upssched-cmd.sh` and
   maps the events.
-- `upsmon.conf` — a `MONITOR` line per UPS plus the `NOTIFYFLAG`/`NOTIFYCMD`
+- `upsmon.conf`: a `MONITOR` line per UPS plus the `NOTIFYFLAG`/`NOTIFYCMD`
   wiring.
 
 ```bash
@@ -55,5 +55,5 @@ it runs whether or not you're logged in.
 | `/var/lib/ups-orchestrator/state.json` | per-UPS state |
 | `~/.config/systemd/user/ups-orchestrator-watch.service` | the poll loop |
 
-Your real device ids, IPs, and the webhook stay on the machine under `/etc` —
+Your real device ids, IPs, and the webhook stay on the machine under `/etc`;
 none of that is in the repo.
