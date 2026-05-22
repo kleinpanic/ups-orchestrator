@@ -5,6 +5,7 @@ name: Wiki Sync
 # the remote to exist; until then this job no-ops.
 
 on:
+  workflow_dispatch: {}
   push:
     branches: [main]
     paths:
