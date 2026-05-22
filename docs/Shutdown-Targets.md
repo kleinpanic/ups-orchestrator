@@ -17,6 +17,19 @@ otherwise. The host running the daemon is protected separately by NUT's own
 - **`local`**: the host the daemon runs on. These always fire *after* every
   enabled serial/remote target on the same UPS, so the watcher dies last.
 
+## Scope: just the remote, or both?
+
+`shutdown_scope` decides whether the host running the daemon is ever shut down by
+the orchestrator. Set it globally and/or per UPS:
+
+- **`remote`** (default): only `serial`/`remote` targets fire. The local host is
+  left to NUT's `upsmon` LOWBATT backstop, so the watcher keeps running and
+  notifying. Any `local` target is ignored.
+- **`all`**: `local` targets fire too, but always last — the watcher stays up
+  as long as it can, then shuts itself down at its own (lower) threshold.
+
+So "just the remote" is `remote`; "both" is `all` with a `local` target defined.
+
 ## Triggers
 
 A target fires when **either** threshold is met:

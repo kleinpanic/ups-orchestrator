@@ -44,6 +44,23 @@ def _opt_int(value: object) -> int | None:
     return None
 
 
+def _norm_scope(value: object, default: str) -> str:
+    """Normalise a shutdown-scope value to ``"remote"`` or ``"all"``.
+
+    ``"remote"`` (and ``remote_only``) → only remote/serial targets fire.
+    ``"all"`` (and ``both``) → local targets fire too, last. Unknown/blank
+    values inherit ``default``.
+    """
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ("all", "both"):
+        return "all"
+    if s in ("remote", "remote_only", "remotes"):
+        return "remote"
+    return default
+
+
 @dataclass(frozen=True)
 class ShutdownTarget:
     """A machine to shut down when its UPS runs low on battery.
@@ -107,9 +124,14 @@ class UpsConfig:
     name: str
     label: str
     shutdown_targets: tuple[ShutdownTarget, ...] = ()
+    # "remote" = only remote/serial targets fire (this host left to NUT's backstop);
+    # "all" = local targets fire too, last. Resolved from the global default at load.
+    shutdown_scope: str = "remote"
 
     @classmethod
-    def from_dict(cls, name: str, data: dict[str, object]) -> UpsConfig:
+    def from_dict(
+        cls, name: str, data: dict[str, object], default_scope: str = "remote"
+    ) -> UpsConfig:
         raw_targets = data.get("shutdown_targets", [])
         targets = (
             tuple(ShutdownTarget.from_dict(t) for t in raw_targets if isinstance(t, dict))
@@ -120,6 +142,7 @@ class UpsConfig:
             name=name,
             label=str(data.get("label", name)),
             shutdown_targets=targets,
+            shutdown_scope=_norm_scope(data.get("shutdown_scope"), default_scope),
         )
 
 
@@ -131,6 +154,7 @@ class Config:
     upses: dict[str, UpsConfig]
     poll_seconds: int = 30
     countdown_every_seconds: int = 60
+    shutdown_scope: str = "remote"  # global default; per-UPS may override
     discord_username: str = "UPS Orchestrator"
     discord_avatar_url: str = ""
 
@@ -157,8 +181,9 @@ class Config:
         if not isinstance(upses_raw, dict) or not upses_raw:
             raise ValueError(f"No 'upses' configured in {path}")
 
+        global_scope = _norm_scope(raw.get("shutdown_scope"), "remote")
         upses = {
-            name: UpsConfig.from_dict(name, data)
+            name: UpsConfig.from_dict(name, data, default_scope=global_scope)
             for name, data in upses_raw.items()
             if isinstance(data, dict)
         }
@@ -169,6 +194,7 @@ class Config:
             # poll_on_battery_seconds is the pre-0.3 name; honoured for back-compat.
             poll_seconds=_as_int(raw.get("poll_seconds", raw.get("poll_on_battery_seconds")), 30),
             countdown_every_seconds=_as_int(raw.get("countdown_every_seconds"), 60),
+            shutdown_scope=global_scope,
             discord_username=str(raw.get("discord_username", "UPS Orchestrator")),
             discord_avatar_url=str(raw.get("discord_avatar_url", "")),
         )

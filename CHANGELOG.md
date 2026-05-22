@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`shutdown_scope`** (global default + per-UPS override): choose whether a UPS
+  shuts down only its remote/serial targets (`remote`, the default) or the local
+  host too (`all`, fired last at its own threshold). Lets you configure "just the
+  remote" vs "both" per UPS.
+
 ## [0.4.0] — 2026-05-21
 
 ### Added

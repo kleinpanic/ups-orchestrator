@@ -18,6 +18,7 @@ The orchestrator looks for the config in this order: `$UPS_ORCH_CONFIG`, then
 | `discord_avatar_url` | `""` | Optional avatar for the webhook |
 | `poll_seconds` | `30` | How often `watch` checks battery thresholds |
 | `countdown_every_seconds` | `60` | On-battery countdown post cadence (`0` turns it off) |
+| `shutdown_scope` | `remote` | Global default: `remote` (only remote/serial targets) or `all` (also the local host, last). Each UPS can override it. |
 | `upses` | — | Map of NUT device name → per-UPS settings |
 
 ## Per-UPS

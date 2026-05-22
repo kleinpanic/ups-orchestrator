@@ -136,9 +136,11 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
   "discord_username": "UPS Orchestrator",
   "poll_seconds": 30,            // how often the watch loop checks battery thresholds
   "countdown_every_seconds": 60, // on-battery countdown post cadence (0 = off)
+  "shutdown_scope": "remote",    // global default: "remote" or "all" (per-UPS overridable)
   "upses": {
     "ups1": {
       "label": "Rack UPS",
+      "shutdown_scope": "all",   // this UPS also shuts down the local host (last)
       "shutdown_targets": [
         { "name": "bigserver", "kind": "serial", "enabled": false,
           "device": "/dev/ttyUSB0", "baud": 115200,
@@ -154,6 +156,14 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
   }
 }
 ```
+
+**`shutdown_scope`** (global default, overridable per UPS) controls whether the
+host running the daemon is in scope:
+- `"remote"` (default) — only `serial`/`remote` targets fire; the local host is
+  **never** shut down by the orchestrator (NUT's `upsmon` LOWBATT backstop still
+  protects it). Any `local` targets are skipped.
+- `"all"` — `local` targets fire too, **last** (at their own threshold), so the
+  watcher stays up and notifying as long as possible, then dies last.
 
 Per target:
 - **`kind`**: `serial` (`device`+`baud`, to a passwordless/auto-login getty;

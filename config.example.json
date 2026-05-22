@@ -5,9 +5,11 @@
   "discord_avatar_url": "",
   "poll_seconds": 30,
   "countdown_every_seconds": 60,
+  "shutdown_scope": "remote",
   "upses": {
     "ups1": {
       "label": "Rack UPS",
+      "shutdown_scope": "all",
       "shutdown_targets": [
         {
           "name": "fileserver",

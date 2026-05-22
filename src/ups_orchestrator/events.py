@@ -275,6 +275,10 @@ def _run_shutdown_targets(
         if t.name not in state.shutdowns_sent and (force or _target_should_fire(t, snap)):
             _fire_target(ups, state, deps, t)
 
+    # shutdown_scope="remote" leaves this host to NUT's LOWBATT backstop — never
+    # shut down local targets. "all" lets them run, but last.
+    if ups.shutdown_scope != "all":
+        return
     # Local hosts die last: hold until every enabled remote has been triggered.
     if any(t.name not in state.shutdowns_sent for t in remotes):
         return

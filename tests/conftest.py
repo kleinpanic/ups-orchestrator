@@ -22,8 +22,11 @@ def make_ups(
     name: str = "ups1",
     *,
     targets: tuple[ShutdownTarget, ...] = (),
+    scope: str = "remote",
 ) -> UpsConfig:
-    return UpsConfig(name=name, label=f"Test {name}", shutdown_targets=targets)
+    return UpsConfig(
+        name=name, label=f"Test {name}", shutdown_targets=targets, shutdown_scope=scope
+    )
 
 
 def make_deps(

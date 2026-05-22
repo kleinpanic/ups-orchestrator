@@ -83,3 +83,29 @@ def test_poll_defaults_and_backcompat(tmp_path: Path) -> None:
     cfg2 = Config.load(p2, env={})
     assert cfg2.poll_seconds == 15
     assert cfg2.countdown_every_seconds == 60
+
+
+def test_shutdown_scope_default_and_override(tmp_path: Path) -> None:
+    # default is "remote" when unset
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    cfg = Config.load(p, env={})
+    assert cfg.shutdown_scope == "remote"
+    assert cfg.ups("u1").shutdown_scope == "remote"  # type: ignore[union-attr]
+
+    # global default applies; per-UPS overrides it; "both" normalises to "all"
+    p2 = _write(
+        tmp_path,
+        {
+            "shutdown_scope": "all",
+            "upses": {
+                "inherit": {"label": "I"},
+                "override": {"label": "O", "shutdown_scope": "remote"},
+                "alias": {"label": "A", "shutdown_scope": "both"},
+            },
+        },
+    )
+    cfg2 = Config.load(p2, env={})
+    assert cfg2.shutdown_scope == "all"
+    assert cfg2.ups("inherit").shutdown_scope == "all"  # type: ignore[union-attr]
+    assert cfg2.ups("override").shutdown_scope == "remote"  # type: ignore[union-attr]
+    assert cfg2.ups("alias").shutdown_scope == "all"  # type: ignore[union-attr]
