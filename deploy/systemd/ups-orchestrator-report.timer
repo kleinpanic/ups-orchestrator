@@ -1,0 +1,13 @@
+# Daily UPS load/status report. Adjust OnCalendar after install if desired:
+#   systemctl --user edit ups-orchestrator-report.timer
+
+[Unit]
+Description=Send daily UPS load report
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+Unit=ups-orchestrator-report.service
+
+[Install]
+WantedBy=timers.target

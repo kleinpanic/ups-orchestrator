@@ -1,0 +1,15 @@
+# High-frequency UPS telemetry recorder for incident forensics.
+
+[Unit]
+Description=ups-orchestrator UPS telemetry recorder
+After=nut-server.service nut-monitor.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ups-orchestrator.env
+ExecStart=/usr/local/bin/ups-orchestrator record --interval 1 --path /var/lib/ups-orchestrator/samples.jsonl
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

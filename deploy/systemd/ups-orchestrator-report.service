@@ -1,0 +1,9 @@
+# Send one UPS status/load report to Discord.
+
+[Unit]
+Description=ups-orchestrator daily UPS load report
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ups-orchestrator.env
+ExecStart=/usr/local/bin/ups-orchestrator report

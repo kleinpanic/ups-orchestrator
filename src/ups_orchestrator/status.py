@@ -25,8 +25,10 @@ class _Row:
     state: str
     state_color: str
     battery: str
-    runtime: str
+    est_to_empty: str
     load: str
+    watts: str
+    margin: str
     inp: str
 
 
@@ -48,6 +50,25 @@ def _battery_cell(snap: UpsSnapshot) -> str:
     return f"{charge_bar(snap.charge)} {snap.charge:>3}%"
 
 
+def _load_cell(snap: UpsSnapshot) -> str:
+    if snap.load is None:
+        return "—"
+    return f"{snap.load}% {snap.load_level}"
+
+
+def _watts_cell(snap: UpsSnapshot) -> str:
+    watts = snap.estimated_load_watts
+    if watts is None or snap.realpower_nominal is None:
+        return "—"
+    return f"~{watts}/{snap.realpower_nominal}W"
+
+
+def _margin_cell(snap: UpsSnapshot) -> str:
+    if snap.load_margin_percent is None:
+        return "—"
+    return f"{snap.load_margin_percent}%"
+
+
 def _row(label: str, snap: UpsSnapshot) -> _Row:
     state, color = _classify(snap)
     return _Row(
@@ -55,8 +76,10 @@ def _row(label: str, snap: UpsSnapshot) -> _Row:
         state=state,
         state_color=color,
         battery=_battery_cell(snap),
-        runtime="—" if snap.runtime_seconds is None else fmt_duration(snap.runtime_seconds),
-        load="—" if snap.load is None else f"{snap.load}%",
+        est_to_empty="—" if snap.runtime_seconds is None else fmt_duration(snap.runtime_seconds),
+        load=_load_cell(snap),
+        watts=_watts_cell(snap),
+        margin=_margin_cell(snap),
         inp="—" if snap.input_voltage is None else f"{snap.input_voltage:.0f}V",
     )
 
@@ -77,8 +100,10 @@ def render(cfg: Config, *, color: bool = True, now: float | None = None) -> str:
     w_label = max([len("UPS"), *(len(r.label) for r in rows)]) + 2
     w_state = max([len("STATE"), *(len(r.state) for r in rows)]) + 2
     w_batt = max([len("BATTERY"), *(len(r.battery) for r in rows)]) + 2
-    w_rt = max([len("RUNTIME"), *(len(r.runtime) for r in rows)]) + 2
-    w_load = 7
+    w_rt = max([len("EST. TO 0%"), *(len(r.est_to_empty) for r in rows)]) + 2
+    w_load = max([len("LOAD"), *(len(r.load) for r in rows)]) + 2
+    w_watts = max([len("WATTS"), *(len(r.watts) for r in rows)]) + 2
+    w_margin = max([len("MARGIN"), *(len(r.margin) for r in rows)]) + 2
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
     lines = [c(f"⚡ UPS Orchestrator — {ts}", _BOLD)]
@@ -86,8 +111,10 @@ def render(cfg: Config, *, color: bool = True, now: float | None = None) -> str:
         _pad("UPS", w_label)
         + _pad("STATE", w_state)
         + _pad("BATTERY", w_batt)
-        + _pad("RUNTIME", w_rt)
+        + _pad("EST. TO 0%", w_rt)
         + _pad("LOAD", w_load)
+        + _pad("WATTS", w_watts)
+        + _pad("MARGIN", w_margin)
         + "INPUT"
     )
     lines.append(c(header, _DIM))
@@ -96,8 +123,10 @@ def render(cfg: Config, *, color: bool = True, now: float | None = None) -> str:
             _pad(r.label, w_label)
             + c(_pad(r.state, w_state), r.state_color)
             + _pad(r.battery, w_batt)
-            + _pad(r.runtime, w_rt)
+            + _pad(r.est_to_empty, w_rt)
             + _pad(r.load, w_load)
+            + _pad(r.watts, w_watts)
+            + _pad(r.margin, w_margin)
             + r.inp
         )
         lines.append(line)

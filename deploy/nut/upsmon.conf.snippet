@@ -2,10 +2,13 @@
 #
 # Use the same device names as ups.conf, and the upsmon password from
 # /etc/nut/upsd.users. `primary` means this host runs the shutdown sequence.
+# Set powervalue to 1 only for UPSes that actually feed this host; use 0 for
+# notification-only UPSes so they don't confuse MINSUPPLIES decisions.
 # NEVER commit real credentials.
 
 MONITOR ups1@localhost 1 upsmon CHANGE_ME primary
 MONITOR ups2@localhost 1 upsmon CHANGE_ME primary
+MONITOR ups3@localhost 0 upsmon CHANGE_ME primary
 
 # Route notifications through upssched (which calls the orchestrator).
 NOTIFYCMD /sbin/upssched

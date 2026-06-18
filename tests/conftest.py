@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from ups_orchestrator.config import ShutdownTarget, UpsConfig
+from ups_orchestrator.config import ShutdownGroupPolicy, ShutdownPolicy, ShutdownTarget, UpsConfig
 from ups_orchestrator.events import Deps
-from ups_orchestrator.notify import Notification, Notifier
+from ups_orchestrator.notify import DeliveryResult, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot
 
 
@@ -14,8 +14,9 @@ class FakeNotifier(Notifier):
     def __init__(self) -> None:
         self.sent: list[Notification] = []
 
-    def send(self, note: Notification) -> None:
+    def send(self, note: Notification) -> DeliveryResult:
         self.sent.append(note)
+        return DeliveryResult(configured=True, ok=True, attempts=1, status_code=204)
 
 
 def make_ups(
@@ -23,9 +24,41 @@ def make_ups(
     *,
     targets: tuple[ShutdownTarget, ...] = (),
     scope: str = "remote",
+    shutdown_policy: ShutdownPolicy | None = None,
 ) -> UpsConfig:
     return UpsConfig(
-        name=name, label=f"Test {name}", shutdown_targets=targets, shutdown_scope=scope
+        name=name,
+        label=f"Test {name}",
+        shutdown_targets=targets,
+        shutdown_scope=scope,
+        shutdown_policy=shutdown_policy or ShutdownPolicy(),
+    )
+
+
+def shutdown_policy(
+    *,
+    enabled: bool = True,
+    external_enabled: bool = True,
+    internal_enabled: bool = False,
+    min_on_battery_seconds: int = 0,
+    external_battery_below: int | None = 15,
+    external_runtime_below: int | None = 300,
+    internal_battery_below: int | None = 10,
+    internal_runtime_below: int | None = 120,
+) -> ShutdownPolicy:
+    return ShutdownPolicy(
+        enabled=enabled,
+        min_on_battery_seconds=min_on_battery_seconds,
+        external=ShutdownGroupPolicy(
+            enabled=external_enabled,
+            battery_below=external_battery_below,
+            runtime_below=external_runtime_below,
+        ),
+        internal=ShutdownGroupPolicy(
+            enabled=internal_enabled,
+            battery_below=internal_battery_below,
+            runtime_below=internal_runtime_below,
+        ),
     )
 
 
@@ -71,5 +104,11 @@ def make_deps(
 
 def snap(status: str, *, charge: int = 80, runtime: int = 600) -> UpsSnapshot:
     return UpsSnapshot(
-        status=status, charge=charge, runtime_seconds=runtime, load=10, input_voltage=120.0
+        status=status,
+        charge=charge,
+        runtime_seconds=runtime,
+        load=10,
+        input_voltage=120.0,
+        output_voltage=120.0,
+        realpower_nominal=900,
     )

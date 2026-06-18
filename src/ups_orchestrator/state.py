@@ -9,6 +9,7 @@ never clobber each other.
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -20,6 +21,7 @@ class UpsState:
     onbatt_since: int | None = None
     shutdowns_sent: list[str] = field(default_factory=list)
     last_tick_notified: int | None = None
+    last_status: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
@@ -29,6 +31,7 @@ class UpsState:
             onbatt_since=_opt_int(data.get("onbatt_since")),
             shutdowns_sent=sent,
             last_tick_notified=_opt_int(data.get("last_tick_notified")),
+            last_status=str(data["last_status"]) if data.get("last_status") is not None else None,
         )
 
 
@@ -65,6 +68,20 @@ class StateStore:
     def save(self) -> None:
         """Atomically persist all UPS states (write to temp, then replace)."""
         payload = {name: asdict(st) for name, st in self._states.items()}
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        tmp.replace(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_path = Path(tmp.name)
+                json.dump(payload, tmp, indent=2, sort_keys=True)
+                tmp.write("\n")
+            tmp_path.replace(self.path)
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)

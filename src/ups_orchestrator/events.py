@@ -6,8 +6,9 @@ Two decoupled concerns share these handlers:
   fire from NUT's ``upssched`` and post per-UPS Discord embeds. NUT's own
   ``upsmon`` ``SHUTDOWNCMD`` remains the backstop that powers off this host.
 * **Polling-driven shutdown** — the ``tick`` handler (run repeatedly by the
-  ``watch`` loop at a configurable interval) reads battery state and shuts down
-  configured ``shutdown_targets`` when their charge/runtime threshold is crossed.
+  ``watch`` loop at a configurable interval) can run configured
+  ``shutdown_targets`` only when the top-level shutdown policy explicitly opts
+  in, the UPS is on battery long enough, and the UPS is close to empty.
   ``local`` targets are always sequenced **after** every enabled ``remote``
   target on the same UPS, so the watcher host dies last. The on-battery
   countdown post has its own cadence and never gates shutdown decisions.
@@ -25,12 +26,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ups_orchestrator.config import ShutdownTarget, UpsConfig
+from ups_orchestrator.config import ShutdownGroupPolicy, ShutdownTarget, UpsConfig
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 from ups_orchestrator.state import UpsState
 
 LOG = logging.getLogger("ups_orchestrator.events")
+
+EventLogger = Callable[[str, UpsConfig, UpsSnapshot | None, str, dict[str, object] | None], None]
 
 
 # --- default side effects (overridable in tests) -----------------------------
@@ -79,6 +82,16 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+def _noop_event_log(
+    _event: str,
+    _ups: UpsConfig,
+    _snap: UpsSnapshot | None,
+    _message: str,
+    _data: dict[str, object] | None,
+) -> None:
+    return None
+
+
 @dataclass
 class Deps:
     """Injectable side effects + the one poll knob the handlers need."""
@@ -90,6 +103,7 @@ class Deps:
     serial_shutdown: Callable[[ShutdownTarget], tuple[int, str, str]] = _default_serial_shutdown
     now: Callable[[], int] = field(default_factory=lambda: lambda: int(time.time()))
     countdown_every: int = 60  # seconds between on-battery countdown posts; 0 = off
+    event_log: EventLogger = _noop_event_log
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -136,12 +150,58 @@ def _snapshot_fields(snap: UpsSnapshot) -> list[tuple[str, str]]:
     if snap.charge is not None:
         fields.append(("Battery", f"{charge_bar(snap.charge)} **{snap.charge}%**"))
     if snap.runtime_seconds is not None:
-        fields.append(("Runtime left", f"~{fmt_duration(snap.runtime_seconds)}"))
+        fields.append(("Expected time before 0%", f"~{fmt_duration(snap.runtime_seconds)}"))
     if snap.load is not None:
-        fields.append(("Load", f"{snap.load}%"))
+        if snap.estimated_load_watts is not None and snap.realpower_nominal is not None:
+            fields.append(
+                (
+                    "Load",
+                    (
+                        f"{snap.load}% {snap.load_level} "
+                        f"(~{snap.estimated_load_watts}/{snap.realpower_nominal} W, "
+                        f"{snap.load_margin_percent}% margin)"
+                    ),
+                )
+            )
+        else:
+            fields.append(("Load", f"{snap.load}% {snap.load_level}"))
     if snap.input_voltage is not None:
-        fields.append(("Input", f"{snap.input_voltage:.1f} V"))
+        fields.append(("Input voltage", f"{snap.input_voltage:.1f} V"))
+    if snap.output_voltage is not None:
+        fields.append(("Output voltage", f"{snap.output_voltage:.1f} V"))
+    if snap.load_is_high:
+        fields.append(("Load warning", "Output load is high; rebalance or move devices."))
     return fields
+
+
+def _log_event(
+    deps: Deps,
+    event: str,
+    ups: UpsConfig,
+    snap: UpsSnapshot | None,
+    message: str,
+    data: dict[str, object] | None = None,
+) -> None:
+    try:
+        deps.event_log(event, ups, snap, message, data)
+    except Exception:  # noqa: BLE001 - logging must never break UPS handling
+        LOG.exception("event log failed for %s/%s", ups.name, event)
+
+
+def _record_status_transition(
+    ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot
+) -> None:
+    if snap.status == state.last_status:
+        return
+    _log_event(
+        deps,
+        "status_transition",
+        ups,
+        snap,
+        "UPS status changed",
+        {"previous_status": state.last_status, "new_status": snap.status},
+    )
+    state.last_status = snap.status
 
 
 # --- NUT-event handlers (Discord notifications) -------------------------------
@@ -153,10 +213,15 @@ def handle_onbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     state.onbatt_since = now
     state.shutdowns_sent = []
     state.last_tick_notified = now  # delay first countdown by one cadence
+    state.last_status = snap.status
+    _log_event(deps, "onbatt", ups, snap, "Utility power lost; UPS is on battery.")
     deps.notifier.send(
         Notification(
             title=f"🔋 {ups.label} — ON BATTERY",
-            body="Utility power lost; running on battery.",
+            body=(
+                "Utility power is out and this UPS is carrying the load. "
+                "Shutdown automation remains policy-gated."
+            ),
             level=Level.WARNING,
             fields=_snapshot_fields(snap),
         )
@@ -169,13 +234,22 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     state.onbatt_since = None
     state.shutdowns_sent = []
     state.last_tick_notified = None
+    state.last_status = snap.status
     fields = _snapshot_fields(snap)
     if outage is not None:
         fields.insert(0, ("Outage duration", fmt_duration(outage)))
+    _log_event(
+        deps,
+        "online",
+        ups,
+        snap,
+        "Utility power restored.",
+        {"outage_seconds": outage},
+    )
     deps.notifier.send(
         Notification(
             title=f"✅ {ups.label} — POWER RESTORED",
-            body="Back on utility power.",
+            body="Back on utility power. Shutdown state has been reset.",
             level=Level.SUCCESS,
             fields=fields,
         )
@@ -184,6 +258,7 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
 def handle_lowbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     snap = deps.read_snapshot(ups.name)
+    _log_event(deps, "lowbatt", ups, snap, "NUT reported low battery.")
     deps.notifier.send(
         Notification(
             title=f"⚠️ {ups.label} — LOW BATTERY",
@@ -195,6 +270,7 @@ def handle_lowbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
 
 def handle_commbad(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
+    _log_event(deps, "commbad", ups, None, "Lost contact with UPS.")
     deps.notifier.send(
         Notification(
             title=f"🔌 {ups.label} — COMMUNICATION LOST",
@@ -206,6 +282,8 @@ def handle_commbad(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
 def handle_commok(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     snap = deps.read_snapshot(ups.name)
+    state.last_status = snap.status
+    _log_event(deps, "commok", ups, snap, "Re-established contact with UPS.")
     deps.notifier.send(
         Notification(
             title=f"🔌 {ups.label} — COMMUNICATION RESTORED",
@@ -219,32 +297,111 @@ def handle_commok(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 # --- polling-driven shutdown --------------------------------------------------
 
 
-def _target_should_fire(target: ShutdownTarget, snap: UpsSnapshot) -> bool:
-    """True if either the charge-% or runtime threshold is met."""
-    if (
-        target.battery_below is not None
-        and snap.charge is not None
-        and snap.charge <= target.battery_below
-    ):
-        return True
-    return (
-        target.runtime_below is not None
-        and snap.runtime_seconds is not None
-        and snap.runtime_seconds <= target.runtime_below
+def _target_group(ups: UpsConfig, target: ShutdownTarget) -> ShutdownGroupPolicy:
+    return ups.shutdown_policy.internal if target.is_local else ups.shutdown_policy.external
+
+
+def _target_location(target: ShutdownTarget) -> str:
+    if target.is_local:
+        return "this host (local)"
+    if target.is_serial:
+        return f"serial {target.device}"
+    return f"{ssh_dest(target)} (ssh)"
+
+
+def _outage_age(state: UpsState, deps: Deps) -> int | None:
+    if state.onbatt_since is None:
+        return None
+    return max(0, deps.now() - state.onbatt_since)
+
+
+def _threshold_status(
+    label: str, value: int | None, threshold: int | None, render: Callable[[int], str]
+) -> tuple[bool | None, str]:
+    if threshold is None:
+        return None, f"{label} threshold disabled"
+    if value is None:
+        return None, f"{label} unknown"
+    due = value <= threshold
+    return due, f"{label} {render(value)} <= {render(threshold)}"
+
+
+def _close_to_empty(group: ShutdownGroupPolicy, snap: UpsSnapshot) -> tuple[bool, str]:
+    battery_due, battery_reason = _threshold_status(
+        "battery", snap.charge, group.battery_below, lambda pct: f"{pct}%"
+    )
+    runtime_due, runtime_reason = _threshold_status(
+        "runtime", snap.runtime_seconds, group.runtime_below, fmt_duration
+    )
+    known = [result for result in (battery_due, runtime_due) if result is not None]
+    reasons = [battery_reason, runtime_reason]
+    if not known:
+        return False, "; ".join(reasons)
+    if battery_due is not None and runtime_due is not None:
+        return battery_due and runtime_due, "; ".join(reasons)
+    return bool(known[0]), "; ".join(reasons)
+
+
+def _target_should_fire(
+    ups: UpsConfig, state: UpsState, deps: Deps, target: ShutdownTarget, snap: UpsSnapshot
+) -> tuple[bool, str]:
+    """Return whether the target may fire and why."""
+    policy = ups.shutdown_policy
+    if not policy.enabled:
+        return False, "shutdown policy disabled"
+
+    group = _target_group(ups, target)
+    group_name = "internal" if target.is_local else "external"
+    if not group.enabled:
+        return False, f"{group_name} shutdown group disabled"
+
+    if policy.require_power_outage:
+        if not snap.on_battery:
+            return False, "UPS is not on battery"
+        age = _outage_age(state, deps)
+        if age is None:
+            return False, "on-battery start was not recorded yet"
+        if age < policy.min_on_battery_seconds:
+            return (
+                False,
+                "on-battery time "
+                f"{fmt_duration(age)} < {fmt_duration(policy.min_on_battery_seconds)}",
+            )
+
+    close, reason = _close_to_empty(group, snap)
+    if not close:
+        return False, f"UPS is not close to empty ({reason})"
+    return True, f"{group_name} shutdown allowed ({reason})"
+
+
+def _notify_shutdown_attempt(
+    ups: UpsConfig,
+    deps: Deps,
+    target: ShutdownTarget,
+    snap: UpsSnapshot,
+    where: str,
+    reason: str,
+) -> None:
+    if not ups.shutdown_policy.notify:
+        return
+    fields = _snapshot_fields(snap)
+    fields.insert(0, ("Target", f"{target.name} via {where}"))
+    fields.insert(1, ("Trigger", reason))
+    deps.notifier.send(
+        Notification(
+            title=f"🛑 {ups.label} — shutdown attempt for {target.name}",
+            body="The orchestrator is issuing a configured shutdown command.",
+            level=Level.CRITICAL,
+            fields=fields,
+        )
     )
 
 
-def _fire_target(ups: UpsConfig, state: UpsState, deps: Deps, target: ShutdownTarget) -> None:
-    if target.is_local:
-        rc, _out, err = deps.local_shutdown(target.cmd)
-        where = "this host (local)"
-    elif target.is_serial:
-        rc, _out, err = deps.serial_shutdown(target)
-        where = f"serial {target.device}"
-    else:
-        rc, _out, err = deps.ssh_shutdown(target)
-        where = f"{ssh_dest(target)} (ssh)"
-    state.shutdowns_sent.append(target.name)
+def _notify_shutdown_result(
+    ups: UpsConfig, deps: Deps, target: ShutdownTarget, rc: int, err: str, where: str
+) -> None:
+    if not ups.shutdown_policy.notify:
+        return
     if rc == 0:
         deps.notifier.send(
             Notification(
@@ -263,28 +420,79 @@ def _fire_target(ups: UpsConfig, state: UpsState, deps: Deps, target: ShutdownTa
         )
 
 
-def _run_shutdown_targets(
-    ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot, *, force: bool = False
+def _fire_target(
+    ups: UpsConfig,
+    state: UpsState,
+    deps: Deps,
+    target: ShutdownTarget,
+    snap: UpsSnapshot,
+    reason: str,
 ) -> None:
+    where = _target_location(target)
+    _log_event(
+        deps,
+        "shutdown_attempt",
+        ups,
+        snap,
+        "Issuing configured shutdown target command.",
+        {"target": target.name, "where": where, "reason": reason},
+    )
+    _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
+    if target.is_local:
+        rc, _out, err = deps.local_shutdown(target.cmd)
+    elif target.is_serial:
+        rc, _out, err = deps.serial_shutdown(target)
+    else:
+        rc, _out, err = deps.ssh_shutdown(target)
+    state.shutdowns_sent.append(target.name)
+    _log_event(
+        deps,
+        "shutdown_result",
+        ups,
+        snap,
+        "Configured shutdown target command completed.",
+        {"target": target.name, "where": where, "returncode": rc, "stderr": err},
+    )
+    _notify_shutdown_result(ups, deps, target, rc, err, where)
+
+
+def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
     """Fire due targets — remotes first, locals only once all remotes are sent."""
     enabled = [t for t in ups.shutdown_targets if t.enabled]
     remotes = [t for t in enabled if not t.is_local]
     locals_ = [t for t in enabled if t.is_local]
 
     for t in remotes:
-        if t.name not in state.shutdowns_sent and (force or _target_should_fire(t, snap)):
-            _fire_target(ups, state, deps, t)
+        should_fire, reason = _target_should_fire(ups, state, deps, t, snap)
+        if t.name not in state.shutdowns_sent and should_fire:
+            _fire_target(ups, state, deps, t, snap, reason)
+        elif t.name not in state.shutdowns_sent:
+            _log_event(
+                deps,
+                "shutdown_target_blocked",
+                ups,
+                snap,
+                "Configured remote/serial target did not meet shutdown gate.",
+                {"target": t.name, "reason": reason},
+            )
 
-    # shutdown_scope="remote" leaves this host to NUT's LOWBATT backstop — never
-    # shut down local targets. "all" lets them run, but last.
-    if ups.shutdown_scope != "all":
-        return
     # Local hosts die last: hold until every enabled remote has been triggered.
-    if any(t.name not in state.shutdowns_sent for t in remotes):
+    active_remotes = [t for t in remotes if _target_group(ups, t).enabled]
+    if any(t.name not in state.shutdowns_sent for t in active_remotes):
         return
     for t in locals_:
-        if t.name not in state.shutdowns_sent and (force or _target_should_fire(t, snap)):
-            _fire_target(ups, state, deps, t)
+        should_fire, reason = _target_should_fire(ups, state, deps, t, snap)
+        if t.name not in state.shutdowns_sent and should_fire:
+            _fire_target(ups, state, deps, t, snap, reason)
+        elif t.name not in state.shutdowns_sent:
+            _log_event(
+                deps,
+                "shutdown_target_blocked",
+                ups,
+                snap,
+                "Configured local target did not meet shutdown gate.",
+                {"target": t.name, "reason": reason},
+            )
 
 
 def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
@@ -294,16 +502,56 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     posts a runtime countdown only every ``countdown_every`` seconds.
     """
     snap = deps.read_snapshot(ups.name)
+    _record_status_transition(ups, state, deps, snap)
     if not snap.on_battery:
+        if state.onbatt_since is not None:
+            _log_event(
+                deps,
+                "online_detected_by_poll",
+                ups,
+                snap,
+                "Poll loop detected utility power restored before/without online callback.",
+            )
+            handle_online(ups, state, deps)
         return
+
+    now = deps.now()
+    if state.onbatt_since is None:
+        state.onbatt_since = now
+        state.shutdowns_sent = []
+        state.last_tick_notified = now
+        _log_event(
+            deps,
+            "onbatt_detected_by_poll",
+            ups,
+            snap,
+            "Poll loop detected on-battery state before/without onbatt callback.",
+        )
+        deps.notifier.send(
+            Notification(
+                title=f"🔋 {ups.label} — ON BATTERY",
+                body=(
+                    "Poll loop detected the UPS on battery. "
+                    "This covers cases where the NUT event callback is missed."
+                ),
+                level=Level.WARNING,
+                fields=_snapshot_fields(snap),
+            )
+        )
 
     _run_shutdown_targets(ups, state, deps, snap)
 
-    now = deps.now()
     if deps.countdown_every > 0 and (
         state.last_tick_notified is None or (now - state.last_tick_notified) >= deps.countdown_every
     ):
         state.last_tick_notified = now
+        _log_event(
+            deps,
+            "onbatt_countdown",
+            ups,
+            snap,
+            "UPS remains on battery; sending countdown notification.",
+        )
         deps.notifier.send(
             Notification(
                 title=f"⏳ {ups.label} — still on battery",
@@ -315,18 +563,42 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
 
 def handle_remote_shutdown(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
-    """Explicit trigger: force all enabled targets now (remotes first, local last)."""
+    """Explicit trigger: evaluate configured targets now (remotes first, local last)."""
     snap = deps.read_snapshot(ups.name)
-    if not snap.on_battery:
+    _log_event(deps, "remote_shutdown", ups, snap, "Explicit remote shutdown trigger received.")
+    if not ups.shutdown_policy.enabled:
+        _log_event(
+            deps,
+            "remote_shutdown_skipped",
+            ups,
+            snap,
+            "Triggered, but orchestrator-managed shutdowns are disabled.",
+        )
         deps.notifier.send(
             Notification(
-                title=f"ℹ️ {ups.label} — forced shutdown skipped",
+                title=f"ℹ️ {ups.label} — shutdown skipped",
+                body="Triggered, but orchestrator-managed shutdowns are disabled.",
+                level=Level.INFO,
+            )
+        )
+        return
+    if ups.shutdown_policy.require_power_outage and not snap.on_battery:
+        _log_event(
+            deps,
+            "remote_shutdown_skipped",
+            ups,
+            snap,
+            "Triggered, but UPS is not on battery.",
+        )
+        deps.notifier.send(
+            Notification(
+                title=f"ℹ️ {ups.label} — shutdown skipped",
                 body="Triggered, but the UPS is no longer on battery.",
                 level=Level.INFO,
             )
         )
         return
-    _run_shutdown_targets(ups, state, deps, snap, force=True)
+    _run_shutdown_targets(ups, state, deps, snap)
 
 
 _HANDLERS: dict[str, Callable[[UpsConfig, UpsState, Deps], None]] = {

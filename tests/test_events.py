@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from conftest import FakeNotifier, make_deps, make_ups, snap
+from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator.config import ShutdownTarget
 from ups_orchestrator.events import dispatch, fmt_duration
 from ups_orchestrator.notify import Level
@@ -85,39 +85,66 @@ def test_target_fires_on_battery_threshold() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=18), countdown_every=0)
     state = UpsState(onbatt_since=1)
-    dispatch("tick", make_ups(targets=(_remote(battery_below=20),)), state, deps)
+    ups = make_ups(
+        targets=(_remote(),),
+        shutdown_policy=shutdown_policy(external_battery_below=20, external_runtime_below=None),
+    )
+    dispatch("tick", ups, state, deps)
     assert calls == ["srv"]
     assert "srv" in state.shutdowns_sent
+    assert "shutdown attempt" in notifier.sent[0].title
+    assert "shutdown sent" in notifier.sent[1].title
 
 
 def test_target_fires_on_runtime_threshold() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=90, runtime=100), countdown_every=0)
-    dispatch(
-        "tick", make_ups(targets=(_remote(runtime_below=120),)), UpsState(onbatt_since=1), deps
+    ups = make_ups(
+        targets=(_remote(),),
+        shutdown_policy=shutdown_policy(external_battery_below=None, external_runtime_below=120),
     )
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
     assert calls == ["srv"]
 
 
-def test_target_not_fired_above_threshold() -> None:
+def test_shutdown_policy_disabled_by_default() -> None:
     notifier = FakeNotifier()
-    deps, calls = make_deps(notifier, snap("OB", charge=80, runtime=600), countdown_every=0)
-    dispatch(
-        "tick",
-        make_ups(targets=(_remote(battery_below=20, runtime_below=120),)),
-        UpsState(onbatt_since=1),
-        deps,
+    deps, calls = make_deps(notifier, snap("OB", charge=4, runtime=30), countdown_every=0)
+    dispatch("tick", make_ups(targets=(_remote(),)), UpsState(onbatt_since=1), deps)
+    assert calls == []
+
+
+def test_target_not_fired_when_runtime_is_healthy_even_if_battery_threshold_matches() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB", charge=18, runtime=1800), countdown_every=0)
+    ups = make_ups(
+        targets=(_remote(),),
+        shutdown_policy=shutdown_policy(external_battery_below=20, external_runtime_below=300),
     )
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
+    assert calls == []
+
+
+def test_target_waits_for_minimum_outage_age() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB", charge=4, runtime=30), now=1050, countdown_every=0)
+    ups = make_ups(
+        targets=(_remote(),),
+        shutdown_policy=shutdown_policy(min_on_battery_seconds=120),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1000), deps)
     assert calls == []
 
 
 def test_serial_target_fires() -> None:
     notifier = FakeNotifier()
-    deps, calls = make_deps(notifier, snap("OB", charge=40), countdown_every=0)
-    serial = ShutdownTarget(
-        name="r630", kind="serial", enabled=True, device="/dev/ttyUSB0", battery_below=50
+    deps, calls = make_deps(notifier, snap("OB", charge=40, runtime=100), countdown_every=0)
+    serial = ShutdownTarget(name="r630", kind="serial", enabled=True, device="/dev/ttyUSB0")
+    ups = make_ups(
+        targets=(serial,),
+        shutdown_policy=shutdown_policy(external_battery_below=50, external_runtime_below=120),
     )
-    dispatch("tick", make_ups(targets=(serial,)), UpsState(onbatt_since=1), deps)
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
     assert calls == ["r630"]
 
 
@@ -125,48 +152,95 @@ def test_serial_counts_as_remote_for_local_last() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=8), countdown_every=0)
     targets = (
-        ShutdownTarget(name="r630", kind="serial", enabled=True, device="/dev/x", battery_below=50),
-        _local("pi", battery_below=10),
+        ShutdownTarget(name="r630", kind="serial", enabled=True, device="/dev/x"),
+        _local("pi"),
     )
-    dispatch("tick", make_ups(targets=targets, scope="all"), UpsState(onbatt_since=1), deps)
+    ups = make_ups(
+        targets=targets,
+        shutdown_policy=shutdown_policy(
+            internal_enabled=True,
+            external_battery_below=50,
+            external_runtime_below=None,
+            internal_battery_below=10,
+            internal_runtime_below=None,
+        ),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
     assert calls == ["r630", "local"]  # serial (remote) before local
 
 
 def test_local_fires_after_remote() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=8), countdown_every=0)
-    targets = (_remote("srv", battery_below=50), _local("pi", battery_below=10))
-    dispatch("tick", make_ups(targets=targets, scope="all"), UpsState(onbatt_since=1), deps)
+    targets = (_remote("srv"), _local("pi"))
+    ups = make_ups(
+        targets=targets,
+        shutdown_policy=shutdown_policy(
+            internal_enabled=True,
+            external_battery_below=50,
+            external_runtime_below=None,
+            internal_battery_below=10,
+            internal_runtime_below=None,
+        ),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
     assert calls == ["srv", "local"]  # remote first, local last
 
 
 def test_local_waits_while_remote_pending() -> None:
     notifier = FakeNotifier()
-    # remote threshold not yet crossed (needs <=5), local's is (<=10) — local must wait
+    # External group is enabled but not due; local must wait so remotes go first.
     deps, calls = make_deps(notifier, snap("OB", charge=8), countdown_every=0)
-    targets = (_remote("srv", battery_below=5), _local("pi", battery_below=10))
-    dispatch("tick", make_ups(targets=targets, scope="all"), UpsState(onbatt_since=1), deps)
+    targets = (_remote("srv"), _local("pi"))
+    ups = make_ups(
+        targets=targets,
+        shutdown_policy=shutdown_policy(
+            internal_enabled=True,
+            external_battery_below=5,
+            external_runtime_below=None,
+            internal_battery_below=10,
+            internal_runtime_below=None,
+        ),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
     assert calls == []
 
 
-def test_scope_remote_skips_local_fires_remote() -> None:
-    # scope="remote" (default): the remote fires, the local is never shut down,
-    # even though its threshold is met.
+def test_internal_group_disabled_skips_local_fires_remote() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=8), countdown_every=0)
-    targets = (_remote("srv", battery_below=50), _local("pi", battery_below=50))
-    dispatch("tick", make_ups(targets=targets, scope="remote"), UpsState(onbatt_since=1), deps)
-    assert calls == ["srv"]  # local skipped — left to NUT's backstop
+    targets = (_remote("srv"), _local("pi"))
+    ups = make_ups(
+        targets=targets,
+        shutdown_policy=shutdown_policy(
+            internal_enabled=False,
+            external_battery_below=50,
+            external_runtime_below=None,
+        ),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
+    assert calls == ["srv"]
 
 
-def test_remote_shutdown_forces_all_regardless_of_threshold() -> None:
+def test_remote_shutdown_respects_disabled_policy() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=100))
-    targets = (_remote("srv", battery_below=5), _local("pi", battery_below=5))
-    dispatch(
-        "remote_shutdown", make_ups(targets=targets, scope="all"), UpsState(onbatt_since=1), deps
+    targets = (_remote("srv"), _local("pi"))
+    dispatch("remote_shutdown", make_ups(targets=targets), UpsState(onbatt_since=1), deps)
+    assert calls == []
+    assert "shutdown skipped" in notifier.sent[0].title
+
+
+def test_remote_shutdown_does_not_bypass_close_to_empty_gate() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB", charge=100, runtime=1800))
+    targets = (_remote("srv"), _local("pi"))
+    ups = make_ups(
+        targets=targets,
+        shutdown_policy=shutdown_policy(internal_enabled=True),
     )
-    assert calls == ["srv", "local"]
+    dispatch("remote_shutdown", ups, UpsState(onbatt_since=1), deps)
+    assert calls == []
 
 
 def test_unknown_event_returns_false() -> None:

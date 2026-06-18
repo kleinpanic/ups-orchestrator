@@ -1,0 +1,13 @@
+# Send one post-boot Discord alert if this boot shows abrupt power loss.
+
+[Unit]
+Description=ups-orchestrator boot recovery audit
+After=nut-server.service nut-monitor.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ups-orchestrator.env
+ExecStart=/usr/local/bin/ups-orchestrator boot-audit
+
+[Install]
+WantedBy=default.target
