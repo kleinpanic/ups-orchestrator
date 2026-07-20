@@ -20,8 +20,12 @@ def test_read_snapshot_parses_types(monkeypatch) -> None:
         "input.voltage": "117.5",
         "output.voltage": "116.8",
         "ups.realpower.nominal": "900",
+        "ups.test.result": "No test initiated",
+        "ups.timer.shutdown": "-60",
+        "ups.timer.start": "30",
+        "ups.alarm": "none",
     }
-    monkeypatch.setattr(nut, "upsc_var", lambda _ups, key, timeout=10.0: values.get(key))
+    monkeypatch.setattr(nut, "upsc_vars", lambda _ups, timeout=10.0: values)
     s = read_snapshot("anything")
     assert s.status == "OB"
     assert s.charge == 73
@@ -31,13 +35,37 @@ def test_read_snapshot_parses_types(monkeypatch) -> None:
     assert s.output_voltage == 116.8
     assert s.realpower_nominal == 900
     assert s.estimated_load_watts == 135
+    assert s.test_result == "No test initiated"
+    assert s.timer_shutdown == -60
+    assert s.timer_start == 30
+    assert s.alarm == "none"
 
 
 def test_read_snapshot_handles_missing(monkeypatch) -> None:
-    monkeypatch.setattr(nut, "upsc_var", lambda _ups, key, timeout=10.0: None)
+    monkeypatch.setattr(nut, "upsc_vars", lambda _ups, timeout=10.0: {})
     s = read_snapshot("gone")
     assert s == UpsSnapshot(None, None, None, None, None)
     assert s.on_battery is False
+
+
+def test_upsc_vars_uses_one_process_and_parses_all_fields(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = "ups.status: OL\nbattery.charge: 100\nups.test.result: No test initiated\n"
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        return Result()
+
+    monkeypatch.setattr(nut.subprocess, "run", fake_run)
+    assert nut.upsc_vars("ups1") == {
+        "ups.status": "OL",
+        "battery.charge": "100",
+        "ups.test.result": "No test initiated",
+    }
+    assert calls == [[nut.UPSC_BIN, "ups1"]]
 
 
 def test_load_assessment_thresholds() -> None:

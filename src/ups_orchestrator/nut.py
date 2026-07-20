@@ -25,6 +25,32 @@ def upsc_var(ups_name: str, key: str, timeout: float = 10.0) -> str | None:
     return result.stdout.strip() or None
 
 
+def upsc_vars(ups_name: str, timeout: float = 10.0) -> dict[str, str]:
+    """Return all variables for one UPS using a single ``upsc`` process.
+
+    The recorder samples several UPSes continuously. Reading each field with a
+    separate process wastes CPU and still returns values from the same NUT
+    driver poll. A single bulk read is both cheaper and internally consistent.
+    """
+    try:
+        result = subprocess.run(
+            [UPSC_BIN, ups_name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    values: dict[str, str] = {}
+    for raw in result.stdout.splitlines():
+        key, separator, value = raw.partition(":")
+        if separator and key.strip():
+            values[key.strip()] = value.strip()
+    return values
+
+
 @dataclass(frozen=True)
 class UpsSnapshot:
     """A point-in-time read of the variables we report on."""
@@ -36,6 +62,10 @@ class UpsSnapshot:
     input_voltage: float | None
     output_voltage: float | None = None
     realpower_nominal: int | None = None
+    test_result: str | None = None
+    timer_shutdown: int | None = None
+    timer_start: int | None = None
+    alarm: str | None = None
 
     @property
     def on_battery(self) -> bool:
@@ -102,12 +132,17 @@ def _as_float(value: str | None) -> float | None:
 
 def read_snapshot(ups_name: str) -> UpsSnapshot:
     """Read the variables we care about for ``ups_name`` in one pass."""
+    values = upsc_vars(ups_name)
     return UpsSnapshot(
-        status=upsc_var(ups_name, "ups.status"),
-        charge=_as_int(upsc_var(ups_name, "battery.charge")),
-        runtime_seconds=_as_int(upsc_var(ups_name, "battery.runtime")),
-        load=_as_int(upsc_var(ups_name, "ups.load")),
-        input_voltage=_as_float(upsc_var(ups_name, "input.voltage")),
-        output_voltage=_as_float(upsc_var(ups_name, "output.voltage")),
-        realpower_nominal=_as_int(upsc_var(ups_name, "ups.realpower.nominal")),
+        status=values.get("ups.status"),
+        charge=_as_int(values.get("battery.charge")),
+        runtime_seconds=_as_int(values.get("battery.runtime")),
+        load=_as_int(values.get("ups.load")),
+        input_voltage=_as_float(values.get("input.voltage")),
+        output_voltage=_as_float(values.get("output.voltage")),
+        realpower_nominal=_as_int(values.get("ups.realpower.nominal")),
+        test_result=values.get("ups.test.result"),
+        timer_shutdown=_as_int(values.get("ups.timer.shutdown")),
+        timer_start=_as_int(values.get("ups.timer.start")),
+        alarm=values.get("ups.alarm"),
     )

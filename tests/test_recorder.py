@@ -25,6 +25,8 @@ def test_build_record_includes_all_ups_fields(monkeypatch) -> None:
     assert ups["status"] == "OL"
     assert ups["estimated_load_watts"] == 225
     assert ups["load_margin_percent"] == 75
+    assert ups["test_result"] is None
+    assert ups["timer_shutdown"] is None
 
 
 def test_append_record_writes_jsonl(tmp_path) -> None:
@@ -33,3 +35,15 @@ def test_append_record_writes_jsonl(tmp_path) -> None:
     append_record(path, {"b": 2}, max_bytes=1000)
 
     assert path.read_text().splitlines() == ['{"a": 1}', '{"b": 2}']
+
+
+def test_rotation_retains_requested_historical_segments(tmp_path) -> None:
+    path = tmp_path / "samples.jsonl"
+    for number in range(5):
+        append_record(path, {"number": number}, max_bytes=1, max_rotations=3)
+
+    assert path.read_text().strip() == '{"number": 4}'
+    assert (tmp_path / "samples.jsonl.1").read_text().strip() == '{"number": 3}'
+    assert (tmp_path / "samples.jsonl.2").read_text().strip() == '{"number": 2}'
+    assert (tmp_path / "samples.jsonl.3").read_text().strip() == '{"number": 1}'
+    assert not (tmp_path / "samples.jsonl.4").exists()

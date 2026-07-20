@@ -105,6 +105,24 @@ def test_audit_reports_suspicious_recorder_gap(
     assert "UPSes healthy/online" not in result.text  # wording remains concrete, not vague.
 
 
+def test_sample_gap_streams_all_numeric_rotations_oldest_first(tmp_path: Path) -> None:
+    samples = tmp_path / "samples.jsonl"
+    (tmp_path / "samples.jsonl.2").write_text(
+        json.dumps({"boot_id": "old-boot", "unix_time": 1000, "time": "old", "upses": {}})
+        + "\n"
+    )
+    (tmp_path / "samples.jsonl.1").write_text("not-json\n")
+    samples.write_text(
+        json.dumps({"boot_id": "new-boot", "unix_time": 1040, "time": "new", "upses": {}})
+        + "\n"
+    )
+
+    result = audit.sample_gap_report(samples, current_boot_id="new-boot")
+
+    assert any(line.startswith("last sample before reboot: old ") for line in result.lines)
+    assert any(line.startswith("first sample after reboot: new ") for line in result.lines)
+
+
 def test_audit_redacts_discord_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
     monkeypatch.setattr(

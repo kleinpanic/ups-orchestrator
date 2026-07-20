@@ -366,7 +366,18 @@ def _cmd_record(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator record")
     parser.add_argument("--interval", type=float, default=1.0, help="sample interval seconds")
     parser.add_argument("--path", type=Path, default=_sample_path(), help="JSONL sample path")
-    parser.add_argument("--max-bytes", type=int, default=50_000_000, help="rotate after this size")
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=recorder.DEFAULT_MAX_BYTES,
+        help="rotate after this size",
+    )
+    parser.add_argument(
+        "--max-rotations",
+        type=int,
+        default=recorder.DEFAULT_MAX_ROTATIONS,
+        help="number of historical sample segments to retain",
+    )
     args = parser.parse_args(argv)
 
     cfg = _load_config()
@@ -387,6 +398,7 @@ def _cmd_record(argv: list[str]) -> int:
         path=args.path,
         interval=args.interval,
         max_bytes=args.max_bytes,
+        max_rotations=max(0, args.max_rotations),
         stop=lambda: stop,
     )
     LOG.info("record: stopped")

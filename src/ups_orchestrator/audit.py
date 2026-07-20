@@ -301,25 +301,46 @@ def _notification_log_lines(path: Path | None, limit: int) -> list[str]:
     return lines
 
 
-def _sample_records(path: Path | None) -> list[dict[str, object]]:
+def _sample_paths(path: Path) -> list[Path]:
+    """Return retained sample segments oldest-first, then the active file."""
+    rotations: list[tuple[int, Path]] = []
+    for candidate in path.parent.glob(f"{path.name}.*"):
+        suffix = candidate.name.removeprefix(f"{path.name}.")
+        if suffix.isdigit():
+            rotations.append((int(suffix), candidate))
+    return [candidate for _, candidate in sorted(rotations, reverse=True)] + [path]
+
+
+def _boot_boundary_samples(
+    path: Path | None, boot_id: str
+) -> tuple[dict[str, object] | None, dict[str, object] | None, bool]:
+    """Stream retained files and return the records bracketing ``boot_id``.
+
+    This intentionally keeps only one prior record in memory. Ten 50 MB
+    rotations must not turn the audit command into a multi-gigabyte allocation.
+    """
     if path is None:
-        return []
-    candidates = [path.with_suffix(path.suffix + ".1"), path]
-    records: list[dict[str, object]] = []
-    for candidate in candidates:
+        return None, None, False
+    previous: dict[str, object] | None = None
+    saw_record = False
+    for candidate in _sample_paths(path):
         try:
-            lines = candidate.read_text().splitlines()
-        except (FileNotFoundError, OSError):
+            handle = candidate.open(encoding="utf-8")
+        except OSError:
             continue
-        for line in lines:
-            try:
-                raw = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(raw, dict):
-                records.append(raw)
-    records.sort(key=_record_unix_time)
-    return records
+        with handle:
+            for line in handle:
+                try:
+                    raw = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                saw_record = True
+                if raw.get("boot_id") == boot_id:
+                    return previous, raw, True
+                previous = raw
+    return previous, None, saw_record
 
 
 def _record_unix_time(record: dict[str, object]) -> float:
@@ -330,26 +351,21 @@ def _record_unix_time(record: dict[str, object]) -> float:
 def sample_gap_report(path: Path | None, *, current_boot_id: str | None = None) -> SampleGapReport:
     """Explain what the recorder saw immediately before this boot."""
     boot_id = current_boot_id or _current_boot_id()
-    records = _sample_records(path)
-    if not records:
+    previous, current, saw_record = _boot_boundary_samples(path, boot_id)
+    if not saw_record:
         return SampleGapReport(
             lines=["no recorder samples found"],
             summary="No recorder samples were available for boot-boundary analysis.",
             suspicious_power_path=False,
         )
 
-    first_current_idx: int | None = None
-    for idx, record in enumerate(records):
-        if record.get("boot_id") == boot_id:
-            first_current_idx = idx
-            break
-    if first_current_idx is None:
+    if current is None:
         return SampleGapReport(
             lines=[f"no samples found for current boot {boot_id[:12]}"],
             summary="Recorder has not written a sample for the current boot yet.",
             suspicious_power_path=False,
         )
-    if first_current_idx == 0:
+    if previous is None:
         return SampleGapReport(
             lines=["no prior-boot sample exists before the first current-boot sample"],
             summary=(
@@ -359,8 +375,6 @@ def sample_gap_report(path: Path | None, *, current_boot_id: str | None = None) 
             suspicious_power_path=False,
         )
 
-    previous = records[first_current_idx - 1]
-    current = records[first_current_idx]
     prev_time = str(previous.get("time", "unknown"))
     current_time = str(current.get("time", "unknown"))
     prev_unix = previous.get("unix_time")
