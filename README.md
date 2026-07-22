@@ -117,7 +117,19 @@ HTTP 429 `retry_after`.
 | `online` | ✅ **POWER RESTORED** — outage duration + state |
 | `lowbatt` | ⚠️ **LOW BATTERY** — critical, shutdown announced |
 | `commbad` / `commok` | 🔌 comms lost / restored |
+| `load_step_drop` | 📉 **load dropped N points** — collapse vs recent peak, est. watts, 10-min draw sparkline |
 | (target due) | 🛑 **shutdown attempt** then **shutdown sent/FAILED** for `<target>` |
+
+**Load-step drop detection** (`load_step` config block, on by default): a device
+abruptly losing power appears as its UPS output load collapsing while the UPS
+itself stays `OL` — NUT gives no other in-band signal for a downstream device
+dying. A drop of `drop_percent` points (default 15) below the peak of the last
+`window_polls` polls (default 4; the window keeps a collapse that straddles a
+poll from splitting into sub-threshold steps) logs a `load_step_drop` event and
+sends one notification per `cooldown_seconds` (default 600). The alert embeds a
+draw-history sparkline built from the recorder samples. It is a hint, not a
+verdict — a heavy job finishing looks identical — so pair it with a
+reachability check on the device.
 
 The notifier sits behind a `Notifier` protocol, so a future **Discord bot** can
 replace the webhook by implementing `Notifier.send`; the event logic does not
