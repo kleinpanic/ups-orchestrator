@@ -148,6 +148,34 @@ class ShutdownPolicy:
 
 
 @dataclass(frozen=True)
+class LoadStepPolicy:
+    """Single-poll output-load drop detection.
+
+    A device abruptly losing power shows up as its UPS's output load falling by
+    its whole draw between two polls — the only in-band signature NUT gives for
+    a downstream device dying (the UPS itself stays happily ``OL``). A drop of
+    ``drop_percent`` points or more between consecutive polls logs a
+    ``load_step_drop`` event and (rate-limited by ``cooldown_seconds``) sends a
+    notification. It is a hint, not a verdict: a heavy job finishing looks
+    identical, so pair it with a reachability check on the device.
+    """
+
+    enabled: bool = True
+    drop_percent: int = 15
+    cooldown_seconds: int = 600
+
+    @classmethod
+    def from_dict(cls, data: object) -> LoadStepPolicy:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=_as_bool(data.get("enabled"), True),
+            drop_percent=max(1, _as_int(data.get("drop_percent"), 15)),
+            cooldown_seconds=max(0, _as_int(data.get("cooldown_seconds"), 600)),
+        )
+
+
+@dataclass(frozen=True)
 class ShutdownTarget:
     """A machine to shut down when its UPS runs low on battery.
 
@@ -246,6 +274,7 @@ class Config:
     countdown_every_seconds: int = 60
     shutdown_scope: str = "remote"  # legacy default; retained for config compatibility
     shutdown_policy: ShutdownPolicy = field(default_factory=ShutdownPolicy)
+    load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
     discord_username: str = "UPS Orchestrator"
     discord_avatar_url: str = ""
 
@@ -293,6 +322,7 @@ class Config:
             countdown_every_seconds=_as_int(raw.get("countdown_every_seconds"), 60),
             shutdown_scope=global_scope,
             shutdown_policy=shutdown_policy,
+            load_step=LoadStepPolicy.from_dict(raw.get("load_step")),
             discord_username=str(raw.get("discord_username", "UPS Orchestrator")),
             discord_avatar_url=str(raw.get("discord_avatar_url", "")),
         )

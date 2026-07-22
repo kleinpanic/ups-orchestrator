@@ -102,12 +102,14 @@ def make_deps(
     return deps, calls
 
 
-def snap(status: str, *, charge: int = 80, runtime: int = 600) -> UpsSnapshot:
+def snap(
+    status: str, *, charge: int = 80, runtime: int = 600, load: int | None = 10
+) -> UpsSnapshot:
     return UpsSnapshot(
         status=status,
         charge=charge,
         runtime_seconds=runtime,
-        load=10,
+        load=load,
         input_voltage=120.0,
         output_voltage=120.0,
         realpower_nominal=900,

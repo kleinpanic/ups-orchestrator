@@ -14,6 +14,8 @@ def test_state_save_creates_parent_and_writes_json(tmp_path) -> None:
 
     assert json.loads(path.read_text()) == {
         "ups1": {
+            "last_load": None,
+            "last_load_step_notified": None,
             "last_tick_notified": None,
             "last_status": None,
             "onbatt_since": 123,

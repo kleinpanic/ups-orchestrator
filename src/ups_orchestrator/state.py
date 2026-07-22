@@ -22,6 +22,8 @@ class UpsState:
     shutdowns_sent: list[str] = field(default_factory=list)
     last_tick_notified: int | None = None
     last_status: str | None = None
+    last_load: int | None = None
+    last_load_step_notified: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
@@ -32,6 +34,8 @@ class UpsState:
             shutdowns_sent=sent,
             last_tick_notified=_opt_int(data.get("last_tick_notified")),
             last_status=str(data["last_status"]) if data.get("last_status") is not None else None,
+            last_load=_opt_int(data.get("last_load")),
+            last_load_step_notified=_opt_int(data.get("last_load_step_notified")),
         )
 
 

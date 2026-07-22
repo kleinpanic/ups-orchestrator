@@ -5,6 +5,11 @@
   "discord_avatar_url": "",
   "poll_seconds": 30,
   "countdown_every_seconds": 60,
+  "load_step": {
+    "enabled": true,
+    "drop_percent": 15,
+    "cooldown_seconds": 600
+  },
   "shutdown": {
     "enabled": false,
     "require_power_outage": true,

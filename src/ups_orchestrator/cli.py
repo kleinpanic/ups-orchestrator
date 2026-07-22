@@ -143,6 +143,7 @@ def _build_deps(cfg: Config) -> Deps:
         notifier=notifier,
         countdown_every=cfg.countdown_every_seconds,
         event_log=_event_log,
+        load_step=cfg.load_step,
     )
 
 

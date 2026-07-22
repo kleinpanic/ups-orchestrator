@@ -26,7 +26,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ups_orchestrator.config import ShutdownGroupPolicy, ShutdownTarget, UpsConfig
+from ups_orchestrator.config import (
+    LoadStepPolicy,
+    ShutdownGroupPolicy,
+    ShutdownTarget,
+    UpsConfig,
+)
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 from ups_orchestrator.state import UpsState
@@ -104,6 +109,7 @@ class Deps:
     now: Callable[[], int] = field(default_factory=lambda: lambda: int(time.time()))
     countdown_every: int = 60  # seconds between on-battery countdown posts; 0 = off
     event_log: EventLogger = _noop_event_log
+    load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -495,14 +501,70 @@ def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: Ups
             )
 
 
+def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
+    """Flag a single-poll output-load collapse (a downstream device dying).
+
+    Always tracks ``last_load`` so enabling the policy later starts with a
+    baseline. The event is always logged when the threshold trips; the
+    notification is rate-limited by the policy cooldown.
+    """
+    load = snap.load
+    if load is None:
+        return
+    previous = state.last_load
+    state.last_load = load
+    policy = deps.load_step
+    if not policy.enabled or previous is None:
+        return
+    drop = previous - load
+    if drop < policy.drop_percent:
+        return
+    watts = (drop * snap.realpower_nominal) // 100 if snap.realpower_nominal else None
+    _log_event(
+        deps,
+        "load_step_drop",
+        ups,
+        snap,
+        f"Output load fell {drop} points in one poll ({previous}% -> {load}%).",
+        {
+            "previous_load": previous,
+            "new_load": load,
+            "drop_points": drop,
+            "estimated_watts_delta": watts,
+        },
+    )
+    now = deps.now()
+    if (
+        state.last_load_step_notified is not None
+        and now - state.last_load_step_notified < policy.cooldown_seconds
+    ):
+        return
+    state.last_load_step_notified = now
+    watts_note = f" (≈{watts} W)" if watts is not None else ""
+    deps.notifier.send(
+        Notification(
+            title=f"📉 {ups.label} — load dropped {drop} points",
+            body=(
+                f"Output load fell {previous}% → {load}%{watts_note} between polls. "
+                "A device on this UPS may have lost power — or just finished heavy "
+                "work. Worth a reachability check."
+            ),
+            level=Level.WARNING,
+            fields=_snapshot_fields(snap),
+        )
+    )
+
+
 def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     """One poll iteration (driven by the ``watch`` loop).
 
-    No-op unless the UPS is on battery. Evaluates shutdown targets every call;
-    posts a runtime countdown only every ``countdown_every`` seconds.
+    Tracks load steps every call; otherwise a no-op unless the UPS is on
+    battery. Evaluates shutdown targets every call; posts a runtime countdown
+    only every ``countdown_every`` seconds.
     """
     snap = deps.read_snapshot(ups.name)
     _record_status_transition(ups, state, deps, snap)
+    _check_load_step(ups, state, deps, snap)
     if not snap.on_battery:
         if state.onbatt_since is not None:
             _log_event(
