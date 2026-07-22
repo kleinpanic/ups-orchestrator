@@ -50,8 +50,8 @@ This installs:
 - `ups-orchestrator-watch.service`: continuous poll loop for the opt-in shutdown
   policy and on-battery countdowns.
 - `ups-orchestrator-recorder.service`: one-second UPS telemetry samples for
-  power-loss forensics. It retains ten 50 MB historical segments plus the
-  active file (roughly a week at the live three-UPS record size) and records
+  power-loss forensics. It retains twenty 50 MB historical segments plus the
+  active file (roughly two weeks at the live three-UPS record size) and records
   self-test, output-shutdown timer, and alarm fields alongside load/voltage.
 - `ups-orchestrator-boot-audit.service`: one-shot post-boot alert when the host
   recovered from abrupt power loss.

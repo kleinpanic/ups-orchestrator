@@ -24,6 +24,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   host too (`all`, fired last at its own threshold). Lets you configure "just the
   remote" vs "both" per UPS.
 
+### Changed
+- Recorder retention deepened from 10 to 20 rotations (`DEFAULT_MAX_ROTATIONS`
+  and the `recorder.service` `--max-rotations`), roughly two weeks of one-second
+  forensic history at the live three-UPS size. Worst case ≈ 1 GB
+  (20 × 50 MB) for the samples log; confirm disk headroom before redeploying.
+
 ## [0.4.0] — 2026-05-21
 
 ### Added

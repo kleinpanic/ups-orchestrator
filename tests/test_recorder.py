@@ -5,7 +5,7 @@ from typing import Any, cast
 from conftest import make_ups
 from ups_orchestrator.config import Config
 from ups_orchestrator.nut import UpsSnapshot
-from ups_orchestrator.recorder import append_record, build_record
+from ups_orchestrator.recorder import DEFAULT_MAX_ROTATIONS, append_record, build_record
 
 
 def test_build_record_includes_all_ups_fields(monkeypatch) -> None:
@@ -47,3 +47,16 @@ def test_rotation_retains_requested_historical_segments(tmp_path) -> None:
     assert (tmp_path / "samples.jsonl.2").read_text().strip() == '{"number": 2}'
     assert (tmp_path / "samples.jsonl.3").read_text().strip() == '{"number": 1}'
     assert not (tmp_path / "samples.jsonl.4").exists()
+
+
+def test_default_retention_is_twenty_segments(tmp_path) -> None:
+    # The default deepened from 10 to 20; the deployed recorder.service passes
+    # --max-rotations 20 to match, so both must move together.
+    assert DEFAULT_MAX_ROTATIONS == 20
+    path = tmp_path / "samples.jsonl"
+    for number in range(25):
+        append_record(path, {"number": number}, max_bytes=1)
+
+    assert path.read_text().strip() == '{"number": 24}'
+    assert (tmp_path / f"samples.jsonl.{DEFAULT_MAX_ROTATIONS}").exists()
+    assert not (tmp_path / f"samples.jsonl.{DEFAULT_MAX_ROTATIONS + 1}").exists()

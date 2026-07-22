@@ -14,7 +14,7 @@ from ups_orchestrator.config import Config
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
 DEFAULT_MAX_BYTES = 50_000_000
-DEFAULT_MAX_ROTATIONS = 10
+DEFAULT_MAX_ROTATIONS = 20
 
 
 def _boot_id() -> str:

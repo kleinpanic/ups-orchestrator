@@ -7,7 +7,7 @@ After=nut-server.service nut-monitor.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/ups-orchestrator.env
-ExecStart=/usr/local/bin/ups-orchestrator record --interval 1 --max-rotations 10 --path /var/lib/ups-orchestrator/samples.jsonl
+ExecStart=/usr/local/bin/ups-orchestrator record --interval 1 --max-rotations 20 --path /var/lib/ups-orchestrator/samples.jsonl
 Restart=always
 RestartSec=5
 
