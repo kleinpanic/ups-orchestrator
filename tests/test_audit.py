@@ -108,13 +108,11 @@ def test_audit_reports_suspicious_recorder_gap(
 def test_sample_gap_streams_all_numeric_rotations_oldest_first(tmp_path: Path) -> None:
     samples = tmp_path / "samples.jsonl"
     (tmp_path / "samples.jsonl.2").write_text(
-        json.dumps({"boot_id": "old-boot", "unix_time": 1000, "time": "old", "upses": {}})
-        + "\n"
+        json.dumps({"boot_id": "old-boot", "unix_time": 1000, "time": "old", "upses": {}}) + "\n"
     )
     (tmp_path / "samples.jsonl.1").write_text("not-json\n")
     samples.write_text(
-        json.dumps({"boot_id": "new-boot", "unix_time": 1040, "time": "new", "upses": {}})
-        + "\n"
+        json.dumps({"boot_id": "new-boot", "unix_time": 1040, "time": "new", "upses": {}}) + "\n"
     )
 
     result = audit.sample_gap_report(samples, current_boot_id="new-boot")

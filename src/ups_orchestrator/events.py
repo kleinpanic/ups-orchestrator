@@ -589,9 +589,7 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
         return
     state.last_load_step_notified = now
     watts_note = f" (≈{watts} W)" if watts is not None else ""
-    sparkline = (
-        _draw_sparkline(deps.sample_path, ups.name) if deps.sample_path is not None else ""
-    )
+    sparkline = _draw_sparkline(deps.sample_path, ups.name) if deps.sample_path is not None else ""
     body = (
         f"Output load fell to {load}% from a recent high of {peak}%{watts_note}. "
         "A device on this UPS may have lost power — or just finished heavy "

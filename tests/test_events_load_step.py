@@ -93,9 +93,7 @@ def test_straddled_collapse_still_trips() -> None:
 
 
 def test_collapse_does_not_refire_from_stale_peak() -> None:
-    _, notifier, log = run_loads(
-        [45, 25, 24, 23], policy=LoadStepPolicy(cooldown_seconds=0)
-    )
+    _, notifier, log = run_loads([45, 25, 24, 23], policy=LoadStepPolicy(cooldown_seconds=0))
     assert len(drops(log)) == 1
     assert len(notifier.sent) == 1
 
@@ -160,9 +158,7 @@ def test_sparkline_handles_missing_or_empty_file(tmp_path) -> None:
 
 
 def test_state_roundtrip_and_legacy_migration() -> None:
-    restored = UpsState.from_dict(
-        {"recent_loads": [37, 40], "last_load_step_notified": 1234}
-    )
+    restored = UpsState.from_dict({"recent_loads": [37, 40], "last_load_step_notified": 1234})
     assert restored.recent_loads == [37, 40]
     assert restored.last_load_step_notified == 1234
     legacy = UpsState.from_dict({"last_load": 31})
