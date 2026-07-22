@@ -24,6 +24,7 @@ Local forensic logs are controlled by:
 | `discord_avatar_url` | `""` | Optional avatar for the webhook |
 | `poll_seconds` | `30` | How often `watch` checks UPS state and the shutdown policy |
 | `countdown_every_seconds` | `60` | On-battery countdown post cadence (`0` turns it off) |
+| `load_step` | on | Output-load collapse detection (a downstream device dying) |
 | `shutdown` | disabled | Central opt-in policy for orchestrator-managed shutdowns |
 | `upses` | — | Map of NUT device name → per-UPS settings |
 
@@ -42,6 +43,28 @@ When battery and runtime readings are both available, both must be at or below
 their group thresholds. That prevents a high battery-percent threshold from
 shutting machines down while the UPS still reports healthy runtime.
 
+## Load-step drop detection
+
+`load_step` flags an abrupt output-load collapse — the only in-band signature
+NUT gives for a downstream device losing power while the UPS itself stays `OL`.
+On by default; set `enabled` to `false` to silence it.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Master switch for the check |
+| `drop_percent` | `15` | Load-point drop below the recent peak that trips the event |
+| `window_polls` | `4` | Polls whose peak the current load is compared against |
+| `cooldown_seconds` | `600` | Minimum gap between notifications (events are always logged) |
+
+The drop is measured against the highest load in the last `window_polls` polls
+rather than just the previous poll, so a collapse that straddles a poll boundary
+(the UPS reporting an intermediate value mid-decay) still trips instead of
+splitting into two sub-threshold steps. A trip logs a `load_step_drop` event
+with the estimated watts delta and sends one notification per `cooldown_seconds`;
+the alert embeds a 10-minute draw-history sparkline built from the recorder
+samples. It is a hint, not a verdict — a heavy job finishing looks identical —
+so pair it with a reachability check on the device.
+
 ## Per-UPS
 
 Each key under `upses` is a NUT device name (whatever you called it in
@@ -53,6 +76,7 @@ Each key under `upses` is a NUT device name (whatever you called it in
   "discord_webhook_env": "UPS_DISCORD_WEBHOOK",
   "poll_seconds": 30,
   "countdown_every_seconds": 60,
+  "load_step": { "enabled": true, "drop_percent": 15, "cooldown_seconds": 600, "window_polls": 4 },
   "shutdown": {
     "enabled": false,
     "require_power_outage": true,

@@ -9,13 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **Load-step drop detection** (`load_step` config block, on by default): a
   device abruptly losing power shows up as its UPS's output load collapsing
-  between two polls while the UPS itself stays `OL` — NUT's only in-band
-  signature for a downstream device dying. A single-poll drop of
-  `drop_percent` points (default 15) logs a `load_step_drop` event with the
-  estimated watts delta and sends a rate-limited notification
-  (`cooldown_seconds`, default 600). Motivated by a real incident: a host's
-  hard power-offs were visible in the recorder as −135 W / −216 W load steps
-  on clean input voltage, but nothing alerted on them.
+  while the UPS itself stays `OL` — NUT's only in-band signature for a
+  downstream device dying. A drop of `drop_percent` points (default 15) below
+  the peak of the last `window_polls` polls (default 4 — the window keeps a
+  collapse that straddles a poll boundary from splitting into two sub-threshold
+  steps) logs a `load_step_drop` event with the estimated watts delta and sends
+  a rate-limited notification (`cooldown_seconds`, default 600). The alert
+  embeds a 10-minute draw-history sparkline built from the recorder samples.
+  Motivated by a real incident: a host's hard power-offs were visible in the
+  recorder as −135 W / −216 W load steps on clean input voltage, but nothing
+  alerted on them.
 - **`shutdown_scope`** (global default + per-UPS override): choose whether a UPS
   shuts down only its remote/serial targets (`remote`, the default) or the local
   host too (`all`, fired last at its own threshold). Lets you configure "just the
