@@ -19,12 +19,14 @@ so the handlers unit-test without a real UPS or network.
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from ups_orchestrator.config import (
     LoadStepPolicy,
@@ -110,6 +112,7 @@ class Deps:
     countdown_every: int = 60  # seconds between on-battery countdown posts; 0 = off
     event_log: EventLogger = _noop_event_log
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
+    sample_path: Path | None = None  # recorder JSONL, for draw-history sparklines
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -501,36 +504,81 @@ def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: Ups
             )
 
 
-def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
-    """Flag a single-poll output-load collapse (a downstream device dying).
+def _draw_sparkline(sample_path: Path, ups_name: str, *, minutes: int = 10) -> str:
+    """Render recent outlet watts from the recorder log as a Unicode sparkline."""
+    try:
+        with sample_path.open("rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 400_000))
+            tail = fh.read().decode("utf-8", "replace").splitlines()[1:]
+    except OSError:
+        return ""
+    watts: list[tuple[float, int]] = []
+    for line in tail:
+        try:
+            d = json.loads(line)
+            t = d["unix_time"]
+            w = d["upses"][ups_name]["estimated_load_watts"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if isinstance(t, (int, float)) and isinstance(w, (int, float)):
+            watts.append((float(t), int(w)))
+    if len(watts) < 2:
+        return ""
+    cutoff = watts[-1][0] - minutes * 60
+    pts = [w for t, w in watts if t >= cutoff]
+    if len(pts) < 2:
+        return ""
+    cols = 24
+    step = max(1, len(pts) // cols)
+    buckets = [max(pts[i : i + step]) for i in range(0, len(pts), step)][:cols]
+    lo, hi = min(buckets), max(buckets)
+    blocks = "▁▂▃▄▅▆▇█"
+    if hi == lo:
+        bar = blocks[0] * len(buckets)
+    else:
+        bar = "".join(blocks[(w - lo) * 7 // (hi - lo)] for w in buckets)
+    return f"`{bar}` {lo}–{hi} W, last {minutes} min"
 
-    Always tracks ``last_load`` so enabling the policy later starts with a
-    baseline. The event is always logged when the threshold trips; the
-    notification is rate-limited by the policy cooldown.
+
+def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
+    """Flag an output-load collapse (a downstream device dying).
+
+    The drop is measured against the highest load in the last ``window_polls``
+    polls — not just the previous poll — so a collapse that straddles a poll
+    (the UPS reporting an intermediate value mid-decay) still trips. Tracking
+    always runs so enabling the policy later starts with a baseline. The event
+    is always logged when the threshold trips; the notification is rate-limited
+    by the policy cooldown.
     """
     load = snap.load
     if load is None:
         return
-    previous = state.last_load
-    state.last_load = load
     policy = deps.load_step
-    if not policy.enabled or previous is None:
+    window = list(state.recent_loads)
+    state.recent_loads = (window + [load])[-max(1, policy.window_polls) :]
+    if not policy.enabled or not window:
         return
-    drop = previous - load
+    peak = max(window)
+    drop = peak - load
     if drop < policy.drop_percent:
         return
+    # Restart the window at the collapsed level so the stale peak can't
+    # re-trigger on every poll until it ages out.
+    state.recent_loads = [load]
     watts = (drop * snap.realpower_nominal) // 100 if snap.realpower_nominal else None
     _log_event(
         deps,
         "load_step_drop",
         ups,
         snap,
-        f"Output load fell {drop} points in one poll ({previous}% -> {load}%).",
+        f"Output load fell {drop} points from its recent peak ({peak}% -> {load}%).",
         {
-            "previous_load": previous,
+            "peak_load": peak,
             "new_load": load,
             "drop_points": drop,
             "estimated_watts_delta": watts,
+            "window": window,
         },
     )
     now = deps.now()
@@ -541,14 +589,20 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
         return
     state.last_load_step_notified = now
     watts_note = f" (≈{watts} W)" if watts is not None else ""
+    sparkline = (
+        _draw_sparkline(deps.sample_path, ups.name) if deps.sample_path is not None else ""
+    )
+    body = (
+        f"Output load fell to {load}% from a recent high of {peak}%{watts_note}. "
+        "A device on this UPS may have lost power — or just finished heavy "
+        "work. Worth a reachability check."
+    )
+    if sparkline:
+        body += f"\n\n{sparkline}"
     deps.notifier.send(
         Notification(
             title=f"📉 {ups.label} — load dropped {drop} points",
-            body=(
-                f"Output load fell {previous}% → {load}%{watts_note} between polls. "
-                "A device on this UPS may have lost power — or just finished heavy "
-                "work. Worth a reachability check."
-            ),
+            body=body,
             level=Level.WARNING,
             fields=_snapshot_fields(snap),
         )

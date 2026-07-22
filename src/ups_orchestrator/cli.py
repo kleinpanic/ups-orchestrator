@@ -144,6 +144,7 @@ def _build_deps(cfg: Config) -> Deps:
         countdown_every=cfg.countdown_every_seconds,
         event_log=_event_log,
         load_step=cfg.load_step,
+        sample_path=_sample_path(),
     )
 
 

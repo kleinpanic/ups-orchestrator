@@ -8,7 +8,8 @@
   "load_step": {
     "enabled": true,
     "drop_percent": 15,
-    "cooldown_seconds": 600
+    "cooldown_seconds": 600,
+    "window_polls": 4
   },
   "shutdown": {
     "enabled": false,

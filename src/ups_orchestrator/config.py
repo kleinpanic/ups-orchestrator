@@ -152,17 +152,21 @@ class LoadStepPolicy:
     """Single-poll output-load drop detection.
 
     A device abruptly losing power shows up as its UPS's output load falling by
-    its whole draw between two polls — the only in-band signature NUT gives for
-    a downstream device dying (the UPS itself stays happily ``OL``). A drop of
-    ``drop_percent`` points or more between consecutive polls logs a
-    ``load_step_drop`` event and (rate-limited by ``cooldown_seconds``) sends a
-    notification. It is a hint, not a verdict: a heavy job finishing looks
-    identical, so pair it with a reachability check on the device.
+    its whole draw within a poll or two — the only in-band signature NUT gives
+    for a downstream device dying (the UPS itself stays happily ``OL``). A drop
+    of ``drop_percent`` points or more below the peak of the last
+    ``window_polls`` polls logs a ``load_step_drop`` event and (rate-limited by
+    ``cooldown_seconds``) sends a notification. The window — rather than a
+    plain previous-poll comparison — keeps a collapse that straddles a poll
+    boundary from splitting into two sub-threshold steps. It is a hint, not a
+    verdict: a heavy job finishing looks identical, so pair it with a
+    reachability check on the device.
     """
 
     enabled: bool = True
     drop_percent: int = 15
     cooldown_seconds: int = 600
+    window_polls: int = 4
 
     @classmethod
     def from_dict(cls, data: object) -> LoadStepPolicy:
@@ -172,6 +176,7 @@ class LoadStepPolicy:
             enabled=_as_bool(data.get("enabled"), True),
             drop_percent=max(1, _as_int(data.get("drop_percent"), 15)),
             cooldown_seconds=max(0, _as_int(data.get("cooldown_seconds"), 600)),
+            window_polls=max(1, _as_int(data.get("window_polls"), 4)),
         )
 
 

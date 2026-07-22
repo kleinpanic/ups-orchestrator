@@ -22,19 +22,30 @@ class UpsState:
     shutdowns_sent: list[str] = field(default_factory=list)
     last_tick_notified: int | None = None
     last_status: str | None = None
-    last_load: int | None = None
+    recent_loads: list[int] = field(default_factory=list)
     last_load_step_notified: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
         raw_sent = data.get("shutdowns_sent", [])
         sent = [str(x) for x in raw_sent] if isinstance(raw_sent, list) else []
+        raw_recent = data.get("recent_loads", [])
+        recent = (
+            [int(x) for x in raw_recent if isinstance(x, (int, float))]
+            if isinstance(raw_recent, list)
+            else []
+        )
+        if not recent:
+            # Pre-window state files stored a single last_load.
+            legacy = _opt_int(data.get("last_load"))
+            if legacy is not None:
+                recent = [legacy]
         return cls(
             onbatt_since=_opt_int(data.get("onbatt_since")),
             shutdowns_sent=sent,
             last_tick_notified=_opt_int(data.get("last_tick_notified")),
             last_status=str(data["last_status"]) if data.get("last_status") is not None else None,
-            last_load=_opt_int(data.get("last_load")),
+            recent_loads=recent,
             last_load_step_notified=_opt_int(data.get("last_load_step_notified")),
         )
 
