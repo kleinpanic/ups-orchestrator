@@ -25,6 +25,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remote" vs "both" per UPS.
 
 ### Changed
+- NUT `upsmon.conf` snippet and Deployment docs now spell out the full `MONITOR`
+  contract — connect-host (`@localhost` only on the `upsd` host), `powervalue`
+  vs `MINSUPPLIES`, `primary`/`secondary`, and the credential source — instead
+  of the earlier one-line sketch.
 - Recorder retention deepened from 10 to 20 rotations (`DEFAULT_MAX_ROTATIONS`
   and the `recorder.service` `--max-rotations`), roughly two weeks of one-second
   forensic history at the live three-UPS size. Worst case ≈ 1 GB

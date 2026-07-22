@@ -30,6 +30,28 @@ USB ids):
 - `upsmon.conf`: a `MONITOR` line per UPS plus the `NOTIFYFLAG`/`NOTIFYCMD`
   wiring.
 
+### The MONITOR contract
+
+`MONITOR <ups>@<host> <powervalue> <user> <pass> <primary|secondary>` decides
+who shuts down and when, so get these right:
+
+- **`@<host>`** must name the host running `upsd` — the one physically cabled to
+  the UPS. Use `@localhost` only there; a host watching over the network names
+  the `upsd` host instead. A wrong host means upsmon never reaches the UPS and
+  every event silently no-ops.
+- **`powervalue`** is `1` for a UPS that actually powers this host (counts toward
+  `MINSUPPLIES`) and `0` for a notify-only UPS, so an unrelated UPS's battery
+  can't trigger this host's shutdown.
+- **`primary`** runs the shutdown sequence (exactly one per UPS); **`secondary`**
+  only observes and powers itself off. On eulerpi5 the lines are `primary`
+  because it owns the shutdown; a USB-cabled debug/observer host (the rpi4) would
+  list the same UPSes as `secondary`.
+
+Every `NOTIFYFLAG … EXEC` must map to an event the orchestrator handles
+(`onbatt`, `online`, `lowbatt`, `commbad`, `commok`) and vice versa — a flag with
+no handler is dead config; a handler with no flag never fires. The orchestrator
+only observes and notifies here; upsmon's `SHUTDOWNCMD` does the real shutdown.
+
 ```bash
 sudo systemctl restart nut-driver-enumerator nut-server nut-monitor
 upsc -l   # your UPSes should be listed
