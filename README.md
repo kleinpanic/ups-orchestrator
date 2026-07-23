@@ -218,11 +218,21 @@ ups-orchestrator status            # table: state, battery, est. time to 0%, loa
 ups-orchestrator status --watch    # live-refreshing dashboard (Ctrl-C to exit)
 ups-orchestrator report --print    # preview the Discord daily load report
 ups-orchestrator report            # send the load report webhook now
+ups-orchestrator power-dashboard --out d.png   # render live+history power image
+ups-orchestrator power-dashboard --hours 168 --post   # post the image to Discord
 ups-orchestrator notify-test       # send a test embed and print delivery result
 ups-orchestrator audit             # summarize boot, UPS/NUT, local logs, state, and shutdown evidence
 ups-orchestrator logs events       # tail local UPS event/decision JSONL
 ups-orchestrator logs notifications
 ```
+
+**Power dashboard.** `power-dashboard` renders a PNG — a card per UPS (status,
+battery, load, runtime) plus a draw-history line chart from the recorder samples
+— and can post it to Discord. It needs `matplotlib` (an optional dep; install
+with `pip install ups-orchestrator[dashboard]` or add matplotlib to the install
+venv). The **daily report posts it automatically once a week** (Mondays), so it
+rides the existing `report` timer — no separate timer or service. Force it any
+day with `ups-orchestrator report --dashboard`.
 
 ## Install / Deploy
 

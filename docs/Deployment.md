@@ -78,7 +78,13 @@ This installs:
 - `ups-orchestrator-boot-audit.service`: one-shot post-boot alert when the host
   recovered from abrupt power loss.
 - `ups-orchestrator-report.timer`: daily Discord report of battery, estimated
-  time to 0%, load, and voltage for every configured UPS.
+  time to 0%, load, and voltage for every configured UPS. On Mondays it also
+  posts the **power dashboard** image (per-UPS cards, a draw-over-time chart, and
+  daily-kWh usage bars for the week) — no separate timer. This needs `matplotlib`
+  in the install venv; add it once with
+  `sudo /opt/ups-orchestrator/venv/bin/pip install matplotlib` (or
+  `pip install ups-orchestrator[dashboard]`). Without it the report still sends;
+  the image is skipped with a logged warning.
 
 You can test the report path immediately:
 

@@ -23,6 +23,7 @@ ups-orchestrator = "ups_orchestrator.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+dashboard = ["matplotlib>=3.7"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ups_orchestrator"]
@@ -38,6 +39,13 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 python_version = "3.11"
 strict = true
 files = ["src"]
+
+# matplotlib is an optional runtime dep (power-dashboard only) and ships no
+# typed stubs; skip it and its numpy backend rather than fail strict checking.
+[[tool.mypy.overrides]]
+module = ["matplotlib", "matplotlib.*", "numpy", "numpy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

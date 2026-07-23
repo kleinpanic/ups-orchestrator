@@ -24,6 +24,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   host too (`all`, fired last at its own threshold). Lets you configure "just the
   remote" vs "both" per UPS.
 
+- **`power-dashboard`** command: renders a PNG — a card per UPS (status, battery,
+  load, runtime) plus a draw-history line chart from the recorder samples — and
+  posts it to Discord as an image attachment (`--post`, `--out`, `--hours`).
+  Needs the optional `matplotlib` dep (`pip install ups-orchestrator[dashboard]`).
+  The daily `report` posts it automatically once a week (Mondays), so it rides
+  the existing report timer with no separate systemd unit; `report --dashboard`
+  forces it any day.
+
 ### Changed
 - NUT `upsmon.conf` snippet and Deployment docs now spell out the full `MONITOR`
   contract — connect-host (`@localhost` only on the `upsd` host), `powervalue`

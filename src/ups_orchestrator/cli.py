@@ -10,6 +10,7 @@ Modes::
     ups-orchestrator audit               # incident-oriented journald/UPS report
     ups-orchestrator boot-audit          # one-shot post-boot abrupt-loss alert
     ups-orchestrator record              # high-frequency UPS telemetry recorder
+    ups-orchestrator power-dashboard     # render/post a live+history power image
     ups-orchestrator notify-test         # send a Discord delivery test
     ups-orchestrator logs                # tail local JSONL logs
 
@@ -235,6 +236,11 @@ def _cmd_status(argv: list[str]) -> int:
 def _cmd_report(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator report")
     parser.add_argument("--print", action="store_true", help="print the report instead of sending")
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="also post the weekly power dashboard now (regardless of weekday)",
+    )
     args = parser.parse_args(argv)
 
     cfg = _load_config()
@@ -254,7 +260,80 @@ def _cmd_report(argv: list[str]) -> int:
         result.status_code,
         len(cfg.upses),
     )
+    # The daily report carries the power dashboard once a week (Monday), so the
+    # existing report timer delivers it without a separate timer/service.
+    if args.dashboard or time.localtime().tm_wday == _DASHBOARD_WEEKDAY:
+        _send_dashboard(cfg, hours=168)
     return 0 if result.ok else 1
+
+
+_DASHBOARD_WEEKDAY = 0  # Monday; the daily report posts the dashboard on this day.
+
+
+def _send_dashboard(cfg: Config, hours: int) -> tuple[bool, int]:
+    """Render the power dashboard and post it to Discord. Never raises.
+
+    Returns ``(ok, status)``; ``(False, 0)`` if matplotlib is unavailable or the
+    render/post fails, so a missing renderer degrades gracefully instead of
+    breaking the daily report.
+    """
+    from ups_orchestrator import dashboard
+
+    try:
+        png = dashboard.render_png(cfg, _sample_path(), hours=hours, host=socket.gethostname())
+    except ImportError:
+        LOG.warning("power-dashboard: matplotlib not installed; skipping image")
+        return False, 0
+    except Exception:  # noqa: BLE001 — a render failure must not sink the report
+        LOG.exception("power-dashboard: render failed")
+        return False, 0
+    ok, status = dashboard.post_png(
+        cfg.webhook_url,
+        png,
+        content=f"**Power dashboard — {socket.gethostname()}** (last {hours}h)",
+        username=cfg.discord_username,
+        avatar_url=cfg.discord_avatar_url,
+    )
+    LOG.info("power-dashboard: posted ok=%s status=%s hours=%d", ok, status, hours)
+    return ok, status
+
+
+def _cmd_power_dashboard(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator power-dashboard")
+    parser.add_argument("--hours", type=int, default=168, help="history window (default 168=7d)")
+    parser.add_argument("--out", type=Path, help="also write the PNG to this path")
+    parser.add_argument("--post", action="store_true", help="post the image to Discord")
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    from ups_orchestrator import dashboard
+
+    try:
+        png = dashboard.render_png(
+            cfg, _sample_path(), hours=max(1, args.hours), host=socket.gethostname()
+        )
+    except ImportError:
+        LOG.error("power-dashboard: matplotlib is not installed in this environment")
+        return 1
+    if args.out:
+        args.out.write_bytes(png)
+        print(f"wrote {args.out} ({len(png)} bytes)")
+    if args.post:
+        ok, status = dashboard.post_png(
+            cfg.webhook_url,
+            png,
+            content=f"**Power dashboard — {socket.gethostname()}** (last {args.hours}h)",
+            username=cfg.discord_username,
+            avatar_url=cfg.discord_avatar_url,
+        )
+        LOG.info("power-dashboard: posted ok=%s status=%s", ok, status)
+        return 0 if ok else 1
+    if not args.out:
+        LOG.error("power-dashboard: nothing to do — pass --out PATH and/or --post")
+        return 2
+    return 0
 
 
 def _cmd_audit(argv: list[str]) -> int:
@@ -417,7 +496,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         LOG.error(
             "usage: ups-orchestrator "
-            "<event|tick|watch|status|report|audit|boot-audit|record|notify-test|logs> [...]"
+            "<event|tick|watch|status|report|audit|boot-audit|record|"
+            "power-dashboard|notify-test|logs> [...]"
         )
         return 0
 
@@ -436,6 +516,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_logs(args[1:])
     if mode == "record":
         return _cmd_record(args[1:])
+    if mode == "power-dashboard":
+        return _cmd_power_dashboard(args[1:])
     if mode == "watch":
         return _cmd_watch()
     return _cmd_event(mode, _resolve_ups_name(args[1] if len(args) > 1 else None))
