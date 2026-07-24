@@ -63,3 +63,92 @@ def test_report_print_command(env_config, monkeypatch, capsys) -> None:
     )
     assert cli.main(["report", "--print"]) == 0
     assert "UPS load and runtime report" in capsys.readouterr().out
+
+
+_SNAP = UpsSnapshot("OL", 100, 600, 12, 120.0, realpower_nominal=900)
+
+
+def test_audit_command_prints(env_config, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("ups_orchestrator.audit._journal_since", lambda _s: [])
+    monkeypatch.setattr("ups_orchestrator.audit._list_boots", lambda: [])
+    monkeypatch.setattr("ups_orchestrator.audit.read_snapshot", lambda _n: _SNAP)
+    assert cli.main(["audit"]) == 0
+    assert capsys.readouterr().out.strip()
+
+
+def test_boot_audit_command(env_config, monkeypatch) -> None:
+    monkeypatch.setattr("ups_orchestrator.audit._current_boot_id", lambda: "b1")
+    monkeypatch.setattr("ups_orchestrator.audit._journal_current_boot", lambda: [])
+    monkeypatch.setattr("ups_orchestrator.audit.read_snapshot", lambda _n: _SNAP)
+    assert cli.main(["boot-audit"]) == 0
+
+
+def test_notify_test_print(env_config, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("ups_orchestrator.report.read_snapshot", lambda _n: _SNAP)
+    assert cli.main(["notify-test", "--print"]) == 0
+    assert "delivery test" in capsys.readouterr().out.lower()
+
+
+def test_notify_test_send_without_webhook_returns_one(env_config, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("ups_orchestrator.report.read_snapshot", lambda _n: _SNAP)
+    rc = cli.main(["notify-test"])  # empty webhook → NullNotifier → ok=False
+    assert "configured=False" in capsys.readouterr().out
+    assert rc == 1
+
+
+def test_logs_missing_files_report_not_found(env_config, capsys) -> None:
+    for kind in ("events", "notifications", "samples"):
+        assert cli.main(["logs", kind]) == 0
+    assert "not found" in capsys.readouterr().out
+
+
+def test_logs_tails_existing_file(env_config, tmp_path, capsys) -> None:
+    (tmp_path / "events.jsonl").write_text('{"a": 1}\n{"a": 2}\n{"a": 3}\n')
+    assert cli.main(["logs", "events", "--lines", "2"]) == 0
+    out = capsys.readouterr().out
+    assert '{"a": 3}' in out
+    assert '{"a": 1}' not in out
+
+
+def test_record_command_dispatches_with_args(env_config, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(_cfg, **kw: object) -> None:
+        seen.update(kw)
+
+    monkeypatch.setattr("ups_orchestrator.recorder.run", fake_run)
+    assert cli.main(["record", "--interval", "0.5", "--max-rotations", "7"]) == 0
+    assert seen["max_rotations"] == 7
+    assert seen["interval"] == 0.5
+
+
+def test_watch_command_runs_until_stopped(env_config, monkeypatch) -> None:
+    # Drive one tick then stop by making the post-tick sleep raise the loop's exit.
+    monkeypatch.setattr(cli, "dispatch", lambda *_a, **_k: None)
+    ticks = {"n": 0}
+
+    def fake_sleep(_secs: float) -> None:
+        ticks["n"] += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    # _cmd_watch does not catch KeyboardInterrupt, so it propagates out cleanly.
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+    assert ticks["n"] == 1
+
+
+def test_path_resolvers_fall_back_to_base(monkeypatch, tmp_path) -> None:
+    for var in (
+        "UPS_ORCH_CONFIG",
+        "UPS_ORCH_STATE",
+        "UPS_ORCH_SAMPLES",
+        "UPS_ORCH_EVENT_LOG",
+        "UPS_ORCH_NOTIFICATION_LOG",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cli, "_ETC_CONFIG", tmp_path / "nope.json")
+    monkeypatch.setattr(cli, "_VAR_STATE", tmp_path / "novar" / "state.json")
+    monkeypatch.setattr(cli, "_BASE", tmp_path)
+    assert cli._config_path() == tmp_path / "config.json"
+    assert cli._state_path() == tmp_path / "state.json"

@@ -56,3 +56,15 @@ def test_status_sparkline_renders_from_history() -> None:
 def test_status_empty_config() -> None:
     cfg = Config(webhook_url="", upses={})
     assert "(no UPSes configured)" in status.render(cfg, color=False, now=0)
+
+
+def test_battery_and_load_gauge_colors_by_threshold() -> None:
+    assert status._battery_color(100) == status._GREEN
+    assert status._battery_color(45) == status._YELLOW
+    assert status._battery_color(15) == status._RED
+    assert status._battery_color(None) == status._DIM
+    assert status._load_color("OK") == status._GREEN
+    assert status._load_color("WATCH") == status._YELLOW
+    assert status._load_color("HIGH") == status._YELLOW
+    assert status._load_color("CRIT") == status._RED
+    assert status._load_color("OVER") == status._RED

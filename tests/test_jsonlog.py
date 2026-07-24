@@ -31,3 +31,18 @@ def test_append_jsonl_rotates_then_writes(tmp_path) -> None:
 
     assert '"b": 2' in log.read_text()
     assert '"a": 1' in (tmp_path / "log.jsonl.1").read_text()
+
+
+def test_boot_id_falls_back_when_unreadable(monkeypatch) -> None:
+    import ups_orchestrator.jsonlog as jl
+
+    monkeypatch.setattr(jl.Path, "read_text", lambda _self: (_ for _ in ()).throw(OSError("nope")))
+    assert jl.boot_id() == "unknown"
+
+
+def test_base_record_has_envelope() -> None:
+    from ups_orchestrator.jsonlog import base_record
+
+    rec = base_record("notification")
+    assert rec["kind"] == "notification"
+    assert "time" in rec and "unix_time" in rec and "boot_id" in rec

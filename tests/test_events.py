@@ -293,3 +293,46 @@ def test_unknown_event_returns_false() -> None:
     notifier = FakeNotifier()
     deps, _ = make_deps(notifier, snap("OL"))
     assert dispatch("nonsense", make_ups(), UpsState(), deps) is False
+
+
+class _Proc:
+    def __init__(self, rc: int, out: str = "", err: str = "") -> None:
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = err
+
+
+def test_ssh_shutdown_reports_returncode_and_dest(monkeypatch) -> None:
+    from ups_orchestrator.events import _default_ssh_shutdown, ssh_dest
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **_kw):
+        captured["cmd"] = cmd
+        return _Proc(255, "", "Permission denied")
+
+    monkeypatch.setattr(events_mod.subprocess, "run", fake_run)
+    t = ShutdownTarget(name="srv", kind="remote", enabled=True, host="h", user="u", cmd="poweroff")  # type: ignore[arg-type]
+    rc, _out, err = _default_ssh_shutdown(t)
+    assert rc == 255
+    assert "Permission denied" in err
+    assert ssh_dest(t) == "u@h"
+    assert captured["cmd"][-2:] == ["u@h", "poweroff"]
+
+
+def test_ssh_dest_uses_host_alias_when_no_user() -> None:
+    from ups_orchestrator.events import ssh_dest
+
+    t = ShutdownTarget(name="srv", kind="remote", enabled=True, host="mt", user="")  # type: ignore[arg-type]
+    assert ssh_dest(t) == "mt"
+
+
+def test_local_shutdown_reports_returncode(monkeypatch) -> None:
+    from ups_orchestrator.events import _default_local_shutdown
+
+    monkeypatch.setattr(
+        events_mod.subprocess, "run", lambda *a, **k: _Proc(1, "", "no such command")
+    )
+    rc, _out, err = _default_local_shutdown("/sbin/shutdown -h now")
+    assert rc == 1
+    assert "no such command" in err

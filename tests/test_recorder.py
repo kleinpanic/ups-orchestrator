@@ -76,3 +76,41 @@ def test_default_retention_is_twenty_segments(tmp_path) -> None:
     assert path.read_text().strip() == '{"number": 24}'
     assert (tmp_path / f"samples.jsonl.{DEFAULT_MAX_ROTATIONS}").exists()
     assert not (tmp_path / f"samples.jsonl.{DEFAULT_MAX_ROTATIONS + 1}").exists()
+
+
+def test_rotate_disabled_when_max_bytes_zero(tmp_path) -> None:
+    from ups_orchestrator.recorder import _rotate
+
+    p = tmp_path / "s.jsonl"
+    p.write_text("x" * 100)
+    _rotate(p, max_bytes=0, max_rotations=5)  # disabled
+    assert p.exists() and not (tmp_path / "s.jsonl.1").exists()
+
+
+def test_rotate_zero_rotations_unlinks(tmp_path) -> None:
+    from ups_orchestrator.recorder import _rotate
+
+    p = tmp_path / "s.jsonl"
+    p.write_text("x" * 100)
+    _rotate(p, max_bytes=1, max_rotations=0)  # over size, no history kept
+    assert not p.exists()
+
+
+def test_run_stops_and_writes_one_sample(tmp_path, monkeypatch) -> None:
+    from ups_orchestrator import recorder
+    from ups_orchestrator.config import Config
+
+    monkeypatch.setattr(recorder, "build_record", lambda _cfg: {"unix_time": 1.0, "upses": {}})
+    monkeypatch.setattr(recorder.time, "monotonic", lambda: 0.0)
+    calls = {"n": 0}
+
+    def stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1  # run the body once, then stop
+
+    path = tmp_path / "s.jsonl"
+    recorder.run(
+        Config(webhook_url="", upses={}), path=path, interval=0.2, max_bytes=10_000, stop=stop
+    )
+    assert path.exists()
+    assert '"unix_time": 1.0' in path.read_text()

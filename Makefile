@@ -15,6 +15,7 @@ help:
 	@echo "  venv                 Create .venv and install package + dev deps"
 	@echo "  lint type test       Run ruff / mypy / pytest"
 	@echo "  coverage             Run pytest with branch coverage + term-missing"
+	@echo "  mutation             Targeted mutation test of critical logic"
 	@echo "  check                All three"
 	@echo "  deploy               System install (needs root): sudo make deploy"
 	@echo "  deploy-user-service  Enable the --user poll-loop service (NO sudo)"
@@ -35,6 +36,10 @@ test:
 
 coverage:
 	$(BASE)/.venv/bin/pytest -q --cov --cov-report=term-missing
+
+# Targeted mutation test — patches critical logic and expects the suite to catch it.
+mutation:
+	$(PY) tools/mutation_test.py
 
 check: lint type test
 
