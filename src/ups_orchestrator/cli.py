@@ -8,6 +8,7 @@ Modes::
     ups-orchestrator watch               # long-running poll loop (systemd --user service)
     ups-orchestrator status [--watch]    # terminal status table
     ups-orchestrator audit               # incident-oriented journald/UPS report
+    ups-orchestrator baseline            # per-UPS draw baseline from recorder history
     ups-orchestrator boot-audit          # one-shot post-boot abrupt-loss alert
     ups-orchestrator record              # high-frequency UPS telemetry recorder
     ups-orchestrator power-dashboard     # render/post a live+history power image
@@ -338,6 +339,21 @@ def _cmd_power_dashboard(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_baseline(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator baseline")
+    parser.add_argument("--hours", type=int, default=168, help="analysis window (default 168=7d)")
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    from ups_orchestrator import baseline
+
+    stats = baseline.compute_baselines(_sample_path(), list(cfg.upses), hours=max(1, args.hours))
+    print(baseline.render_text(cfg, stats, hours=max(1, args.hours)))
+    return 0
+
+
 def _cmd_audit(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator audit")
     parser.add_argument("--since", default="today", help="journalctl --since window")
@@ -498,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         LOG.error(
             "usage: ups-orchestrator "
-            "<event|tick|watch|status|report|audit|boot-audit|record|"
+            "<event|tick|watch|status|report|audit|baseline|boot-audit|record|"
             "power-dashboard|notify-test|logs> [...]"
         )
         return 0
@@ -510,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_report(args[1:])
     if mode == "audit":
         return _cmd_audit(args[1:])
+    if mode == "baseline":
+        return _cmd_baseline(args[1:])
     if mode == "boot-audit":
         return _cmd_boot_audit(args[1:])
     if mode == "notify-test":

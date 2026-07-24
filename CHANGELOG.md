@@ -7,6 +7,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`baseline` command**: per-UPS draw statistics (median / p95 / mean / min / max watts) computed read-only from the recorder history — a sense of each UPS's normal load. `--hours` sets the window.
 - **Full NUT data ingestion**: `UpsSnapshot` and the recorder now capture battery
   voltage (+nominal), battery type, driver state, beeper status, shutdown/start
   delays, device serial, input nominal voltage, and battery charge/runtime
