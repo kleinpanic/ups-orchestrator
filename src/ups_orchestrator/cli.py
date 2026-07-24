@@ -13,6 +13,7 @@ Modes::
     ups-orchestrator boot-audit          # one-shot post-boot abrupt-loss alert
     ups-orchestrator record              # high-frequency UPS telemetry recorder
     ups-orchestrator power-dashboard     # render/post a live+history power image
+    ups-orchestrator webui               # local web dashboard (live status + history)
     ups-orchestrator notify-test         # send a Discord delivery test
     ups-orchestrator logs                # tail local JSONL logs
 
@@ -416,6 +417,22 @@ def _cmd_selftest(argv: list[str]) -> int:
     return 1 if any_problem else 0
 
 
+def _cmd_webui(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator webui")
+    parser.add_argument("--host", default="127.0.0.1", help="bind address (localhost by default)")
+    parser.add_argument("--port", type=int, default=8765, help="listen port")
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    from ups_orchestrator import webui
+
+    LOG.info("webui: serving http://%s:%d — no auth, do not expose publicly", args.host, args.port)
+    webui.serve(cfg, _sample_path(), host=args.host, port=args.port)
+    return 0
+
+
 def _cmd_audit(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator audit")
     parser.add_argument("--since", default="today", help="journalctl --since window")
@@ -577,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error(
             "usage: ups-orchestrator "
             "<event|tick|watch|status|report|audit|baseline|selftest|boot-audit|record|"
-            "power-dashboard|notify-test|logs> [...]"
+            "power-dashboard|webui|notify-test|logs> [...]"
         )
         return 0
 
@@ -592,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_baseline(args[1:])
     if mode == "selftest":
         return _cmd_selftest(args[1:])
+    if mode == "webui":
+        return _cmd_webui(args[1:])
     if mode == "boot-audit":
         return _cmd_boot_audit(args[1:])
     if mode == "notify-test":

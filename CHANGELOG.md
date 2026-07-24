@@ -7,6 +7,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`webui` command**: a dependency-free (stdlib `http.server`) local web dashboard — live per-UPS cards (status, battery/load gauges, pack voltage, headroom, alarm, self-test) plus a 24h draw chart, backed by `/api/status` and `/api/history` JSON endpoints. Binds to localhost with no auth (don't expose publicly); serves no secrets. All UPS-supplied strings are HTML-escaped.
 - **`selftest` command**: runs a NUT quick battery test (`upscmd`) per UPS, polls `ups.test.result`, and alerts on a failed/aborted/timed-out result. Skips any UPS on battery (a test drains the pack). Admin creds come from env (`UPS_NUT_ADMIN_USER` / `UPS_NUT_ADMIN_PASSWORD`), never the config. Ships a weekly systemd timer snippet.
 - **`baseline` command**: per-UPS draw statistics (median / p95 / mean / min / max watts) computed read-only from the recorder history — a sense of each UPS's normal load. `--hours` sets the window.
 - **Full NUT data ingestion**: `UpsSnapshot` and the recorder now capture battery
