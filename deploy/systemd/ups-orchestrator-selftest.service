@@ -1,0 +1,12 @@
+# Weekly NUT battery self-test with Discord alert on failure.
+# Needs a NUT admin account (instcmds in /etc/nut/upsd.users) exported as
+# UPS_NUT_ADMIN_USER / UPS_NUT_ADMIN_PASSWORD in /etc/ups-orchestrator.env.
+# The command skips any UPS that is on battery (a test drains the pack).
+
+[Unit]
+Description=ups-orchestrator weekly UPS battery self-test
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ups-orchestrator.env
+ExecStart=/usr/local/bin/ups-orchestrator selftest

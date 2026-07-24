@@ -7,6 +7,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`selftest` command**: runs a NUT quick battery test (`upscmd`) per UPS, polls `ups.test.result`, and alerts on a failed/aborted/timed-out result. Skips any UPS on battery (a test drains the pack). Admin creds come from env (`UPS_NUT_ADMIN_USER` / `UPS_NUT_ADMIN_PASSWORD`), never the config. Ships a weekly systemd timer snippet.
 - **`baseline` command**: per-UPS draw statistics (median / p95 / mean / min / max watts) computed read-only from the recorder history — a sense of each UPS's normal load. `--hours` sets the window.
 - **Full NUT data ingestion**: `UpsSnapshot` and the recorder now capture battery
   voltage (+nominal), battery type, driver state, beeper status, shutdown/start

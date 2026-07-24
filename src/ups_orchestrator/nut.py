@@ -7,6 +7,28 @@ import subprocess
 from dataclasses import dataclass
 
 UPSC_BIN = shutil.which("upsc") or "/bin/upsc"
+UPSCMD_BIN = shutil.which("upscmd") or "/bin/upscmd"
+
+
+def upscmd(
+    ups_name: str, command: str, *, user: str, password: str, timeout: float = 15.0
+) -> tuple[int, str, str]:
+    """Run an instant command via ``upscmd`` (e.g. ``test.battery.start.quick``).
+
+    Needs a NUT admin account (``instcmds``/``actions`` in ``upsd.users``); the
+    credentials are the caller's responsibility and must never be logged. Returns
+    ``(returncode, stdout, stderr)``; a non-zero code on failure.
+    """
+    try:
+        result = subprocess.run(
+            [UPSCMD_BIN, "-u", user, "-p", password, ups_name, command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
 def upsc_var(ups_name: str, key: str, timeout: float = 10.0) -> str | None:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly UPS battery self-test
+
+[Timer]
+# Monday 08:30 local; adjust with: systemctl --user edit ups-orchestrator-selftest.timer
+OnCalendar=Mon *-*-* 08:30:00
+Persistent=true
+Unit=ups-orchestrator-selftest.service
+
+[Install]
+WantedBy=timers.target
