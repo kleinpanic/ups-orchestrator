@@ -66,6 +66,48 @@ class UpsSnapshot:
     timer_shutdown: int | None = None
     timer_start: int | None = None
     alarm: str | None = None
+    # Extended NUT fields (Phase G). battery.mfr.date is intentionally omitted —
+    # these CyberPower units report the vendor string ("CPS") there, not a date,
+    # so battery age is not derivable.
+    battery_voltage: float | None = None
+    battery_voltage_nominal: float | None = None
+    battery_type: str | None = None
+    input_voltage_nominal: float | None = None
+    driver_state: str | None = None
+    beeper_status: str | None = None
+    delay_shutdown: int | None = None
+    delay_start: int | None = None
+    device_serial: str | None = None
+    charge_low: int | None = None
+    charge_warning: int | None = None
+    runtime_low: int | None = None
+
+    @property
+    def battery_voltage_percent(self) -> int | None:
+        """Battery voltage as a percent of nominal.
+
+        A charged lead-acid pack sits well above 100% (e.g. 27/24 V ≈ 113%); the
+        aging signal is a declining *charged peak* over time, not a single
+        reading, so this is context/trend data — not a clamped health gauge.
+        """
+        if self.battery_voltage is None or not self.battery_voltage_nominal:
+            return None
+        return round(self.battery_voltage / self.battery_voltage_nominal * 100)
+
+    @property
+    def input_voltage_percent(self) -> int | None:
+        """Input voltage as a percent of nominal line voltage (line quality)."""
+        if self.input_voltage is None or not self.input_voltage_nominal:
+            return None
+        return round(self.input_voltage / self.input_voltage_nominal * 100)
+
+    @property
+    def load_headroom_watts(self) -> int | None:
+        """Unused output capacity in watts (nominal − estimated draw)."""
+        watts = self.estimated_load_watts
+        if watts is None or self.realpower_nominal is None:
+            return None
+        return max(0, self.realpower_nominal - watts)
 
     @property
     def on_battery(self) -> bool:
@@ -145,4 +187,16 @@ def read_snapshot(ups_name: str) -> UpsSnapshot:
         timer_shutdown=_as_int(values.get("ups.timer.shutdown")),
         timer_start=_as_int(values.get("ups.timer.start")),
         alarm=values.get("ups.alarm"),
+        battery_voltage=_as_float(values.get("battery.voltage")),
+        battery_voltage_nominal=_as_float(values.get("battery.voltage.nominal")),
+        battery_type=values.get("battery.type"),
+        input_voltage_nominal=_as_float(values.get("input.voltage.nominal")),
+        driver_state=values.get("driver.state"),
+        beeper_status=values.get("ups.beeper.status"),
+        delay_shutdown=_as_int(values.get("ups.delay.shutdown")),
+        delay_start=_as_int(values.get("ups.delay.start")),
+        device_serial=values.get("device.serial") or values.get("ups.serial"),
+        charge_low=_as_int(values.get("battery.charge.low")),
+        charge_warning=_as_int(values.get("battery.charge.warning")),
+        runtime_low=_as_int(values.get("battery.runtime.low")),
     )

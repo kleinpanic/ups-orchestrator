@@ -24,6 +24,18 @@ def test_read_snapshot_parses_types(monkeypatch) -> None:
         "ups.timer.shutdown": "-60",
         "ups.timer.start": "30",
         "ups.alarm": "none",
+        "battery.voltage": "26.3",
+        "battery.voltage.nominal": "24",
+        "battery.type": "PbAcid",
+        "input.voltage.nominal": "120",
+        "driver.state": "quiet",
+        "ups.beeper.status": "enabled",
+        "ups.delay.shutdown": "20",
+        "ups.delay.start": "30",
+        "device.serial": "CYBMY7000053",
+        "battery.charge.low": "10",
+        "battery.charge.warning": "20",
+        "battery.runtime.low": "300",
     }
     monkeypatch.setattr(nut, "upsc_vars", lambda _ups, timeout=10.0: values)
     s = read_snapshot("anything")
@@ -39,6 +51,38 @@ def test_read_snapshot_parses_types(monkeypatch) -> None:
     assert s.timer_shutdown == -60
     assert s.timer_start == 30
     assert s.alarm == "none"
+    assert s.battery_voltage == 26.3
+    assert s.battery_voltage_nominal == 24.0
+    assert s.battery_type == "PbAcid"
+    assert s.input_voltage_nominal == 120.0
+    assert s.driver_state == "quiet"
+    assert s.beeper_status == "enabled"
+    assert s.delay_shutdown == 20
+    assert s.delay_start == 30
+    assert s.device_serial == "CYBMY7000053"
+    assert (s.charge_low, s.charge_warning, s.runtime_low) == (10, 20, 300)
+
+
+def test_derived_voltage_and_headroom_metrics() -> None:
+    s = UpsSnapshot(
+        "OL",
+        100,
+        1800,
+        22,
+        117.5,
+        realpower_nominal=900,
+        battery_voltage=26.4,
+        battery_voltage_nominal=24.0,
+        input_voltage_nominal=120.0,
+    )
+    assert s.battery_voltage_percent == 110  # 26.4/24
+    assert s.input_voltage_percent == 98  # 117.5/120
+    assert s.load_headroom_watts == 702  # 900 - 198
+    # Absent inputs degrade to None, never crash.
+    bare = UpsSnapshot(None, None, None, None, None)
+    assert bare.battery_voltage_percent is None
+    assert bare.input_voltage_percent is None
+    assert bare.load_headroom_watts is None
 
 
 def test_read_snapshot_handles_missing(monkeypatch) -> None:

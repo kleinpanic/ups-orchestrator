@@ -40,6 +40,13 @@ def _snapshot_payload(snap: UpsSnapshot) -> dict[str, int | float | str | None]:
         "timer_shutdown": snap.timer_shutdown,
         "timer_start": snap.timer_start,
         "alarm": snap.alarm,
+        "battery_voltage": snap.battery_voltage,
+        "battery_voltage_nominal": snap.battery_voltage_nominal,
+        "battery_type": snap.battery_type,
+        "input_voltage_nominal": snap.input_voltage_nominal,
+        "driver_state": snap.driver_state,
+        "beeper_status": snap.beeper_status,
+        "device_serial": snap.device_serial,
     }
 
 

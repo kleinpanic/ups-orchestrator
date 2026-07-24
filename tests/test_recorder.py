@@ -15,7 +15,18 @@ def test_build_record_includes_all_ups_fields(monkeypatch) -> None:
     record = build_record(
         cfg,
         snapshot_reader=lambda _name: UpsSnapshot(
-            "OL", 100, 120, 25, 119.0, output_voltage=119.0, realpower_nominal=900
+            "OL",
+            100,
+            120,
+            25,
+            119.0,
+            output_voltage=119.0,
+            realpower_nominal=900,
+            battery_voltage=27.0,
+            battery_voltage_nominal=24.0,
+            battery_type="PbAcid",
+            driver_state="quiet",
+            device_serial="CYBMY7000053",
         ),
     )
 
@@ -27,6 +38,11 @@ def test_build_record_includes_all_ups_fields(monkeypatch) -> None:
     assert ups["load_margin_percent"] == 75
     assert ups["test_result"] is None
     assert ups["timer_shutdown"] is None
+    assert ups["battery_voltage"] == 27.0
+    assert ups["battery_voltage_nominal"] == 24.0
+    assert ups["battery_type"] == "PbAcid"
+    assert ups["driver_state"] == "quiet"
+    assert ups["device_serial"] == "CYBMY7000053"
 
 
 def test_append_record_writes_jsonl(tmp_path) -> None:
