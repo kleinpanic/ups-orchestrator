@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
-from dataclasses import dataclass
+from pathlib import Path
 
 from ups_orchestrator.config import Config
-from ups_orchestrator.events import charge_bar, fmt_duration
+from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
 _RESET = "\033[0m"
@@ -16,20 +17,14 @@ _BOLD = "\033[1m"
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
-_CLEAR = "\033[2J\033[H"
+_CYAN = "\033[36m"
+_HOME = "\033[H"
+_CLEAR_EOL = "\033[K"
+_CLEAR_EOS = "\033[J"
 
-
-@dataclass
-class _Row:
-    label: str
-    state: str
-    state_color: str
-    battery: str
-    est_to_empty: str
-    load: str
-    watts: str
-    margin: str
-    inp: str
+_BLOCKS = "▁▂▃▄▅▆▇█"
+_GAUGE_W = 14
+_SPARK_MIN = "▏"
 
 
 def _classify(snap: UpsSnapshot) -> tuple[str, str]:
@@ -37,115 +32,133 @@ def _classify(snap: UpsSnapshot) -> tuple[str, str]:
     if snap.status is None:
         return "✖ NO COMM", _RED
     if snap.low_battery:
-        return "⚠ Low Battery", _RED
+        return "⚠ LOW BATTERY", _RED
     if snap.on_battery:
-        return "⚡ On Battery", _YELLOW
+        return "⚡ ON BATTERY", _YELLOW
     suffix = " (charging)" if "CHRG" in snap.status else ""
     return f"● Online{suffix}", _GREEN
 
 
-def _battery_cell(snap: UpsSnapshot) -> str:
-    if snap.charge is None:
-        return "—"
-    return f"{charge_bar(snap.charge)} {snap.charge:>3}%"
+def _load_color(level: str) -> str:
+    if level in ("CRIT", "OVER"):
+        return _RED
+    if level in ("HIGH", "WATCH"):
+        return _YELLOW
+    return _GREEN
 
 
-def _load_cell(snap: UpsSnapshot) -> str:
-    if snap.load is None:
-        return "—"
-    return f"{snap.load}% {snap.load_level}"
+def _battery_color(charge: int | None) -> str:
+    if charge is None:
+        return _DIM
+    if charge <= 20:
+        return _RED
+    if charge <= 50:
+        return _YELLOW
+    return _GREEN
 
 
-def _watts_cell(snap: UpsSnapshot) -> str:
-    watts = snap.estimated_load_watts
-    if watts is None or snap.realpower_nominal is None:
-        return "—"
-    return f"~{watts}/{snap.realpower_nominal}W"
+def _gauge(frac: float, color: str, *, use_color: bool, width: int = _GAUGE_W) -> str:
+    frac = max(0.0, min(1.0, frac))
+    filled = round(frac * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{color}{bar}{_RESET}" if use_color else bar
 
 
-def _margin_cell(snap: UpsSnapshot) -> str:
-    if snap.load_margin_percent is None:
-        return "—"
-    return f"{snap.load_margin_percent}%"
+def _sparkline(watts: list[int], cols: int = 34) -> str:
+    if len(watts) < 2:
+        return ""
+    step = max(1, len(watts) // cols)
+    buckets = [max(watts[i : i + step]) for i in range(0, len(watts), step)][:cols]
+    lo, hi = min(buckets), max(buckets)
+    if hi == lo:
+        return _BLOCKS[3] * len(buckets)
+    return "".join(_BLOCKS[(w - lo) * 7 // (hi - lo)] for w in buckets)
 
 
-def _row(label: str, snap: UpsSnapshot) -> _Row:
-    state, color = _classify(snap)
-    return _Row(
-        label=label,
-        state=state,
-        state_color=color,
-        battery=_battery_cell(snap),
-        est_to_empty="—" if snap.runtime_seconds is None else fmt_duration(snap.runtime_seconds),
-        load=_load_cell(snap),
-        watts=_watts_cell(snap),
-        margin=_margin_cell(snap),
-        inp="—" if snap.input_voltage is None else f"{snap.input_voltage:.0f}V",
-    )
+def _recent_watts(sample_path: Path | None, name: str, now: float, minutes: int = 30) -> list[int]:
+    if sample_path is None:
+        return []
+    try:
+        from ups_orchestrator.dashboard import _read_series
+
+        series = _read_series(sample_path, [name], now - minutes * 60)
+    except Exception:  # noqa: BLE001 — telemetry is best-effort; never break status
+        return []
+    return [w for _, w in series.get(name, [])]
 
 
-def _pad(text: str, width: int) -> str:
-    # Pad on plain text, then colour separately so escape codes don't skew width.
-    return text + " " * max(0, width - len(text))
-
-
-def render(cfg: Config, *, color: bool = True, now: float | None = None) -> str:
-    """Build the full status block for every configured UPS."""
-
+def _card(
+    ups_label: str, snap: UpsSnapshot, watts_hist: list[int], *, use_color: bool
+) -> list[str]:
     def c(text: str, code: str) -> str:
-        return f"{code}{text}{_RESET}" if color else text
+        return f"{code}{text}{_RESET}" if use_color else text
 
-    rows = [_row(u.label, read_snapshot(name)) for name, u in cfg.upses.items()]
+    state, scolor = _classify(snap)
+    v_in = "—" if snap.input_voltage is None else f"{snap.input_voltage:.0f}V"
+    v_out = "" if snap.output_voltage is None else f" / {snap.output_voltage:.0f}V out"
+    header = f"{c(ups_label, _BOLD)}  {c(state, scolor)}  {c(f'in {v_in}{v_out}', _DIM)}"
 
-    w_label = max([len("UPS"), *(len(r.label) for r in rows)]) + 2
-    w_state = max([len("STATE"), *(len(r.state) for r in rows)]) + 2
-    w_batt = max([len("BATTERY"), *(len(r.battery) for r in rows)]) + 2
-    w_rt = max([len("EST. TO 0%"), *(len(r.est_to_empty) for r in rows)]) + 2
-    w_load = max([len("LOAD"), *(len(r.load) for r in rows)]) + 2
-    w_watts = max([len("WATTS"), *(len(r.watts) for r in rows)]) + 2
-    w_margin = max([len("MARGIN"), *(len(r.margin) for r in rows)]) + 2
-
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-    lines = [c(f"⚡ UPS Orchestrator — {ts}", _BOLD)]
-    header = (
-        _pad("UPS", w_label)
-        + _pad("STATE", w_state)
-        + _pad("BATTERY", w_batt)
-        + _pad("EST. TO 0%", w_rt)
-        + _pad("LOAD", w_load)
-        + _pad("WATTS", w_watts)
-        + _pad("MARGIN", w_margin)
-        + "INPUT"
+    charge = snap.charge
+    bv = f"  {snap.battery_voltage:.1f}V" if snap.battery_voltage is not None else ""
+    rt = "" if snap.runtime_seconds is None else f"  ~{fmt_duration(snap.runtime_seconds)} to 0%"
+    batt = (
+        f"  Battery {_gauge((charge or 0) / 100, _battery_color(charge), use_color=use_color)} "
+        f"{'—' if charge is None else f'{charge:>3}%'}{bv}{c(rt, _DIM)}"
     )
-    lines.append(c(header, _DIM))
-    for r in rows:
-        line = (
-            _pad(r.label, w_label)
-            + c(_pad(r.state, w_state), r.state_color)
-            + _pad(r.battery, w_batt)
-            + _pad(r.est_to_empty, w_rt)
-            + _pad(r.load, w_load)
-            + _pad(r.watts, w_watts)
-            + _pad(r.margin, w_margin)
-            + r.inp
-        )
-        lines.append(line)
-    if not rows:
-        lines.append(c("(no UPSes configured)", _DIM))
+
+    load = snap.load
+    lg = _gauge((load or 0) / 100, _load_color(snap.load_level), use_color=use_color)
+    watts, nominal, head = (
+        snap.estimated_load_watts,
+        snap.realpower_nominal,
+        snap.load_headroom_watts,
+    )
+    wtext = "" if watts is None or nominal is None else f"  {watts}/{nominal} W"
+    htext = "" if head is None else c(f"  {head} W free", _DIM)
+    loadline = (
+        f"  Load    {lg} {'—' if load is None else f'{load:>3}%'} {snap.load_level}{wtext}{htext}"
+    )
+
+    lines = ["", header, batt, loadline]
+    spark = _sparkline(watts_hist)
+    if spark:
+        rng = f"{min(watts_hist)}–{max(watts_hist)} W, 30m"
+        lines.append(f"  Draw    {c(spark, _CYAN)} {c(rng, _DIM)}")
+    return lines
+
+
+def render(
+    cfg: Config, *, color: bool = True, now: float | None = None, sample_path: Path | None = None
+) -> str:
+    """Build the full status block for every configured UPS."""
+    now = time.time() if now is None else now
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    header = f"⚡ UPS Orchestrator — {ts}"
+    lines = [f"{_BOLD}{header}{_RESET}" if color else header]
+    for name, ups in cfg.upses.items():
+        snap = read_snapshot(name)
+        lines.extend(_card(ups.label, snap, _recent_watts(sample_path, name, now), use_color=color))
+    if not cfg.upses:
+        lines.append(f"{_DIM}(no UPSes configured){_RESET}" if color else "(no UPSes configured)")
     return "\n".join(lines)
 
 
-def run(cfg: Config, *, watch: bool = False, interval: float = 2.0) -> int:
+def run(
+    cfg: Config, *, watch: bool = False, interval: float = 2.0, sample_path: Path | None = None
+) -> int:
     """Print the status view once, or live-refresh it until interrupted."""
-    color = sys.stdout.isatty()
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     if not watch:
-        print(render(cfg, color=color))
+        print(render(cfg, color=color, sample_path=sample_path))
         return 0
     try:
+        # Home-and-overwrite (not full clear) to avoid flicker; clear to EOL per
+        # line and to end-of-screen at the bottom so shorter frames don't ghost.
         while True:
-            sys.stdout.write(_CLEAR)
-            sys.stdout.write(render(cfg, color=color) + "\n")
-            sys.stdout.write(f"\n{_DIM}refreshing every {interval:g}s — Ctrl-C to exit{_RESET}\n")
+            frame = render(cfg, color=color, sample_path=sample_path).split("\n")
+            out = _HOME + "\n".join(line + _CLEAR_EOL for line in frame)
+            out += f"\n{_DIM}refreshing every {interval:g}s — Ctrl-C to exit{_RESET}{_CLEAR_EOL}"
+            sys.stdout.write(out + _CLEAR_EOS)
             sys.stdout.flush()
             time.sleep(interval)
     except KeyboardInterrupt:

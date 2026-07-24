@@ -230,7 +230,9 @@ def _cmd_status(argv: list[str]) -> int:
     cfg = _load_config()
     if cfg is None:
         return 1
-    return status_view.run(cfg, watch=args.watch, interval=args.interval)
+    return status_view.run(
+        cfg, watch=args.watch, interval=args.interval, sample_path=_sample_path()
+    )
 
 
 def _cmd_report(argv: list[str]) -> int:
