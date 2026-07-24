@@ -21,3 +21,19 @@ config.local.json
 *.env
 !*.env.example
 .env
+
+# Generated artifacts (dashboards/reports/telemetry) — never commit
+*.png
+*.jpg
+*.jpeg
+*.svg
+samples.jsonl
+samples.jsonl.*
+events.jsonl
+notifications.jsonl
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

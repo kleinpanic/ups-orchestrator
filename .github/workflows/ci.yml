@@ -20,8 +20,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Install the dashboard extra too, so the matplotlib-backed power-dashboard
+      # is import-tested in CI (it ships as an optional feature).
       - name: Install
-        run: python -m pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev,dashboard]"
 
       - name: Ruff (lint + format check)
         run: |
@@ -31,5 +33,16 @@ jobs:
       - name: Mypy (strict)
         run: mypy
 
-      - name: Pytest
-        run: pytest -q
+      - name: Pytest (with branch coverage gate)
+        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=70
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml

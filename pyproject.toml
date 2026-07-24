@@ -11,12 +11,30 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "klein" }]
 keywords = ["nut", "ups", "discord", "monitoring", "homelab"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: No Input/Output (Daemon)",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Monitoring",
+  "Topic :: System :: Hardware",
+  "Typing :: Typed",
+]
 # Runtime is intentionally dependency-free: Discord delivery uses stdlib urllib,
 # UPS data comes from the `upsc` CLI shipped with NUT.
 dependencies = []
 
 [project.urls]
+Homepage = "https://github.com/kleinpanic/ups-orchestrator"
 Repository = "https://github.com/kleinpanic/ups-orchestrator"
+Changelog = "https://github.com/kleinpanic/ups-orchestrator/blob/main/CHANGELOG.md"
+Issues = "https://github.com/kleinpanic/ups-orchestrator/issues"
+Documentation = "https://github.com/kleinpanic/ups-orchestrator/wiki"
 
 [project.scripts]
 ups-orchestrator = "ups_orchestrator.cli:main"

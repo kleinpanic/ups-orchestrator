@@ -7,6 +7,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Full NUT data ingestion**: `UpsSnapshot` and the recorder now capture battery
+  voltage (+nominal), battery type, driver state, beeper status, shutdown/start
+  delays, device serial, input nominal voltage, and battery charge/runtime
+  thresholds — the useful vars the CyberPower units expose that were previously
+  discarded. Derived `battery_voltage_percent`, `input_voltage_percent`, and
+  `load_headroom_watts`. (`battery.mfr.date` reads the vendor string, not a date,
+  so battery age is not derivable and is not shown.)
+- **Richer displays**: report, dashboard, and audit now surface battery health
+  (pack voltage · % of nominal · type), active alarms, last self-test result,
+  input line quality vs nominal, and load headroom in watts. A failed self-test
+  or active alarm escalates the report to a warning.
+- **Redesigned `status` TUI**: per-UPS cards with colored battery/load bar
+  gauges, pack voltage, output voltage, load headroom, and an in-terminal draw
+  sparkline from the recorder samples. Honors `NO_COLOR`/non-TTY; `--watch`
+  refreshes without flicker.
+
+### Fixed
+- **Boot-audit alert loss**: the "already sent" marker is now written only after
+  a confirmed Discord delivery, so a failed first send (the network is often
+  down right after a power-loss reboot) retries on the next run instead of
+  permanently suppressing the abrupt-power-loss alert for that boot.
+- **State durability**: the state tempfile is `fsync`'d before the atomic
+  replace, matching the recorder/jsonlog writers — no zero-length state file on
+  power loss.
+- **Log rotation**: `jsonlog` rotates via atomic `Path.replace` instead of
+  unlink-then-rename (removes a TOCTOU window).
+- **Serial shutdown**: a short/failed serial write is now reported as a failure
+  instead of false success.
+
+### Repository
+- `py.typed` marker (PEP 561), pyproject classifiers + Homepage/Changelog/Issues
+  URLs, coverage tooling (`pytest-cov`, `[tool.coverage]`) with a 70% CI gate,
+  CI now installs+tests the `[dashboard]` extra and runs a gitleaks job,
+  `.pre-commit-config.yaml`, issue/PR templates, `.editorconfig`, and expanded
+  `.gitignore`.
+
+### Added (earlier)
 - **Load-step drop detection** (`load_step` config block, on by default): a
   device abruptly losing power shows up as its UPS's output load collapsing
   while the UPS itself stays `OL` — NUT's only in-band signature for a
