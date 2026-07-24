@@ -160,3 +160,12 @@ def test_shutdown_policy_parses_central_surface(tmp_path: Path) -> None:
     assert cfg.shutdown_policy.internal.enabled is False
     assert cfg.shutdown_policy.internal.battery_below == 8
     assert cfg.shutdown_policy.internal.runtime_below == 60
+
+
+def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> None:
+    from ups_orchestrator import cli
+
+    bad = tmp_path / "config.json"
+    bad.write_text("{ not valid json ")
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(bad))
+    assert cli._load_config() is None  # graceful, not a crash

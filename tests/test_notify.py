@@ -80,3 +80,87 @@ def test_audited_notifier_writes_delivery_result(tmp_path) -> None:
     assert '"title": "delivery"' in line
     assert '"attempts": 2' in line
     assert '"ok": true' in line
+
+
+# --- delivery retry/backoff -------------------------------------------------
+import io  # noqa: E402
+import urllib.error  # noqa: E402
+
+import ups_orchestrator.notify as notify_mod  # noqa: E402
+
+
+class _Resp:
+    def __init__(self, status: int) -> None:
+        self._status = status
+
+    def __enter__(self) -> _Resp:
+        return self
+
+    def __exit__(self, *_a: object) -> bool:
+        return False
+
+    def getcode(self) -> int:
+        return self._status
+
+
+def _http_error(code: int, headers: dict[str, str] | None = None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://x", code, "err", headers or {}, io.BytesIO(b"{}"))
+
+
+def _patch_urlopen(monkeypatch, seq):
+    calls = {"n": 0}
+
+    def fake_urlopen(_req, timeout=0.0):
+        item = seq[calls["n"]]
+        calls["n"] += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(notify_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(notify_mod.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_notify_retries_5xx_then_succeeds(monkeypatch) -> None:
+    _patch_urlopen(monkeypatch, [_http_error(503), _http_error(502), _Resp(204)])
+    res = DiscordWebhookNotifier("https://x", max_attempts=3).send(Notification(title="t"))
+    assert res.ok is True
+    assert res.status_code == 204
+    assert res.attempts == 3
+
+
+def test_notify_429_honors_retry_after_header(monkeypatch) -> None:
+    slept: list[float] = []
+    calls = {"n": 0}
+    seq = [_http_error(429, {"Retry-After": "2"}), _Resp(204)]
+
+    def fake_urlopen(_req, timeout=0.0):
+        item = seq[calls["n"]]
+        calls["n"] += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(notify_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(notify_mod.time, "sleep", lambda s: slept.append(s))
+    res = DiscordWebhookNotifier("https://x", max_attempts=3).send(Notification(title="t"))
+    assert res.ok is True
+    assert slept == [2.0]  # honored the header, not the default backoff
+
+
+def test_notify_gives_up_after_max_attempts(monkeypatch) -> None:
+    calls = _patch_urlopen(monkeypatch, [urllib.error.URLError("down")] * 3)
+    res = DiscordWebhookNotifier("https://x", max_attempts=3).send(Notification(title="t"))
+    assert res.ok is False
+    assert res.attempts == 3
+    assert calls["n"] == 3
+
+
+def test_notify_4xx_fails_without_retry(monkeypatch) -> None:
+    calls = _patch_urlopen(monkeypatch, [_http_error(400), _Resp(204)])
+    res = DiscordWebhookNotifier("https://x", max_attempts=3).send(Notification(title="t"))
+    assert res.ok is False
+    assert res.status_code == 400
+    assert res.attempts == 1
+    assert calls["n"] == 1  # no retry on 4xx

@@ -37,3 +37,22 @@ def test_state_save_creates_parent_and_writes_json(tmp_path) -> None:
             "shutdowns_sent": [],
         }
     }
+
+
+def test_state_recovers_from_corrupt_json(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("{ this is not valid json ")
+    store = StateStore(path)  # must not raise
+    st = store.get("ups1")
+    assert st.onbatt_since is None  # fell back to a fresh default
+    # And it can re-save cleanly over the corrupt file.
+    st.onbatt_since = 5
+    store.save()
+    assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 5
+
+
+def test_state_from_dict_ignores_non_numeric_recent_loads(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"ups1": {"recent_loads": [40, "x", 30, None]}}))
+    store = StateStore(path)
+    assert store.get("ups1").recent_loads == [40, 30]
