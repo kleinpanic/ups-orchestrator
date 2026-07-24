@@ -17,6 +17,10 @@ fi
 ORCH="/usr/local/bin/ups-orchestrator"
 
 case "$1" in
+  onbatt_grace)
+    # Debounce timer fired (see upssched.conf): a sustained outage → onbatt.
+    exec "$ORCH" onbatt "${UPSNAME:-}"
+    ;;
   onbatt|online|lowbatt|commbad|commok|tick|remote_shutdown)
     exec "$ORCH" "$1" "${UPSNAME:-}"
     ;;

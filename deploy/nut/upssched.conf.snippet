@@ -5,18 +5,29 @@
 # non-existent lowercase "python" dir, so every event silently no-opped. The
 # dispatcher is installed to /usr/local/bin by deploy/install.sh.
 #
-# Notification-only model: each event is forwarded straight to the orchestrator
-# via EXECUTE. The actual protective shutdown is handled by upsmon's SHUTDOWNCMD,
-# not here. The on-battery runtime countdown is handled by the systemd
-# `ups-orchestrator-tick.timer`, not by an upssched timer.
+# Notification-only model: each event is forwarded to the orchestrator. The
+# actual protective shutdown is handled by upsmon's SHUTDOWNCMD, not here.
 
 CMDSCRIPT /usr/local/bin/upssched-cmd.sh
 PIPEFN /run/nut/upssched.pipe
 LOCKFN /run/nut/upssched.lock
 
-# Apply to every UPS (*) — UPSNAME is passed through to the orchestrator.
-AT ONBATT  * EXECUTE onbatt
-AT ONLINE  * EXECUTE online
+# Debounced ONBATT (applies to every UPS, *): a real outage only alerts if the
+# UPS stays on battery past a short grace, so sub-15s utility dips don't page.
+#
+#   ONBATT -> start a 15s timer named `onbatt_grace`.
+#   ONLINE -> CANCEL-TIMER onbatt_grace online
+#             NUT semantics: if the timer is still counting (brief dip), it is
+#             cancelled and nothing runs — silent. If it already FIRED (the
+#             outage was real and `onbatt` was sent), the optional `online`
+#             command runs, so the restore alert only follows a real outage.
+#
+# When the timer fires, upssched invokes CMDSCRIPT with `onbatt_grace`, which the
+# dispatcher forwards to the orchestrator's `onbatt` handler.
+AT ONBATT  * START-TIMER onbatt_grace 15
+AT ONLINE  * CANCEL-TIMER onbatt_grace online
+
+# LOWBATT is critical — never debounced.
 AT LOWBATT * EXECUTE lowbatt
 AT COMMBAD * EXECUTE commbad
 AT COMMOK  * EXECUTE commok

@@ -152,3 +152,25 @@ def test_path_resolvers_fall_back_to_base(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(cli, "_BASE", tmp_path)
     assert cli._config_path() == tmp_path / "config.json"
     assert cli._state_path() == tmp_path / "state.json"
+
+
+def test_selftest_without_creds_errors(env_config, monkeypatch) -> None:
+    monkeypatch.delenv("UPS_NUT_ADMIN_USER", raising=False)
+    monkeypatch.delenv("UPS_NUT_ADMIN_PASSWORD", raising=False)
+    assert cli.main(["selftest", "ups1"]) == 2
+
+
+def test_selftest_runs_and_alerts_on_failure(env_config, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("UPS_NUT_ADMIN_USER", "admin")
+    monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
+    monkeypatch.setattr(cli, "read_snapshot", lambda _n: _SNAP)
+    from ups_orchestrator import selftest
+
+    monkeypatch.setattr(
+        selftest,
+        "run_selftest",
+        lambda name, *_a, **_k: selftest.SelfTestResult(name, "failed", "Test failed"),
+    )
+    rc = cli.main(["selftest", "ups1"])
+    assert rc == 1  # a problem outcome → non-zero
+    assert "failed" in capsys.readouterr().out

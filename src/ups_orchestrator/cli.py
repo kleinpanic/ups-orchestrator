@@ -8,9 +8,12 @@ Modes::
     ups-orchestrator watch               # long-running poll loop (systemd --user service)
     ups-orchestrator status [--watch]    # terminal status table
     ups-orchestrator audit               # incident-oriented journald/UPS report
+    ups-orchestrator baseline            # per-UPS draw baseline from recorder history
+    ups-orchestrator selftest [ups]      # run a NUT battery self-test and alert on failure
     ups-orchestrator boot-audit          # one-shot post-boot abrupt-loss alert
     ups-orchestrator record              # high-frequency UPS telemetry recorder
     ups-orchestrator power-dashboard     # render/post a live+history power image
+    ups-orchestrator webui               # local web dashboard (live status + history)
     ups-orchestrator notify-test         # send a Discord delivery test
     ups-orchestrator logs                # tail local JSONL logs
 
@@ -37,7 +40,7 @@ from ups_orchestrator.config import Config, UpsConfig
 from ups_orchestrator.events import Deps, dispatch
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
-from ups_orchestrator.nut import UpsSnapshot
+from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 from ups_orchestrator.state import StateStore
 
 LOG = logging.getLogger("ups_orchestrator")
@@ -338,6 +341,98 @@ def _cmd_power_dashboard(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_baseline(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator baseline")
+    parser.add_argument("--hours", type=int, default=168, help="analysis window (default 168=7d)")
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    from ups_orchestrator import baseline
+
+    stats = baseline.compute_baselines(_sample_path(), list(cfg.upses), hours=max(1, args.hours))
+    print(baseline.render_text(cfg, stats, hours=max(1, args.hours)))
+    return 0
+
+
+def _cmd_selftest(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator selftest")
+    parser.add_argument("ups", nargs="?", help="UPS name (default: every configured UPS)")
+    parser.add_argument(
+        "--timeout", type=float, default=180.0, help="max seconds to await a result"
+    )
+    parser.add_argument(
+        "--user-env", default="UPS_NUT_ADMIN_USER", help="env var holding the admin user"
+    )
+    parser.add_argument(
+        "--password-env",
+        default="UPS_NUT_ADMIN_PASSWORD",
+        help="env var holding the admin password",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    user = os.environ.get(args.user_env, "").strip()
+    password = os.environ.get(args.password_env, "")
+    if not user or not password:
+        LOG.error(
+            "selftest: NUT admin credentials not set (%s / %s)", args.user_env, args.password_env
+        )
+        return 2
+
+    from ups_orchestrator import selftest
+    from ups_orchestrator.notify import Level, Notification
+    from ups_orchestrator.nut import upsc_var
+
+    deps = _build_deps(cfg)
+    targets = [args.ups] if args.ups else list(cfg.upses)
+    any_problem = False
+    for name in targets:
+        ups = cfg.ups(name)
+        if ups is None:
+            LOG.warning("selftest: unconfigured UPS %r — skipping", name)
+            continue
+        snap = read_snapshot(ups.name)
+        result = selftest.run_selftest(
+            ups.name,
+            snap,
+            user=user,
+            password=password,
+            read_result=lambda u: upsc_var(u, "ups.test.result"),
+            timeout=max(5.0, args.timeout),
+        )
+        print(f"{ups.label}: {result.outcome} — {result.detail}")
+        if result.outcome != "skipped":
+            deps.notifier.send(
+                Notification(
+                    title=f"🔋 {ups.label} — battery self-test: {result.outcome}",
+                    body=result.detail,
+                    level=Level.WARNING if result.is_problem else Level.INFO,
+                )
+            )
+        any_problem = any_problem or result.is_problem
+    return 1 if any_problem else 0
+
+
+def _cmd_webui(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator webui")
+    parser.add_argument("--host", default="127.0.0.1", help="bind address (localhost by default)")
+    parser.add_argument("--port", type=int, default=8765, help="listen port")
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    from ups_orchestrator import webui
+
+    LOG.info("webui: serving http://%s:%d — no auth, do not expose publicly", args.host, args.port)
+    webui.serve(cfg, _sample_path(), host=args.host, port=args.port)
+    return 0
+
+
 def _cmd_audit(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator audit")
     parser.add_argument("--since", default="today", help="journalctl --since window")
@@ -498,8 +593,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         LOG.error(
             "usage: ups-orchestrator "
-            "<event|tick|watch|status|report|audit|boot-audit|record|"
-            "power-dashboard|notify-test|logs> [...]"
+            "<event|tick|watch|status|report|audit|baseline|selftest|boot-audit|record|"
+            "power-dashboard|webui|notify-test|logs> [...]"
         )
         return 0
 
@@ -510,6 +605,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_report(args[1:])
     if mode == "audit":
         return _cmd_audit(args[1:])
+    if mode == "baseline":
+        return _cmd_baseline(args[1:])
+    if mode == "selftest":
+        return _cmd_selftest(args[1:])
+    if mode == "webui":
+        return _cmd_webui(args[1:])
     if mode == "boot-audit":
         return _cmd_boot_audit(args[1:])
     if mode == "notify-test":
