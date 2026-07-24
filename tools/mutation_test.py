@@ -86,6 +86,36 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "if charge <= 200:",
         "status: battery colour threshold",
     ),
+    (
+        "src/ups_orchestrator/baseline.py",
+        "ordered[low] + (ordered[high] - ordered[low]) * frac",
+        "ordered[low] - (ordered[high] - ordered[low]) * frac",
+        "baseline: percentile interpolation sign",
+    ),
+    (
+        "src/ups_orchestrator/baseline.py",
+        "mean=round(sum(watts) / len(watts)),",
+        "mean=round(sum(watts) * len(watts)),",
+        "baseline: mean op",
+    ),
+    (
+        "src/ups_orchestrator/selftest.py",
+        'if "fail" in r:',
+        'if "fail" not in r:',
+        "selftest: classify failed inverted",
+    ),
+    (
+        "src/ups_orchestrator/selftest.py",
+        "if snapshot.on_battery or snapshot.low_battery:",
+        "if snapshot.on_battery and snapshot.low_battery:",
+        "selftest: on-battery guard weakened",
+    ),
+    (
+        "src/ups_orchestrator/webui.py",
+        "step = max(1, -(-len(pts) // 600))",
+        "step = max(1, len(pts) // 600)",
+        "webui: history downsample cap",
+    ),
 ]
 
 
