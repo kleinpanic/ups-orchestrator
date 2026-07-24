@@ -137,7 +137,22 @@ def _snapshot_line(name: str, label: str, snap: UpsSnapshot) -> str:
             f"(~{snap.estimated_load_watts}/{snap.realpower_nominal}W, "
             f"{snap.load_margin_percent}% margin)"
         )
-    return f"- {name} ({label}): {status}, battery {charge}, est. to 0% {runtime}, load {load}"
+    line = f"- {name} ({label}): {status}, battery {charge}, est. to 0% {runtime}, load {load}"
+    extras: list[str] = []
+    if snap.output_voltage is not None:
+        extras.append(f"{snap.output_voltage:.1f}V out")
+    if snap.battery_voltage is not None:
+        bv = f"batt {snap.battery_voltage:.1f}V"
+        if snap.battery_voltage_percent is not None:
+            bv += f" ({snap.battery_voltage_percent}%)"
+        extras.append(bv)
+    if snap.test_result and snap.test_result.strip().lower() not in ("no test initiated", ""):
+        extras.append(f"self-test: {snap.test_result}")
+    if snap.alarm and snap.alarm.strip().lower() not in ("", "none"):
+        extras.append(f"ALARM: {snap.alarm}")
+    if extras:
+        line += " · " + ", ".join(extras)
+    return line
 
 
 def _sample_ups_line(name: str, payload: object) -> str:

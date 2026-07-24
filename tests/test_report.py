@@ -25,7 +25,7 @@ def test_build_report_includes_all_ups_load_and_voltage() -> None:
     assert note.level is Level.INFO
     assert len(note.fields) == 2
     assert "Expected time before 0%: 10m 0s" in note.fields[0][1]
-    assert "50% WATCH (~450 W / 900 W, 50% margin)" in note.fields[0][1]
+    assert "50% WATCH (~450 W / 900 W, 450 W free, 50% margin)" in note.fields[0][1]
     assert "120.1 V in / 119.8 V out" in note.fields[0][1]
 
 
@@ -51,3 +51,32 @@ def test_report_warns_on_high_load() -> None:
 
     assert note.level is Level.WARNING
     assert "80% HIGH" in render_text(note)
+
+
+def test_report_surfaces_battery_health_alarm_and_selftest() -> None:
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    snap = UpsSnapshot(
+        "OL",
+        100,
+        1800,
+        22,
+        117.5,
+        output_voltage=118.0,
+        realpower_nominal=900,
+        input_voltage_nominal=120.0,
+        battery_voltage=26.4,
+        battery_voltage_nominal=24.0,
+        battery_type="PbAcid",
+        test_result="Battery test failed",
+        alarm="Replace battery",
+    )
+    note = build_report(cfg, snapshot_reader=lambda _n: snap)
+    text = render_text(note)
+
+    assert note.level is Level.WARNING  # alarm + failed test → degraded
+    assert "Battery health: 26.4 V · 110% of 24 V nominal · PbAcid" in text
+    assert "702 W free" in text  # load headroom
+    assert "nom 120" in text  # input nominal
+    assert "Last self-test: Battery test failed" in text
+    assert "⚠️ Alarm: Replace battery" in text
+    assert "self-test FAILED" in text

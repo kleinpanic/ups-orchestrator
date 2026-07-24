@@ -242,11 +242,26 @@ def render_png(
             ha="right",
             va="center",
         )
-        # battery gauge
+        alarm_on = s.alarm is not None and s.alarm.strip().lower() not in ("", "none")
+        test_bad = s.test_result is not None and "fail" in s.test_result.lower()
+        if alarm_on or test_bad:
+            ax.text(
+                0.5,
+                0.50,
+                "⚠ ALARM" if alarm_on else "⚠ TEST",
+                transform=ax.transAxes,
+                color="#ef4444",
+                fontsize=9,
+                fontweight="bold",
+                ha="center",
+                va="center",
+            )
+        # battery gauge (charge %, with the raw pack voltage — the aging signal)
+        batt_v = f" · {s.battery_voltage:.1f} V" if s.battery_voltage is not None else ""
         ax.text(
             0.06,
             0.375,
-            f"battery {charge if charge is not None else '—'}%",
+            f"battery {charge if charge is not None else '—'}%{batt_v}",
             transform=ax.transAxes,
             color=muted,
             fontsize=8.5,

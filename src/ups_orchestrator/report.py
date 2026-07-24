@@ -25,8 +25,18 @@ def _status_text(snap: UpsSnapshot) -> str:
     return f"`{snap.status}`"
 
 
+def _alarm_active(snap: UpsSnapshot) -> bool:
+    return snap.alarm is not None and snap.alarm.strip().lower() not in ("", "none")
+
+
+def _selftest_failed(snap: UpsSnapshot) -> bool:
+    return snap.test_result is not None and "fail" in snap.test_result.lower()
+
+
 def _is_degraded(snap: UpsSnapshot) -> bool:
     if snap.status is None or snap.low_battery or snap.on_battery:
+        return True
+    if _alarm_active(snap) or _selftest_failed(snap):
         return True
     flags = set(snap.status.split())
     return ("OL" in flags and "DISCHRG" in flags) or snap.load_is_high
@@ -46,15 +56,36 @@ def _load_text(snap: UpsSnapshot) -> str:
     margin_text = "unknown margin" if margin is None else f"{margin}% margin"
     if watts is None or snap.realpower_nominal is None:
         return f"{snap.load}% {snap.load_level} ({margin_text})"
+    headroom = snap.load_headroom_watts
+    headroom_text = "" if headroom is None else f", {headroom} W free"
     return (
-        f"{snap.load}% {snap.load_level} (~{watts} W / {snap.realpower_nominal} W, {margin_text})"
+        f"{snap.load}% {snap.load_level} "
+        f"(~{watts} W / {snap.realpower_nominal} W{headroom_text}, {margin_text})"
     )
 
 
 def _voltage_text(snap: UpsSnapshot) -> str:
-    inp = "unknown" if snap.input_voltage is None else f"{snap.input_voltage:.1f} V in"
+    if snap.input_voltage is None:
+        inp = "unknown"
+    else:
+        nom = (
+            "" if snap.input_voltage_nominal is None else f", nom {snap.input_voltage_nominal:.0f}"
+        )
+        inp = f"{snap.input_voltage:.1f} V in{nom}"
     out = "unknown" if snap.output_voltage is None else f"{snap.output_voltage:.1f} V out"
     return f"{inp} / {out}"
+
+
+def _battery_health_text(snap: UpsSnapshot) -> str | None:
+    if snap.battery_voltage is None:
+        return None
+    parts = [f"{snap.battery_voltage:.1f} V"]
+    pct = snap.battery_voltage_percent
+    if pct is not None:
+        parts.append(f"{pct}% of {snap.battery_voltage_nominal:.0f} V nominal")
+    if snap.battery_type:
+        parts.append(snap.battery_type)
+    return " · ".join(parts)
 
 
 def _field_value(snap: UpsSnapshot) -> str:
@@ -66,6 +97,15 @@ def _field_value(snap: UpsSnapshot) -> str:
         f"Load: {_load_text(snap)}",
         f"Voltage: {_voltage_text(snap)}",
     ]
+    health = _battery_health_text(snap)
+    if health is not None:
+        lines.append(f"Battery health: {health}")
+    if snap.test_result and snap.test_result.strip().lower() not in ("no test initiated", ""):
+        lines.append(f"Last self-test: {snap.test_result}")
+    if _alarm_active(snap):
+        lines.append(f"⚠️ Alarm: {snap.alarm}")
+    if _selftest_failed(snap):
+        lines.append("Action: battery self-test FAILED — inspect/replace battery")
     if snap.load_is_high:
         lines.append("Action: rebalance load or move devices to another UPS")
     if snap.status and "OL" in snap.status.split() and "DISCHRG" in snap.status.split():
