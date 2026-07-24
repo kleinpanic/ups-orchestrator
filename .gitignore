@@ -37,3 +37,7 @@ notifications.jsonl
 .coverage.*
 htmlcov/
 coverage.xml
+
+# mutmut working copy
+mutants/
+.mutmut-cache
