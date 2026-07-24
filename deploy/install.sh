@@ -50,7 +50,11 @@ visudo -cf /etc/sudoers.d/ups-orchestrator >/dev/null && echo "   sudoers OK" ||
 
 echo ">> NUT: appending UPS sections to ups.conf (idempotent; edit the snippet's"
 echo "   vendorid/productid first — see deploy/nut/ups.conf.snippet)"
-grep -q '^\[ups2\]' /etc/nut/ups.conf || cat "$REPO/deploy/nut/ups.conf.snippet" >> /etc/nut/ups.conf
+if grep -Eq '^\[(cyberpower|ups[0-9]+)\]' /etc/nut/ups.conf; then
+  echo "   existing UPS sections found; leaving /etc/nut/ups.conf unchanged"
+else
+  cat "$REPO/deploy/nut/ups.conf.snippet" >> /etc/nut/ups.conf
+fi
 
 cat <<EOF
 

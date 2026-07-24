@@ -1,13 +1,42 @@
 # Merge into /etc/nut/upsmon.conf — one MONITOR line per UPS.
+# NEVER commit real credentials; the passwords below are CHANGE_ME placeholders.
 #
-# Use the same device names as ups.conf, and the upsmon password from
-# /etc/nut/upsd.users. `primary` means this host runs the shutdown sequence.
-# NEVER commit real credentials.
+# MONITOR <ups>@<host> <powervalue> <user> <password> <primary|secondary>
+#
+#   <ups>@<host>  Device name from ups.conf, at the host running `upsd`. Use
+#                 @localhost ONLY on the host physically cabled to the UPS. A
+#                 host that watches over the network names the upsd host instead
+#                 (e.g. ups1@eulerpi5). Getting this wrong = upsmon can't reach
+#                 the UPS and every event silently no-ops.
+#   <powervalue>  How many power feeds this UPS provides to THIS host. 1 = it
+#                 actually powers this host and counts toward MINSUPPLIES; 0 =
+#                 notification-only (watch it, but its battery state must never
+#                 trigger this host's shutdown).
+#   <user/pass>   The upsmon account from /etc/nut/upsd.users (needs
+#                 `upsmon primary` or `upsmon secondary` there to match).
+#   primary       This host runs the shutdown sequence and tells secondaries to
+#                 power off first. Exactly one primary per UPS.
+#   secondary     This host only observes and shuts itself down; it never drives
+#                 others. Use on debug/observer hosts.
+#
+# Topology (eulerpi5): eulerpi5 owns the shutdown sequence, so its lines are
+# `primary`. A separate rpi4 is USB-B cabled to the UPS(es) for debugging — on
+# the rpi4 the same UPSes would be `secondary`. Confirm which host runs `upsd`
+# before choosing @localhost vs @<host>: if the rpi4 is the USB/upsd server,
+# eulerpi5 connects to ups@<rpi4>, not @localhost.
 
 MONITOR ups1@localhost 1 upsmon CHANGE_ME primary
 MONITOR ups2@localhost 1 upsmon CHANGE_ME primary
+MONITOR ups3@localhost 0 upsmon CHANGE_ME primary
 
-# Route notifications through upssched (which calls the orchestrator).
+# MINSUPPLIES = how many powervalue units must remain before this host keeps
+# running. With two powervalue=1 feeds above, 1 means "run until BOTH are gone";
+# raise to 2 for a host that genuinely needs both UPSes up. The default is 1.
+MINSUPPLIES 1
+
+# Route notifications through upssched (which calls the orchestrator). Every
+# NOTIFYFLAG with EXEC must map to an event the orchestrator handles, and every
+# handled event needs its flag here — otherwise config and handler drift apart.
 NOTIFYCMD /sbin/upssched
 
 # EXEC = run NOTIFYCMD; keep SYSLOG for journald visibility.
@@ -17,5 +46,6 @@ NOTIFYFLAG LOWBATT  SYSLOG+EXEC
 NOTIFYFLAG COMMBAD  SYSLOG+EXEC
 NOTIFYFLAG COMMOK   SYSLOG+EXEC
 
-# NUT performs the real shutdown of THIS host when battery is critical.
+# NUT performs the real shutdown of THIS host when battery is critical. The
+# orchestrator never runs this — it only observes and notifies.
 SHUTDOWNCMD "/sbin/shutdown -h now"

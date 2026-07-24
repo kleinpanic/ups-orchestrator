@@ -12,8 +12,13 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def normalize_ups_name(name: str) -> str:
+    """Return the local NUT UPS name from values like ``ups@localhost``."""
+    return name.strip().split("@", 1)[0]
 
 
 def _as_int(value: object, default: int) -> int:
@@ -27,6 +32,19 @@ def _as_int(value: object, default: int) -> int:
             return int(value)
         except ValueError:
             return default
+    return default
+
+
+def _as_bool(value: object, default: bool) -> bool:
+    """Coerce common JSON/env-style values to bool, falling back to ``default``."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "y", "on", "enabled"):
+            return True
+        if s in ("0", "false", "no", "n", "off", "disabled"):
+            return False
     return default
 
 
@@ -62,6 +80,107 @@ def _norm_scope(value: object, default: str) -> str:
 
 
 @dataclass(frozen=True)
+class ShutdownGroupPolicy:
+    """Central trigger policy for one class of shutdown targets."""
+
+    enabled: bool = False
+    battery_below: int | None = None
+    runtime_below: int | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: object, *, default_battery: int | None, default_runtime: int | None
+    ) -> ShutdownGroupPolicy:
+        if not isinstance(data, dict):
+            return cls(battery_below=default_battery, runtime_below=default_runtime)
+        return cls(
+            enabled=_as_bool(data.get("enabled"), False),
+            battery_below=(
+                _opt_int(data.get("battery_below")) if "battery_below" in data else default_battery
+            ),
+            runtime_below=(
+                _opt_int(data.get("runtime_below")) if "runtime_below" in data else default_runtime
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ShutdownPolicy:
+    """Global opt-in policy for orchestrator-initiated device shutdowns.
+
+    This is intentionally a single surface above per-target transports:
+    ``external`` covers SSH/serial targets and ``internal`` covers the local
+    watcher host. Auto-shutdown is disabled unless ``enabled`` and the relevant
+    group are both true.
+    """
+
+    enabled: bool = False
+    require_power_outage: bool = True
+    min_on_battery_seconds: int = 120
+    notify: bool = True
+    external: ShutdownGroupPolicy = field(
+        default_factory=lambda: ShutdownGroupPolicy(
+            enabled=False, battery_below=15, runtime_below=300
+        )
+    )
+    internal: ShutdownGroupPolicy = field(
+        default_factory=lambda: ShutdownGroupPolicy(
+            enabled=False, battery_below=10, runtime_below=120
+        )
+    )
+
+    @classmethod
+    def from_dict(cls, data: object) -> ShutdownPolicy:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=_as_bool(data.get("enabled"), False),
+            require_power_outage=_as_bool(data.get("require_power_outage"), True),
+            min_on_battery_seconds=max(0, _as_int(data.get("min_on_battery_seconds"), 120)),
+            notify=_as_bool(data.get("notify"), True),
+            external=ShutdownGroupPolicy.from_dict(
+                data.get("external"), default_battery=15, default_runtime=300
+            ),
+            internal=ShutdownGroupPolicy.from_dict(
+                data.get("internal"), default_battery=10, default_runtime=120
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LoadStepPolicy:
+    """Single-poll output-load drop detection.
+
+    A device abruptly losing power shows up as its UPS's output load falling by
+    its whole draw within a poll or two — the only in-band signature NUT gives
+    for a downstream device dying (the UPS itself stays happily ``OL``). A drop
+    of ``drop_percent`` points or more below the peak of the last
+    ``window_polls`` polls logs a ``load_step_drop`` event and (rate-limited by
+    ``cooldown_seconds``) sends a notification. The window — rather than a
+    plain previous-poll comparison — keeps a collapse that straddles a poll
+    boundary from splitting into two sub-threshold steps. It is a hint, not a
+    verdict: a heavy job finishing looks identical, so pair it with a
+    reachability check on the device.
+    """
+
+    enabled: bool = True
+    drop_percent: int = 15
+    cooldown_seconds: int = 600
+    window_polls: int = 4
+
+    @classmethod
+    def from_dict(cls, data: object) -> LoadStepPolicy:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=_as_bool(data.get("enabled"), True),
+            drop_percent=max(1, _as_int(data.get("drop_percent"), 15)),
+            cooldown_seconds=max(0, _as_int(data.get("cooldown_seconds"), 600)),
+            window_polls=max(1, _as_int(data.get("window_polls"), 4)),
+        )
+
+
+@dataclass(frozen=True)
 class ShutdownTarget:
     """A machine to shut down when its UPS runs low on battery.
 
@@ -73,10 +192,9 @@ class ShutdownTarget:
         still works during an outage when SSH can't reach the box.
       * ``local`` — the host this daemon runs on.
 
-    A UPS may list any number; all disabled by default. Triggers fire when
-    **either** threshold is crossed: battery charge at or below ``battery_below``
-    (%), or estimated runtime at or below ``runtime_below`` (seconds). A target
-    with neither set never auto-fires.
+    A UPS may list any number; all disabled by default. ``battery_below`` and
+    ``runtime_below`` are parsed for backward compatibility, but automatic
+    shutdown decisions are controlled by the top-level ``shutdown`` policy.
 
     The orchestrator always sequences ``local`` targets **after** every enabled
     remote/serial target on the same UPS, so the watcher host dies last.
@@ -124,13 +242,17 @@ class UpsConfig:
     name: str
     label: str
     shutdown_targets: tuple[ShutdownTarget, ...] = ()
-    # "remote" = only remote/serial targets fire (this host left to NUT's backstop);
-    # "all" = local targets fire too, last. Resolved from the global default at load.
+    # Legacy pre-policy scope value, still parsed so old config files load.
     shutdown_scope: str = "remote"
+    shutdown_policy: ShutdownPolicy = field(default_factory=ShutdownPolicy)
 
     @classmethod
     def from_dict(
-        cls, name: str, data: dict[str, object], default_scope: str = "remote"
+        cls,
+        name: str,
+        data: dict[str, object],
+        default_scope: str = "remote",
+        shutdown_policy: ShutdownPolicy | None = None,
     ) -> UpsConfig:
         raw_targets = data.get("shutdown_targets", [])
         targets = (
@@ -143,6 +265,7 @@ class UpsConfig:
             label=str(data.get("label", name)),
             shutdown_targets=targets,
             shutdown_scope=_norm_scope(data.get("shutdown_scope"), default_scope),
+            shutdown_policy=shutdown_policy or ShutdownPolicy(),
         )
 
 
@@ -154,13 +277,15 @@ class Config:
     upses: dict[str, UpsConfig]
     poll_seconds: int = 30
     countdown_every_seconds: int = 60
-    shutdown_scope: str = "remote"  # global default; per-UPS may override
+    shutdown_scope: str = "remote"  # legacy default; retained for config compatibility
+    shutdown_policy: ShutdownPolicy = field(default_factory=ShutdownPolicy)
+    load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
     discord_username: str = "UPS Orchestrator"
     discord_avatar_url: str = ""
 
     def ups(self, name: str) -> UpsConfig | None:
         """Look up a UPS by NUT name, returning ``None`` if it is not configured."""
-        return self.upses.get(name)
+        return self.upses.get(normalize_ups_name(name))
 
     @classmethod
     def load(cls, path: Path, env: Mapping[str, str] | None = None) -> Config:
@@ -182,8 +307,14 @@ class Config:
             raise ValueError(f"No 'upses' configured in {path}")
 
         global_scope = _norm_scope(raw.get("shutdown_scope"), "remote")
+        shutdown_policy = ShutdownPolicy.from_dict(raw.get("shutdown"))
         upses = {
-            name: UpsConfig.from_dict(name, data, default_scope=global_scope)
+            name: UpsConfig.from_dict(
+                name,
+                data,
+                default_scope=global_scope,
+                shutdown_policy=shutdown_policy,
+            )
             for name, data in upses_raw.items()
             if isinstance(data, dict)
         }
@@ -195,6 +326,8 @@ class Config:
             poll_seconds=_as_int(raw.get("poll_seconds", raw.get("poll_on_battery_seconds")), 30),
             countdown_every_seconds=_as_int(raw.get("countdown_every_seconds"), 60),
             shutdown_scope=global_scope,
+            shutdown_policy=shutdown_policy,
+            load_step=LoadStepPolicy.from_dict(raw.get("load_step")),
             discord_username=str(raw.get("discord_username", "UPS Orchestrator")),
             discord_avatar_url=str(raw.get("discord_avatar_url", "")),
         )

@@ -3,7 +3,7 @@
 **NUT-driven UPS power-event monitor with per-UPS Discord embeds**
 
 <p align="center">
-  <em>Multi-UPS · NUT-event alerts · battery-threshold shutdown (serial / ssh / local) · zero runtime deps</em>
+  <em>Multi-UPS · NUT-event alerts · opt-in gated shutdowns · audit reports · zero runtime deps</em>
 </p>
 
 <p align="center">
@@ -18,9 +18,9 @@
 It turns [Network UPS Tools](https://networkupstools.org/) power events into
 **per-UPS Discord embeds** for on-battery alerts, a runtime-remaining countdown,
 power-restored summaries, and low-battery warnings. NUT's own `upsmon` still
-handles the host's protective shutdown, and the orchestrator can also shut down
-UPS-powered machines over **serial**, **SSH**, or **locally** when a battery runs
-low.
+handles the host's protective shutdown, and the orchestrator can optionally shut
+down UPS-powered machines over **serial**, **SSH**, or **locally** when a
+central opt-in policy says the UPS is both on battery and close to empty.
 
 Works with any NUT-supported UPS and monitors **any number** of them. Nothing is
 hard-coded to a model.
@@ -35,9 +35,13 @@ hard-coded to a model.
   `ONBATT`/`ONLINE`/`LOWBATT`/`COMMBAD`/`COMMOK`, `upssched` passes them through
   `deploy/upssched-cmd.sh` to `ups-orchestrator <event> $UPSNAME`, which posts a
   labeled embed for that UPS.
-- **Unified shutdown targets, local last.** Each UPS lists any number of
-  `shutdown_targets`. A target fires when its battery `battery_below` (%) **or**
-  `runtime_below` (sec) threshold is crossed:
+- **Opt-in shutdown policy, local last.** The top-level `shutdown` policy is the
+  single place that enables or disables orchestrator-managed shutdowns. It is
+  off by default. `shutdown.external` controls SSH/serial targets, and
+  `shutdown.internal` controls the local host. A target command only runs when
+  the policy is enabled, the relevant group is enabled, the UPS is on battery
+  long enough, and the UPS is close to empty by the central battery/runtime
+  thresholds:
   - `remote`: over SSH (`host` may be an `ssh_config` alias; omit `user`).
   - `serial`: over a serial console (`device`+`baud`) to a passwordless/
     auto-login getty. **Network-independent**, so it still works during an outage
@@ -46,10 +50,11 @@ hard-coded to a model.
   - `local`: this host; always runs *after* every enabled remote/serial target on
     the UPS, so the watcher host dies last.
 
-  NUT's `upsmon SHUTDOWNCMD` stays as a low-battery backstop. All targets off by default.
+  NUT's `upsmon SHUTDOWNCMD` stays as a low-battery backstop. All orchestrator
+  shutdowns are disabled by default.
 - **Configurable poll loop, decoupled from webhooks.** A `systemd --user` service
-  (`ups-orchestrator watch`) polls every `poll_seconds` to evaluate shutdown
-  thresholds; the on-battery countdown posts on its own `countdown_every_seconds`
+  (`ups-orchestrator watch`) polls every `poll_seconds` to evaluate the central
+  shutdown policy; the on-battery countdown posts on its own `countdown_every_seconds`
   cadence (0 = off). Discord *alerts* stay NUT-event-driven; polling never gates
   them.
 
@@ -62,7 +67,7 @@ flowchart LR
     UPSMON -->|low battery| SDC["SHUTDOWNCMD<br/>(protects this host)"]
     UPSMON -->|"NUT events"| SCHED["upssched<br/>→ upssched-cmd.sh"]
     SCHED --> ORCH["ups-orchestrator"]
-    WATCH["watch loop<br/>(poll every poll_seconds)"] -->|"battery thresholds"| ORCH
+    WATCH["watch loop<br/>(poll every poll_seconds)"] -->|"shutdown policy"| ORCH
 
     ORCH -->|"alerts + countdown"| DISCORD["🟦 Discord embeds"]
     ORCH --> SER["serial → console"]
@@ -78,7 +83,7 @@ flowchart LR
 ```
 
 Two paths run independently: Discord *alerts* come from **NUT events**
-(`upssched`), while battery-threshold *shutdowns* come from the **poll loop**
+(`upssched`), while policy-gated *shutdowns* come from the **poll loop**
 (`watch`). Each shutdown target picks its own transport: serial console
 (network-independent, best during an outage), SSH (a host or `ssh_config`
 alias), or the local host. The shutdown order is fixed below:
@@ -91,9 +96,9 @@ sequenceDiagram
     participant R as serial / ssh targets
     participant L as local host
     Note over W,U: every poll_seconds while on battery
-    U-->>W: charge 50% (remote threshold)
-    W->>R: shut down remote / serial targets
-    U-->>W: charge 15% (local threshold)
+    U-->>W: on battery long enough + close to empty
+    W->>R: shut down external targets, if enabled
+    U-->>W: internal group also enabled + close to empty
     W->>L: shut down local — only after every remote was sent
 ```
 
@@ -112,7 +117,19 @@ HTTP 429 `retry_after`.
 | `online` | ✅ **POWER RESTORED** — outage duration + state |
 | `lowbatt` | ⚠️ **LOW BATTERY** — critical, shutdown announced |
 | `commbad` / `commok` | 🔌 comms lost / restored |
-| (target due) | 🛑 **shutdown sent to `<target>`** |
+| `load_step_drop` | 📉 **load dropped N points** — collapse vs recent peak, est. watts, 10-min draw sparkline |
+| (target due) | 🛑 **shutdown attempt** then **shutdown sent/FAILED** for `<target>` |
+
+**Load-step drop detection** (`load_step` config block, on by default): a device
+abruptly losing power appears as its UPS output load collapsing while the UPS
+itself stays `OL` — NUT gives no other in-band signal for a downstream device
+dying. A drop of `drop_percent` points (default 15) below the peak of the last
+`window_polls` polls (default 4; the window keeps a collapse that straddles a
+poll from splitting into sub-threshold steps) logs a `load_step_drop` event and
+sends one notification per `cooldown_seconds` (default 600). The alert embeds a
+draw-history sparkline built from the recorder samples. It is a hint, not a
+verdict — a heavy job finishing looks identical — so pair it with a
+reachability check on the device.
 
 The notifier sits behind a `Notifier` protocol, so a future **Discord bot** can
 replace the webhook by implementing `Notifier.send`; the event logic does not
@@ -134,22 +151,35 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
 {
   "discord_webhook_env": "UPS_DISCORD_WEBHOOK",  // env var holding the URL
   "discord_username": "UPS Orchestrator",
-  "poll_seconds": 30,            // how often the watch loop checks battery thresholds
+  "poll_seconds": 30,            // how often the watch loop checks policy
   "countdown_every_seconds": 60, // on-battery countdown post cadence (0 = off)
-  "shutdown_scope": "remote",    // global default: "remote" or "all" (per-UPS overridable)
+  "shutdown": {
+    "enabled": false,            // master switch for orchestrator shutdowns
+    "require_power_outage": true,
+    "min_on_battery_seconds": 120,
+    "notify": true,              // Discord attempt/result messages
+    "external": {                // serial + SSH targets
+      "enabled": false,
+      "battery_below": 15,
+      "runtime_below": 300
+    },
+    "internal": {                // local host target
+      "enabled": false,
+      "battery_below": 10,
+      "runtime_below": 120
+    }
+  },
   "upses": {
     "ups1": {
       "label": "Rack UPS",
-      "shutdown_scope": "all",   // this UPS also shuts down the local host (last)
       "shutdown_targets": [
         { "name": "bigserver", "kind": "serial", "enabled": false,
           "device": "/dev/ttyUSB0", "baud": 115200,
-          "cmd": "sudo /sbin/shutdown -h now", "battery_below": 50 },
+          "cmd": "sudo /sbin/shutdown -h now" },
         { "name": "fileserver", "kind": "remote", "enabled": false,
-          "host": "mt", "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 50 },
+          "host": "mt", "cmd": "sudo /sbin/shutdown -h now" },
         { "name": "this-host", "kind": "local", "enabled": false,
-          "cmd": "sudo /sbin/shutdown -h now", "battery_below": 15 }
+          "cmd": "sudo /sbin/shutdown -h now" }
       ]
     },
     "ups2": { "label": "Desk UPS", "shutdown_targets": [] }
@@ -157,21 +187,21 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
 }
 ```
 
-**`shutdown_scope`** (global default, overridable per UPS) controls whether the
-host running the daemon is in scope:
-- `"remote"` (default) — only `serial`/`remote` targets fire; the local host is
-  **never** shut down by the orchestrator (NUT's `upsmon` LOWBATT backstop still
-  protects it). Any `local` targets are skipped.
-- `"all"` — `local` targets fire too, **last** (at their own threshold), so the
-  watcher stays up and notifying as long as possible, then dies last.
+Shutdown policy:
+- `shutdown.enabled` is the master switch. If it is false, no external or
+  internal target command runs.
+- `require_power_outage` and `min_on_battery_seconds` prevent short utility
+  blips from triggering machine shutdowns.
+- If both battery and runtime readings exist, both must be at or below their
+  group thresholds before a target fires. That prevents a percentage threshold
+  from shutting machines down while the UPS still reports healthy runtime.
+- `external.enabled` covers `serial` and `remote`; `internal.enabled` covers
+  `local`. Local targets run only after enabled external targets have been sent.
 
-Per target:
+Per target transport:
 - **`kind`**: `serial` (`device`+`baud`, to a passwordless/auto-login getty;
   network-independent), `remote` (`host` is a hostname *or* `ssh_config` alias;
   omit `user` for `ssh <alias>`), or `local`.
-- **Trigger**: fires when **either** `battery_below` (charge %) or
-  `runtime_below` (seconds) is crossed; omit both and it only fires on an
-  explicit `remote_shutdown`.
 - **Ordering**: `local` targets always run *after* every enabled serial/remote
   target on the UPS, so the watcher host dies last.
 - `local` targets need passwordless shutdown (set up by `deploy/install.sh`);
@@ -184,9 +214,25 @@ else `<repo>/config.json`. State resolves similarly via `$UPS_ORCH_STATE` /
 ## Status
 
 ```bash
-ups-orchestrator status            # one-shot per-UPS table (alive/dead, gauge, runtime, load)
+ups-orchestrator status            # table: state, battery, est. time to 0%, load level, watts, margin
 ups-orchestrator status --watch    # live-refreshing dashboard (Ctrl-C to exit)
+ups-orchestrator report --print    # preview the Discord daily load report
+ups-orchestrator report            # send the load report webhook now
+ups-orchestrator power-dashboard --out d.png   # render live+history power image
+ups-orchestrator power-dashboard --hours 168 --post   # post the image to Discord
+ups-orchestrator notify-test       # send a test embed and print delivery result
+ups-orchestrator audit             # summarize boot, UPS/NUT, local logs, state, and shutdown evidence
+ups-orchestrator logs events       # tail local UPS event/decision JSONL
+ups-orchestrator logs notifications
 ```
+
+**Power dashboard.** `power-dashboard` renders a PNG — a card per UPS (status,
+battery, load, runtime) plus a draw-history line chart from the recorder samples
+— and can post it to Discord. It needs `matplotlib` (an optional dep; install
+with `pip install ups-orchestrator[dashboard]` or add matplotlib to the install
+venv). The **daily report posts it automatically once a week** (Mondays), so it
+rides the existing `report` timer — no separate timer or service. Force it any
+day with `ups-orchestrator report --dashboard`.
 
 ## Install / Deploy
 
@@ -217,6 +263,7 @@ deploy/install-user-service.sh
 | `/etc/ups-orchestrator.env` | webhook + paths (`root:nut 0640` + user ACL) |
 | `/var/lib/ups-orchestrator/state.json` | per-UPS state |
 | `~/.config/systemd/user/ups-orchestrator-watch.service` | the `--user` poll loop |
+| `~/.config/systemd/user/ups-orchestrator-report.timer` | daily load/status report |
 | `/etc/sudoers.d/ups-orchestrator` | passwordless shutdown for `local` targets |
 
 > Live config under `/etc` and `/etc/nut` holds your real device ids / IPs and

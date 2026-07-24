@@ -5,11 +5,31 @@
   "discord_avatar_url": "",
   "poll_seconds": 30,
   "countdown_every_seconds": 60,
-  "shutdown_scope": "remote",
+  "load_step": {
+    "enabled": true,
+    "drop_percent": 15,
+    "cooldown_seconds": 600,
+    "window_polls": 4
+  },
+  "shutdown": {
+    "enabled": false,
+    "require_power_outage": true,
+    "min_on_battery_seconds": 120,
+    "notify": true,
+    "external": {
+      "enabled": false,
+      "battery_below": 15,
+      "runtime_below": 300
+    },
+    "internal": {
+      "enabled": false,
+      "battery_below": 10,
+      "runtime_below": 120
+    }
+  },
   "upses": {
     "ups1": {
       "label": "Rack UPS",
-      "shutdown_scope": "all",
       "shutdown_targets": [
         {
           "name": "fileserver",
@@ -17,8 +37,7 @@
           "enabled": false,
           "host": "fileserver.lan",
           "user": "youruser",
-          "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 50
+          "cmd": "sudo /sbin/shutdown -h now"
         },
         {
           "name": "bigserver-serial",
@@ -26,21 +45,22 @@
           "enabled": false,
           "device": "/dev/ttyUSB0",
           "baud": 115200,
-          "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 50
+          "cmd": "sudo /sbin/shutdown -h now"
         },
         {
           "name": "this-host",
           "kind": "local",
           "enabled": false,
-          "cmd": "sudo /sbin/shutdown -h now",
-          "battery_below": 15,
-          "runtime_below": 120
+          "cmd": "sudo /sbin/shutdown -h now"
         }
       ]
     },
     "ups2": {
       "label": "Desk UPS",
+      "shutdown_targets": []
+    },
+    "ups3": {
+      "label": "Third UPS",
       "shutdown_targets": []
     }
   }

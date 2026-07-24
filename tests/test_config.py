@@ -75,6 +75,13 @@ def test_per_ups_targets_parse(tmp_path: Path) -> None:
     assert cfg.ups("missing") is None
 
 
+def test_ups_lookup_accepts_nut_upsname_with_host(tmp_path: Path) -> None:
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    cfg = Config.load(p, env={})
+    assert cfg.ups("u1@localhost") == cfg.ups("u1")
+    assert cfg.ups("  u1@127.0.0.1  ") == cfg.ups("u1")
+
+
 def test_poll_defaults_and_backcompat(tmp_path: Path) -> None:
     p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
     assert Config.load(p, env={}).poll_seconds == 30
@@ -109,3 +116,56 @@ def test_shutdown_scope_default_and_override(tmp_path: Path) -> None:
     assert cfg2.ups("inherit").shutdown_scope == "all"  # type: ignore[union-attr]
     assert cfg2.ups("override").shutdown_scope == "remote"  # type: ignore[union-attr]
     assert cfg2.ups("alias").shutdown_scope == "all"  # type: ignore[union-attr]
+
+
+def test_shutdown_policy_defaults_disabled(tmp_path: Path) -> None:
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    cfg = Config.load(p, env={})
+    assert cfg.shutdown_policy.enabled is False
+    assert cfg.shutdown_policy.external.enabled is False
+    assert cfg.shutdown_policy.internal.enabled is False
+    assert cfg.shutdown_policy.external.battery_below == 15
+    assert cfg.shutdown_policy.external.runtime_below == 300
+    assert cfg.ups("u1").shutdown_policy == cfg.shutdown_policy  # type: ignore[union-attr]
+
+
+def test_shutdown_policy_parses_central_surface(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "shutdown": {
+                "enabled": True,
+                "require_power_outage": True,
+                "min_on_battery_seconds": 300,
+                "external": {
+                    "enabled": True,
+                    "battery_below": 12,
+                    "runtime_below": 180,
+                },
+                "internal": {
+                    "enabled": False,
+                    "battery_below": 8,
+                    "runtime_below": 60,
+                },
+            },
+            "upses": {"u1": {"label": "U1"}},
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert cfg.shutdown_policy.enabled is True
+    assert cfg.shutdown_policy.min_on_battery_seconds == 300
+    assert cfg.shutdown_policy.external.enabled is True
+    assert cfg.shutdown_policy.external.battery_below == 12
+    assert cfg.shutdown_policy.external.runtime_below == 180
+    assert cfg.shutdown_policy.internal.enabled is False
+    assert cfg.shutdown_policy.internal.battery_below == 8
+    assert cfg.shutdown_policy.internal.runtime_below == 60
+
+
+def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> None:
+    from ups_orchestrator import cli
+
+    bad = tmp_path / "config.json"
+    bad.write_text("{ not valid json ")
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(bad))
+    assert cli._load_config() is None  # graceful, not a crash

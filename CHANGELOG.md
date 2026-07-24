@@ -7,10 +7,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Full NUT data ingestion**: `UpsSnapshot` and the recorder now capture battery
+  voltage (+nominal), battery type, driver state, beeper status, shutdown/start
+  delays, device serial, input nominal voltage, and battery charge/runtime
+  thresholds — the useful vars the CyberPower units expose that were previously
+  discarded. Derived `battery_voltage_percent`, `input_voltage_percent`, and
+  `load_headroom_watts`. (`battery.mfr.date` reads the vendor string, not a date,
+  so battery age is not derivable and is not shown.)
+- **Richer displays**: report, dashboard, and audit now surface battery health
+  (pack voltage · % of nominal · type), active alarms, last self-test result,
+  input line quality vs nominal, and load headroom in watts. A failed self-test
+  or active alarm escalates the report to a warning.
+- **Redesigned `status` TUI**: per-UPS cards with colored battery/load bar
+  gauges, pack voltage, output voltage, load headroom, and an in-terminal draw
+  sparkline from the recorder samples. Honors `NO_COLOR`/non-TTY; `--watch`
+  refreshes without flicker.
+
+### Fixed
+- **Boot-audit alert loss**: the "already sent" marker is now written only after
+  a confirmed Discord delivery, so a failed first send (the network is often
+  down right after a power-loss reboot) retries on the next run instead of
+  permanently suppressing the abrupt-power-loss alert for that boot.
+- **State durability**: the state tempfile is `fsync`'d before the atomic
+  replace, matching the recorder/jsonlog writers — no zero-length state file on
+  power loss.
+- **Log rotation**: `jsonlog` rotates via atomic `Path.replace` instead of
+  unlink-then-rename (removes a TOCTOU window).
+- **Serial shutdown**: a short/failed serial write is now reported as a failure
+  instead of false success.
+
+### Repository
+- `py.typed` marker (PEP 561), pyproject classifiers + Homepage/Changelog/Issues
+  URLs, coverage tooling (`pytest-cov`, `[tool.coverage]`) with a 70% CI gate,
+  CI now installs+tests the `[dashboard]` extra and runs a gitleaks job,
+  `.pre-commit-config.yaml`, issue/PR templates, `.editorconfig`, and expanded
+  `.gitignore`.
+
+### Added (earlier)
+- **Load-step drop detection** (`load_step` config block, on by default): a
+  device abruptly losing power shows up as its UPS's output load collapsing
+  while the UPS itself stays `OL` — NUT's only in-band signature for a
+  downstream device dying. A drop of `drop_percent` points (default 15) below
+  the peak of the last `window_polls` polls (default 4 — the window keeps a
+  collapse that straddles a poll boundary from splitting into two sub-threshold
+  steps) logs a `load_step_drop` event with the estimated watts delta and sends
+  a rate-limited notification (`cooldown_seconds`, default 600). The alert
+  embeds a 10-minute draw-history sparkline built from the recorder samples.
+  Motivated by a real incident: a host's hard power-offs were visible in the
+  recorder as −135 W / −216 W load steps on clean input voltage, but nothing
+  alerted on them.
 - **`shutdown_scope`** (global default + per-UPS override): choose whether a UPS
   shuts down only its remote/serial targets (`remote`, the default) or the local
   host too (`all`, fired last at its own threshold). Lets you configure "just the
   remote" vs "both" per UPS.
+
+- **`power-dashboard`** command: renders a PNG — a card per UPS (status, battery,
+  load, runtime) plus a draw-history line chart from the recorder samples — and
+  posts it to Discord as an image attachment (`--post`, `--out`, `--hours`).
+  Needs the optional `matplotlib` dep (`pip install ups-orchestrator[dashboard]`).
+  The daily `report` posts it automatically once a week (Mondays), so it rides
+  the existing report timer with no separate systemd unit; `report --dashboard`
+  forces it any day.
+
+### Changed
+- NUT `upsmon.conf` snippet and Deployment docs now spell out the full `MONITOR`
+  contract — connect-host (`@localhost` only on the `upsd` host), `powervalue`
+  vs `MINSUPPLIES`, `primary`/`secondary`, and the credential source — instead
+  of the earlier one-line sketch.
+- Recorder retention deepened from 10 to 20 rotations (`DEFAULT_MAX_ROTATIONS`
+  and the `recorder.service` `--max-rotations`), roughly two weeks of one-second
+  forensic history at the live three-UPS size. Worst case ≈ 1 GB
+  (20 × 50 MB) for the samples log; confirm disk headroom before redeploying.
 
 ## [0.4.0] — 2026-05-21
 

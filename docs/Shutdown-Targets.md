@@ -1,9 +1,13 @@
 # Shutdown Targets
 
-A shutdown target is a machine the orchestrator powers down when its UPS runs
-low. Each UPS can have any number, and they're all disabled until you say
-otherwise. The host running the daemon is protected separately by NUT's own
-`upsmon SHUTDOWNCMD`; targets are for the *other* boxes a UPS feeds.
+A shutdown target is a machine the orchestrator knows how to power down. Each
+UPS can have any number, and target entries are only transports: they say *how*
+to reach a device. The top-level `shutdown` policy decides *whether* any target
+command is allowed to run. That policy is disabled by default.
+
+The host running the daemon is protected separately by NUT's own
+`upsmon SHUTDOWNCMD`; orchestrator targets are optional extra actions for the
+devices a UPS feeds.
 
 ## Kinds
 
@@ -14,30 +18,29 @@ otherwise. The host running the daemon is protected separately by NUT's own
 - **`remote`**: run the command over SSH. `host` can be a real hostname or an
   `ssh_config` Host alias; leave `user` empty to connect as just `ssh <alias>`,
   which keeps the real hostname/port/key in `~/.ssh/config`.
-- **`local`**: the host the daemon runs on. These always fire *after* every
+- **`local`**: the host the daemon runs on. Local targets run *after* every
   enabled serial/remote target on the same UPS, so the watcher dies last.
-
-## Scope: just the remote, or both?
-
-`shutdown_scope` decides whether the host running the daemon is ever shut down by
-the orchestrator. Set it globally and/or per UPS:
-
-- **`remote`** (default): only `serial`/`remote` targets fire. The local host is
-  left to NUT's `upsmon` LOWBATT backstop, so the watcher keeps running and
-  notifying. Any `local` target is ignored.
-- **`all`**: `local` targets fire too, but always last — the watcher stays up
-  as long as it can, then shuts itself down at its own (lower) threshold.
-
-So "just the remote" is `remote`; "both" is `all` with a `local` target defined.
 
 ## Triggers
 
-A target fires when **either** threshold is met:
+Auto-shutdown is controlled from one top-level surface:
 
-- `battery_below`: charge percentage at or below this value, or
-- `runtime_below`: estimated runtime (seconds) at or below this value.
+- `shutdown.enabled` must be `true`.
+- The relevant group must be enabled:
+  - `shutdown.external.enabled` for `serial` and `remote`.
+  - `shutdown.internal.enabled` for `local`.
+- The UPS must be on battery when `require_power_outage` is true.
+- The UPS must have been on battery for at least `min_on_battery_seconds`.
+- The UPS must be close to empty by the group's central `battery_below` and
+  `runtime_below` thresholds.
 
-Leave both out and the target only fires on an explicit `remote_shutdown` event.
+If battery percent and runtime are both available, both must be at or below the
+group threshold. This prevents a shutdown at, for example, 50% battery while the
+UPS still reports 30 minutes of runtime. If one reading is unavailable, the
+available threshold is used.
+
+An explicit `remote_shutdown` event still respects this policy; it does not
+bypass disabled groups or the close-to-empty gate.
 
 ## Example
 
@@ -48,8 +51,7 @@ Leave both out and the target only fires on an explicit `remote_shutdown` event.
   "enabled": true,
   "device": "/dev/ttyUSB0",
   "baud": 115200,
-  "cmd": "sudo /sbin/shutdown -h now",
-  "battery_below": 50
+  "cmd": "sudo /sbin/shutdown -h now"
 }
 ```
 
