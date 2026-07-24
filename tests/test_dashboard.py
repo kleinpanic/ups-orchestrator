@@ -119,3 +119,42 @@ def test_post_png_sets_user_agent(monkeypatch) -> None:
     assert (ok, status) == (True, 200)
     assert seen["ua"] and "ups-orchestrator" in seen["ua"]
     assert seen["ctype"] and "multipart/form-data" in seen["ctype"]
+
+
+def test_render_png_smoke(monkeypatch, tmp_path) -> None:
+    # Exercises the matplotlib render path; skipped where matplotlib is absent
+    # (CI installs the [dashboard] extra before pytest so this runs there).
+    import pytest
+
+    pytest.importorskip("matplotlib")
+    import ups_orchestrator.dashboard as dash
+    from conftest import make_ups
+    from ups_orchestrator.config import Config
+    from ups_orchestrator.nut import UpsSnapshot
+
+    monkeypatch.setattr(
+        dash,
+        "read_snapshot",
+        lambda _n: UpsSnapshot(
+            "OL",
+            100,
+            600,
+            25,
+            120.0,
+            realpower_nominal=900,
+            battery_voltage=27.0,
+            battery_voltage_nominal=24.0,
+        ),
+    )
+    samples = tmp_path / "samples.jsonl"
+    with samples.open("w") as fh:
+        for i in range(6):
+            fh.write(
+                json.dumps(
+                    {"unix_time": 1000.0 + i, "upses": {"ups1": {"estimated_load_watts": 200 + i}}}
+                )
+                + "\n"
+            )
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    png = dash.render_png(cfg, samples, hours=1, host="ci", now=1005.0)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"  # valid PNG signature
