@@ -122,3 +122,31 @@ def test_load_assessment_thresholds() -> None:
     assert snap.load_margin_percent == 71
     assert snap.estimated_load_watts == 261
     assert snap.load_is_high is False
+
+
+def test_upscmd_success_and_failure(monkeypatch) -> None:
+    class Result:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    calls = []
+
+    def fake_run(args, **_kw):
+        calls.append(args)
+        return Result(0, "OK\n", "")
+
+    monkeypatch.setattr(nut.subprocess, "run", fake_run)
+    rc, out, err = nut.upscmd("ups1", "test.battery.start.quick", user="admin", password="pw")
+    assert rc == 0 and out == "OK"
+    assert calls[0][:1] == [nut.UPSCMD_BIN]
+    assert "admin" in calls[0] and "pw" in calls[0]
+    assert calls[0][-2:] == ["ups1", "test.battery.start.quick"]
+
+
+def test_upscmd_handles_oserror(monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise OSError("upscmd missing")
+
+    monkeypatch.setattr(nut.subprocess, "run", boom)
+    rc, _out, err = nut.upscmd("ups1", "x", user="u", password="p")
+    assert rc == 1 and "upscmd missing" in err

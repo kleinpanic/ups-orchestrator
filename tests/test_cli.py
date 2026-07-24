@@ -174,3 +174,25 @@ def test_selftest_runs_and_alerts_on_failure(env_config, monkeypatch, capsys) ->
     rc = cli.main(["selftest", "ups1"])
     assert rc == 1  # a problem outcome → non-zero
     assert "failed" in capsys.readouterr().out
+
+
+def test_baseline_command(env_config, tmp_path, capsys) -> None:
+    (tmp_path / "samples.jsonl").write_text(
+        '{"unix_time": 0, "upses": {"ups1": {"estimated_load_watts": 0}}}\n'
+        '{"unix_time": 1, "upses": {"ups1": {"estimated_load_watts": 200}}}\n'
+        '{"unix_time": 2, "upses": {"ups1": {"estimated_load_watts": 300}}}\n'
+    )
+    assert cli.main(["baseline", "--hours", "999"]) == 0
+    out = capsys.readouterr().out
+    assert "draw baseline" in out and "U1" in out
+
+
+def test_webui_command_invokes_serve(env_config, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_serve(_cfg, _path, *, host, port):
+        seen["host"], seen["port"] = host, port
+
+    monkeypatch.setattr("ups_orchestrator.webui.serve", fake_serve)
+    assert cli.main(["webui", "--host", "0.0.0.0", "--port", "9001"]) == 0
+    assert seen == {"host": "0.0.0.0", "port": 9001}
