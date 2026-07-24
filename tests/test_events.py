@@ -1,10 +1,56 @@
 from __future__ import annotations
 
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
+from ups_orchestrator import events as events_mod
 from ups_orchestrator.config import ShutdownTarget
-from ups_orchestrator.events import dispatch, fmt_duration
+from ups_orchestrator.events import _default_serial_shutdown, dispatch, fmt_duration
 from ups_orchestrator.notify import Level
 from ups_orchestrator.state import UpsState
+
+
+class _FakePort:
+    """Serial port stand-in whose command write returns a fixed byte count."""
+
+    def __init__(self, cmd_written: int) -> None:
+        self._cmd_written = cmd_written
+
+    def __enter__(self) -> _FakePort:
+        return self
+
+    def __exit__(self, *_a: object) -> bool:
+        return False
+
+    def write(self, data: bytes) -> int:
+        return len(data) if data == b"\r" else self._cmd_written
+
+
+def _serial_target() -> ShutdownTarget:
+    return ShutdownTarget(  # type: ignore[arg-type]
+        name="r630", kind="serial", enabled=True, device="/dev/ttyUSB0", cmd="poweroff"
+    )
+
+
+def test_serial_short_write_reports_failure(monkeypatch) -> None:
+    monkeypatch.setattr(events_mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(events_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("builtins.open", lambda *a, **k: _FakePort(cmd_written=0))
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert "short serial write" in err
+
+
+def test_serial_full_write_succeeds(monkeypatch) -> None:
+    payload_len = len(b"poweroff\n")
+    monkeypatch.setattr(events_mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(events_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("builtins.open", lambda *a, **k: _FakePort(cmd_written=payload_len))
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 0
+    assert err == ""
 
 
 def _remote(name: str = "srv", **kw: object) -> ShutdownTarget:

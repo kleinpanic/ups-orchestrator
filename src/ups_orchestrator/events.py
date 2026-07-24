@@ -83,7 +83,12 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
         with open(target.device, "wb", buffering=0) as port:
             port.write(b"\r")  # nudge the shell to a fresh prompt
             time.sleep(0.5)
-            port.write((target.cmd + "\n").encode())
+            payload = (target.cmd + "\n").encode()
+            written = port.write(payload)
+        if written != len(payload):
+            # Unbuffered write returned short — the far end likely isn't reading
+            # (device unplugged / no getty). Report failure, not false success.
+            return 1, "", f"short serial write: {written}/{len(payload)} bytes to {target.device}"
         return 0, "", ""
     except OSError as exc:
         return 1, "", str(exc)

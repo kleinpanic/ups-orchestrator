@@ -545,8 +545,9 @@ def send_boot_audit(
             text="boot audit already sent for this boot",
         )
 
-    _write_marker(marker_path, boot_id)
     if not power_loss:
+        # Evaluated this boot with nothing to deliver — safe to mark done.
+        _write_marker(marker_path, boot_id)
         return BootAuditResult(
             sent=False,
             boot_id=boot_id,
@@ -569,7 +570,7 @@ def send_boot_audit(
     details = "\n".join(power_loss[-3:])
     gap = sample_gap_report(sample_path, current_boot_id=boot_id)
     gap_text = "\n".join(gap.lines[:8])
-    notifier.send(
+    result = notifier.send(
         Notification(
             title="⚠️ UPS host recovered from abrupt power loss",
             body=(
@@ -584,10 +585,23 @@ def send_boot_audit(
             fields=fields,
         )
     )
+    if result.configured and not result.ok:
+        # Delivery was attempted and failed — the network is frequently not up
+        # yet right after a power-loss reboot. Do NOT write the marker, so the
+        # next boot-audit run retries instead of suppressing the alert forever.
+        return BootAuditResult(
+            sent=False,
+            boot_id=boot_id,
+            power_loss_count=len(power_loss),
+            shutdown_action_count=len(shutdown_actions),
+            text="boot audit send failed; will retry next run",
+        )
+    # Delivered, or no notifier configured (nothing to retry) — mark this boot done.
+    _write_marker(marker_path, boot_id)
     return BootAuditResult(
-        sent=True,
+        sent=result.ok,
         boot_id=boot_id,
         power_loss_count=len(power_loss),
         shutdown_action_count=len(shutdown_actions),
-        text="boot audit sent",
+        text="boot audit sent" if result.ok else "boot audit evaluated; no notifier configured",
     )

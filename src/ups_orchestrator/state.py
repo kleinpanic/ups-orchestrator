@@ -9,6 +9,7 @@ never clobber each other.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -96,6 +97,12 @@ class StateStore:
                 tmp_path = Path(tmp.name)
                 json.dump(payload, tmp, indent=2, sort_keys=True)
                 tmp.write("\n")
+                # Durability: flush userspace + kernel buffers before the atomic
+                # rename, so a power loss right after replace() can't leave the
+                # state file pointing at a zero-length/partial inode. Matches the
+                # fsync in recorder.py/jsonlog.py.
+                tmp.flush()
+                os.fsync(tmp.fileno())
             tmp_path.replace(self.path)
         finally:
             if tmp_path is not None and tmp_path.exists():

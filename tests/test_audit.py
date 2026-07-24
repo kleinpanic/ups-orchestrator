@@ -8,8 +8,22 @@ import pytest
 from conftest import FakeNotifier, make_ups
 from ups_orchestrator import audit
 from ups_orchestrator.config import Config
-from ups_orchestrator.notify import Level
+from ups_orchestrator.notify import DeliveryResult, Level, Notification
 from ups_orchestrator.nut import UpsSnapshot
+
+
+class _FlakyNotifier:
+    """Fails the first ``fail_times`` sends, then succeeds. Tracks call count."""
+
+    def __init__(self, fail_times: int) -> None:
+        self.calls = 0
+        self.fail_times = fail_times
+
+    def send(self, _note: Notification) -> DeliveryResult:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            return DeliveryResult(configured=True, ok=False, attempts=3, error="down")
+        return DeliveryResult(configured=True, ok=True, attempts=1, status_code=204)
 
 
 def test_audit_reports_power_loss_without_shutdown_evidence(
@@ -170,3 +184,38 @@ def test_boot_audit_sends_once_for_unclean_boot(
     assert second.sent is False
     assert len(notifier.sent) == 1
     assert notifier.sent[0].level is Level.CRITICAL
+
+
+def test_boot_audit_retries_after_failed_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A failed delivery must NOT write the marker, so the alert retries next run
+    # instead of being suppressed forever (network often down right after boot).
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    notifier = _FlakyNotifier(fail_times=1)
+    marker = tmp_path / "boot-audit.json"
+    monkeypatch.setattr(audit, "_current_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(
+        audit,
+        "_journal_current_boot",
+        lambda: [
+            "Jun 18 host systemd-journald[1]: system.journal corrupted or uncleanly shut down"
+        ],
+    )
+    monkeypatch.setattr(
+        audit,
+        "read_snapshot",
+        lambda _name: UpsSnapshot("OL", 100, 1800, 10, 120.0, realpower_nominal=900),
+    )
+
+    first = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    assert first.sent is False
+    assert not marker.exists()  # not marked → will retry
+
+    second = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    assert second.sent is True
+    assert marker.exists()  # delivered → now marked
+
+    third = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    assert third.sent is False  # already delivered this boot
+    assert notifier.calls == 2  # third short-circuits on the marker, no send

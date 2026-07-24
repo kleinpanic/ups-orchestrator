@@ -6,7 +6,6 @@ import json
 import os
 import socket
 import time
-from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -30,9 +29,8 @@ def _rotate(path: Path, max_bytes: int) -> None:
     except FileNotFoundError:
         return
     rotated = path.with_suffix(path.suffix + ".1")
-    with suppress(FileNotFoundError):
-        rotated.unlink()
-    path.rename(rotated)
+    # Atomic replace-over-existing (no unlink+rename TOCTOU); matches recorder.py.
+    path.replace(rotated)
 
 
 def append_jsonl(path: Path, record: dict[str, object], *, max_bytes: int = 10_000_000) -> None:
