@@ -26,7 +26,10 @@ USB ids):
 
 - `ups.conf`: one section per UPS.
 - `upssched.conf`: points `CMDSCRIPT` at `/usr/local/bin/upssched-cmd.sh` and
-  maps the events.
+  maps the events. `ONBATT` is **debounced** via a 15 s `START-TIMER` so brief
+  utility dips don't page — only a sustained outage forwards `onbatt`, and the
+  restore alert only follows a real (non-debounced) outage. `LOWBATT` is never
+  debounced.
 - `upsmon.conf`: a `MONITOR` line per UPS plus the `NOTIFYFLAG`/`NOTIFYCMD`
   wiring.
 
