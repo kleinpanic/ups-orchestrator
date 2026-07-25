@@ -43,6 +43,7 @@ def valid_ip(value: str) -> bool:
         return False
     return True
 
+
 # --- injected runner types (mirror events.Deps) -------------------------------
 
 RunLocal = Callable[[Sequence[str]], tuple[int, str, str]]

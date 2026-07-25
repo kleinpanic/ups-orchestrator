@@ -366,9 +366,7 @@ def test_verify_rejects_ups_name_metachar_without_running():
     # A --ups / config value carrying a shell metachar must be refused at the
     # sink BEFORE it is interpolated into the remote `upsc` command.
     ssh = FakeSSH()
-    ok, reason = nutclient.verify_secondary(
-        "mt", "x; touch /tmp/pwned", "192.168.1.125", ssh
-    )
+    ok, reason = nutclient.verify_secondary("mt", "x; touch /tmp/pwned", "192.168.1.125", ssh)
     assert ok is False
     assert "invalid UPS name" in reason
     assert ssh.calls == []  # nothing was executed
