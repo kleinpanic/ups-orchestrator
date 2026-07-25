@@ -42,6 +42,7 @@ ups-orchestrator = "ups_orchestrator.cli:main"
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11"]
 dashboard = ["matplotlib>=3.7"]
+docs = ["mkdocs-material>=9.5"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ups_orchestrator"]

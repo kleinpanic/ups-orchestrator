@@ -7,6 +7,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`control` command**: runs the safe NUT instant commands these units expose —
+  beeper mute/disable/enable and battery test start (quick/deep)/stop — across one
+  or all UPSes via `upscmd`. Each run posts a Discord embed counterpart (🔇 beeper,
+  🔋 test) with a per-UPS OK/FAIL field list alongside the CLI output; `--no-notify`
+  opts out. Power-cutting commands (`load.off`, `shutdown.*`, `driver.killpower`) are
+  deliberately excluded — those stay on the policy-gated shutdown path. Admin creds
+  come from env; `make control ACTION=beeper-mute`. (These consumer CyberPower units
+  expose no display/LCD control — no instant command and no settable variable — so
+  turning displays on/off is not possible.)
+- **Per-UPS `load_step` override**: a UPS with bursty multi-device load can raise its
+  own `drop_percent` (and cooldown/window) so routine job churn doesn't page, while
+  the other UPSes keep the sensitive global default.
+- **Bordered `status` panels**: each UPS renders inside a titled, ANSI-width-aware box
+  (rounded `╭╮╰╯` in color, ASCII `+-|` under `NO_COLOR`), with state in the title bar.
+- **Install grants the installing user perms**: `deploy/install.sh` hands `/opt`
+  ownership to the installing user (`user:nut` + `g+rX`), adds them to the `nut` group,
+  drops a `~/.local/bin` symlink, and creates a least-privilege `upsctl` NUT control
+  user (`deploy/nut-control-user.sh`) — so redeploys need no sudo (`make deploy-code`).
+  The canonical binary stays on `/usr/local/bin` because the `nut` user runs the
+  upssched dispatcher and cannot enter a `0700` home.
 - **`webui` command**: a dependency-free (stdlib `http.server`) local web dashboard — live per-UPS cards (status, battery/load gauges, pack voltage, headroom, alarm, self-test) plus a 24h draw chart, backed by `/api/status` and `/api/history` JSON endpoints. Binds to localhost with no auth (don't expose publicly); serves no secrets. All UPS-supplied strings are HTML-escaped.
 - **`selftest` command**: runs a NUT quick battery test (`upscmd`) per UPS, polls `ups.test.result`, and alerts on a failed/aborted/timed-out result. Skips any UPS on battery (a test drains the pack). Admin creds come from env (`UPS_NUT_ADMIN_USER` / `UPS_NUT_ADMIN_PASSWORD`), never the config. Ships a weekly systemd timer snippet.
 - **`baseline` command**: per-UPS draw statistics (median / p95 / mean / min / max watts) computed read-only from the recorder history — a sense of each UPS's normal load. `--hours` sets the window.
@@ -27,6 +47,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refreshes without flicker.
 
 ### Fixed
+- **ON BATTERY notification grace**: the poll loop paged Discord the instant it saw
+  on-battery, so grid blips *and the orchestrator's own battery self-tests* (which
+  transfer to battery for a few seconds) fired false ON BATTERY / POWER RESTORED
+  pairs. A transfer must now persist past `onbatt_notify_grace_seconds` (default 20)
+  before paging; if it never paged, restoration stays silent too; countdowns gate
+  behind the initial page.
+- **Mutation harness could hang**: it ran the suite with no timeout, so a mutant that
+  turns a bounded loop infinite wedged the whole sweep. A 120s per-mutant timeout now
+  counts a hang as killed, and the self-test guard test uses an advancing clock so its
+  guard mutant dies by a fast assertion instead of looping.
 - **Boot-audit alert loss**: the "already sent" marker is now written only after
   a confirmed Discord delivery, so a failed first send (the network is often
   down right after a power-loss reboot) retries on the next run instead of
@@ -41,7 +71,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Repository
 - `py.typed` marker (PEP 561), pyproject classifiers + Homepage/Changelog/Issues
-  URLs, coverage tooling (`pytest-cov`, `[tool.coverage]`) with a 70% CI gate,
+  URLs, coverage tooling (`pytest-cov`, `[tool.coverage]`) with an 85% CI gate
+  (branch coverage) plus a `tools/mutation_test.py` harness at a 100% kill score,
   CI now installs+tests the `[dashboard]` extra and runs a gitleaks job,
   `.pre-commit-config.yaml`, issue/PR templates, `.editorconfig`, and expanded
   `.gitignore`.
