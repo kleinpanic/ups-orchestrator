@@ -9,6 +9,12 @@ The host running the daemon is protected separately by NUT's own
 `upsmon SHUTDOWNCMD`; orchestrator targets are optional extra actions for the
 devices a UPS feeds.
 
+!!! note "SSH is the fallback, not the primary path"
+    Native NUT (upsmon secondary) is the primary graceful-shutdown mechanism; the
+    `remote` (SSH) / `serial` targets here are a configurable, **default-off**
+    backup. See [SSH vs. native NUT](Shutdown-Mechanisms.md) for the full analysis,
+    the failure modes, and when each path applies.
+
 ## Kinds
 
 - **`serial`**: send the command over a serial console (`device` + `baud`) into
