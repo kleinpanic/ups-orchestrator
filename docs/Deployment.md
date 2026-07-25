@@ -106,6 +106,22 @@ The secondary's NUT password comes from `UPS_NUT_SECONDARY_PASSWORD` in
 `/etc/ups-orchestrator.env` and must match the `[upsmon_secondary]` entry on the
 primary. It is never written to `config.json`.
 
+**Address resolution.** Two addresses matter and both are auto-detected, but a
+WAN/NAT SSH path can fool the defaults — override explicitly when in doubt:
+
+- *The secondary's source IP* (the nftables `saddr`, and what `upsd` sees). It is
+  resolved by running `ip -o route get <primary>` **on the secondary** and taking
+  the `src` — the real address the box sources packets from toward the primary.
+  `$SSH_CONNECTION` is only a fallback, because over a WAN/NAT hop its client
+  field is the **gateway**, not the machine's LAN IP. Pass `--ip <addr>` to
+  override.
+- *The primary's LAN IP* (the `MONITOR` line and the `LISTEN` the secondary dials).
+  It is taken from the first non-loopback `nut_server.listen` entry, else
+  auto-detected via a local `ip route get` toward the secondary. If neither
+  yields a LAN address, enrollment **errors** (rather than silently binding
+  `upsd` to localhost and failing at verify) — pass `--primary-ip <addr>` or add
+  a LAN address to `nut_server.listen`.
+
 !!! danger "Mandatory: restart crowdsec after every `nft -f`"
     Debian's `/etc/nftables.conf` opens with `flush ruleset`, which wipes
     crowdsec's `crowdsec`/`crowdsec6` tables. The bouncer does **not** recreate

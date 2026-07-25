@@ -569,6 +569,175 @@ def test_add_ssh_connection_field1_parse(cfg_path, add_env, monkeypatch) -> None
     assert entry["ip"] == "192.168.1.114"
 
 
+# --- LIVE BUG #2: remote IP resolved to the gateway over a WAN/NAT SSH path ----
+
+
+def test_parse_route_src_extracts_src_field() -> None:
+    out = "192.168.1.125 dev eth0 src 192.168.1.114 uid 0 \n    cache \n"
+    assert cli._parse_route_src(out) == "192.168.1.114"
+
+
+def test_parse_route_src_none_when_absent_or_invalid() -> None:
+    assert cli._parse_route_src("192.168.1.125 dev eth0 uid 0\n") is None
+    assert cli._parse_route_src("... src not-an-ip ...") is None
+
+
+def test_resolve_remote_ip_prefers_route_src_over_ssh_connection_gateway(monkeypatch) -> None:
+    # The live bug: over a WAN/NAT SSH path, $SSH_CONNECTION field 1 is the
+    # GATEWAY (192.168.1.1), not the machine's real LAN IP. `ip route get
+    # <primary>` on the remote returns the true src (192.168.1.114) upsd sees.
+    calls: list[str] = []
+
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        calls.append(command)
+        if "route get" in command:
+            return 0, "192.168.1.125 dev eth0 src 192.168.1.114 uid 0\n", ""
+        if "SSH_CONNECTION" in command:
+            return 0, "192.168.1.1 41000 203.0.113.9 22\n", ""  # gateway!
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    ip = cli._resolve_remote_ip("mt", None, "192.168.1.125")
+    assert ip == "192.168.1.114"  # route src, NOT the gateway
+    assert any("ip -o route get 192.168.1.125" in c for c in calls)
+
+
+def test_resolve_remote_ip_falls_back_to_ssh_connection_when_route_fails(monkeypatch) -> None:
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        if "route get" in command:
+            return 1, "", "network unreachable"
+        if "SSH_CONNECTION" in command:
+            return 0, "192.168.1.114 22 192.168.1.125 3493\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    assert cli._resolve_remote_ip("mt", None, "192.168.1.125") == "192.168.1.114"
+
+
+def test_resolve_remote_ip_explicit_overrides_everything(monkeypatch) -> None:
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        raise AssertionError("no probe should run when --ip is explicit")
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    assert cli._resolve_remote_ip("mt", "10.0.0.5", "192.168.1.125") == "10.0.0.5"
+
+
+def test_add_persists_route_src_not_gateway(cfg_path, add_env, monkeypatch) -> None:
+    # End-to-end: --primary-ip given (so the remote route-get runs toward it), a
+    # WAN SSH path returns the gateway on $SSH_CONNECTION. The persisted entry
+    # must carry the route src (192.168.1.114), never the gateway.
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        if "route get" in command:
+            return 0, "192.168.1.125 dev eth0 src 192.168.1.114 uid 0\n", ""
+        if "SSH_CONNECTION" in command:
+            return 0, "192.168.1.1 41000 203.0.113.9 22\n", ""  # gateway
+        if "uname -s" in command:
+            return 0, "Linux\n/usr/bin/pacman\n", ""
+        if "ups.status" in command:
+            return 0, "OL\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_NFT_PATH", str(add_env["tmp"] / "u.nft"))
+    monkeypatch.setattr(cli, "_NFT_RELOAD_PATH", str(add_env["tmp"] / "u.nft"))
+    _seed_nft(add_env["tmp"] / "u.nft")
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--ssh",
+            "mt",
+            "--ups",
+            "cyberpower",
+            "--primary-ip",
+            "192.168.1.125",
+        ]
+    )
+    assert rc == 0
+    data = json.loads(cfg_path.read_text())
+    entry = next(m for m in data["monitored_machines"] if m["name"] == "mt")
+    assert entry["ip"] == "192.168.1.114"  # route src, not the gateway 192.168.1.1
+
+
+# --- LIVE BUG #3: primary LAN LISTEN auto-detect silently failed --------------
+
+
+def test_resolve_primary_ip_prefers_lan_listen(monkeypatch, tmp_path) -> None:
+    from ups_orchestrator.config import Config
+
+    cfg = tmp_path / "config.json"
+    _write_config(cfg)  # listen includes 192.168.1.125
+    conf = Config.load(cfg)
+    assert cli._resolve_primary_ip(conf, None, "192.168.1.114") == "192.168.1.125"
+
+
+def test_resolve_primary_ip_autodetects_via_route_when_only_loopback(monkeypatch, tmp_path) -> None:
+    # No --primary-ip and only a loopback LISTEN: the old code silently returned
+    # 127.0.0.1, so no LAN LISTEN was written and enrollment failed at verify.
+    # Now it routes locally toward the machine and uses the src.
+    from ups_orchestrator.config import Config
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upses": {"cyberpower": {"label": "CyberPower"}},
+                "nut_server": {"listen": ["127.0.0.1", "::1"], "port": 3493},
+                "monitored_machines": [],
+            }
+        )
+    )
+    conf = Config.load(cfg)
+    monkeypatch.setattr(
+        cli,
+        "_monitor_run_local_probe",
+        lambda argv: (0, "192.168.1.114 dev eth0 src 192.168.1.125 uid 0\n", ""),
+    )
+    assert cli._resolve_primary_ip(conf, None, "192.168.1.114") == "192.168.1.125"
+
+
+def test_resolve_primary_ip_none_when_autodetect_fails(monkeypatch, tmp_path) -> None:
+    from ups_orchestrator.config import Config
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "upses": {"cyberpower": {"label": "CyberPower"}},
+                "nut_server": {"listen": ["127.0.0.1"], "port": 3493},
+                "monitored_machines": [],
+            }
+        )
+    )
+    conf = Config.load(cfg)
+    monkeypatch.setattr(cli, "_monitor_run_local_probe", lambda argv: (1, "", "no route"))
+    assert cli._resolve_primary_ip(conf, None, "192.168.1.114") is None
+
+
+def test_add_errors_rc2_when_primary_ip_undetectable(cfg_path, add_env, monkeypatch) -> None:
+    # End-to-end: only loopback LISTEN, no --primary-ip, route auto-detect fails
+    # → clean rc 2 telling the operator to pass --primary-ip, NOT a silent
+    # localhost-only enrollment that fails later at verify.
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "upses": {"cyberpower": {"label": "CyberPower"}},
+                "nut_server": {"listen": ["127.0.0.1"], "port": 3493},
+                "monitored_machines": [],
+            }
+        )
+    )
+    monkeypatch.setattr(cli, "_monitor_run_local_probe", lambda argv: (1, "", "no route"))
+    monkeypatch.setattr(cli, "_monitor_run_ssh", _add_ssh_all_ok(with_ip=True))
+    monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    rc = cli.main(["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "1.2.3.4"])
+    assert rc == 2
+
+
 def test_add_persists_machine_without_password(cfg_path, add_env, monkeypatch) -> None:
     _write_config(cfg_path, extra={"_comment": "keep me"})
     ssh = _add_ssh_all_ok(with_ip=True)

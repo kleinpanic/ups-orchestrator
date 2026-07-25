@@ -710,6 +710,12 @@ def _monitor_restart_bouncer() -> None:  # pragma: no cover — live only
     nutclient._default_run_local(["systemctl", "restart", "crowdsec-firewall-bouncer"])
 
 
+def _monitor_run_local_probe(argv: Sequence[str]) -> tuple[int, str, str]:  # pragma: no cover
+    """Live local command runner for read-only probes (no stdin, no /etc write)."""
+    proc = subprocess.run(list(argv), capture_output=True, text=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def _monitor_primary_ip(cfg: Config, override: str | None) -> str:
     """First non-loopback LISTEN address (the LAN IP the secondary connects to)."""
     if override:
@@ -718,6 +724,31 @@ def _monitor_primary_ip(cfg: Config, override: str | None) -> str:
         if addr not in ("127.0.0.1", "::1", "localhost"):
             return addr
     return "127.0.0.1"
+
+
+def _resolve_primary_ip(cfg: Config, override: str | None, toward_ip: str) -> str | None:
+    """Resolve the primary's LAN IP the secondary's MONITOR line points at.
+
+    Order: explicit ``--primary-ip`` override → first non-loopback
+    ``nut_server.listen`` entry → local ``ip -o route get <toward_ip>`` ``src``
+    (the primary's address on the path to the secondary) → ``None``.
+
+    The route probe closes the live gap where, without ``--primary-ip`` and with
+    only a loopback LISTEN configured, the old code silently returned
+    ``127.0.0.1`` — so no LAN LISTEN was written and upsd stayed localhost-only,
+    failing enrollment at verify with no clear error. Returning ``None`` here lets
+    the caller ERROR clearly instead.
+    """
+    if override:
+        return override.strip() if _valid_ip(override) else None
+    for addr in cfg.nut_server.listen:
+        if addr not in ("127.0.0.1", "::1", "localhost") and _valid_ip(addr):
+            return addr
+    if _valid_ip(toward_ip):
+        rc, out, _err = _monitor_run_local_probe(["ip", "-o", "route", "get", toward_ip])
+        if rc == 0:
+            return _parse_route_src(out)
+    return None
 
 
 def _survivor_saddrs(machines: tuple[MonitoredMachine, ...]) -> list[str]:
@@ -885,15 +916,44 @@ def _valid_ip(value: str) -> bool:
     return True
 
 
-def _resolve_remote_ip(alias: str, explicit: str | None) -> str | None:
-    """RESEARCH.md §4 order: explicit --ip → SSH_CONNECTION field 1 → None.
+def _parse_route_src(route_out: str) -> str | None:
+    """Extract the ``src`` field from ``ip -o route get`` output. PURE.
 
-    ``echo $SSH_CONNECTION`` is expanded by the remote shell; field 1 is the
-    client source address upsd actually sees, so it is the most correct saddr.
-    Returns a validated IP literal or ``None`` when nothing usable resolves.
+    ``ip route get`` prints the address the kernel would source a packet from on
+    the path to a destination, e.g. ``… src 192.168.1.114 uid 0``. That is the
+    exact source IP upsd sees — unlike ``$SSH_CONNECTION`` field 1, which for a
+    box reached over a WAN/NAT path is the GATEWAY, not the machine's LAN IP
+    (the live enrollment bug: mt resolved to 192.168.1.1, not 192.168.1.114).
+    Returns the validated literal or ``None``.
+    """
+    tokens = route_out.split()
+    for i, tok in enumerate(tokens):
+        if tok == "src" and i + 1 < len(tokens):
+            candidate = tokens[i + 1]
+            return candidate if _valid_ip(candidate) else None
+    return None
+
+
+def _resolve_remote_ip(alias: str, explicit: str | None, primary_ip: str) -> str | None:
+    """Resolve the source IP the secondary uses to reach the primary.
+
+    Order: explicit ``--ip`` overrides everything → ``ip -o route get
+    <primary_ip>`` run ON THE REMOTE (its ``src`` is the address upsd actually
+    sees) → ``$SSH_CONNECTION`` field 1 as a last-resort fallback. Returns a
+    validated IP literal or ``None`` when nothing usable resolves.
+
+    The route probe replaces trusting ``$SSH_CONNECTION`` field 1 outright:
+    over a WAN/NAT SSH path that field is the gateway, so a route lookup toward
+    the primary is the only reliable way to learn the machine's real LAN IP.
     """
     if explicit:
         return explicit.strip() if _valid_ip(explicit) else None
+    if _valid_ip(primary_ip):
+        rc, out, _err = _monitor_run_ssh(alias, f"ip -o route get {primary_ip}", None)
+        if rc == 0:
+            src = _parse_route_src(out)
+            if src is not None:
+                return src
     rc, out, _err = _monitor_run_ssh(alias, "echo $SSH_CONNECTION", None)
     if rc == 0:
         fields = out.split()
@@ -958,13 +1018,27 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         )
         return 2
 
-    # 4. resolve the remote source IP (validated literal)
-    ip = _resolve_remote_ip(args.ssh, args.ip)
+    # 4. resolve the remote source IP (validated literal). When --primary-ip is
+    # given, the remote `ip route get <primary>` learns the machine's real LAN
+    # source; otherwise the resolver falls back to $SSH_CONNECTION field 1.
+    ip = _resolve_remote_ip(args.ssh, args.ip, args.primary_ip or "")
     if not ip:
         LOG.error("monitor add: could not resolve a valid source IP for %s", args.ssh)
         return 2
 
-    primary = _monitor_primary_ip(cfg, args.primary_ip)
+    # 5. resolve the primary's LAN IP the secondary's MONITOR line points at.
+    # Without --primary-ip, auto-detect it locally by routing toward the machine
+    # (the primary's src on that path) rather than silently defaulting to
+    # localhost, which would leave upsd bound to 127.0.0.1 and enrollment failing
+    # at verify with no clear cause (the live bug).
+    primary = _resolve_primary_ip(cfg, args.primary_ip, ip)
+    if not primary:
+        LOG.error(
+            "monitor add: could not auto-detect the primary's LAN IP toward %s — "
+            "pass --primary-ip or add a LAN LISTEN to nut_server.listen",
+            ip,
+        )
+        return 2
     ns = cfg.nut_server
     # Carry a pre-existing entry's raw dict so re-adding (idempotent replace)
     # preserves that machine's operator-authored keys (e.g. a _comment).
