@@ -73,6 +73,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forces it any day.
 
 ### Changed
+- **Per-UPS `load_step` override**: a UPS can now set its own `load_step` block (e.g. a higher `drop_percent`) that overrides the global one — quiets a bursty UPS whose routine load swings were tripping the sensitive default, without desensitizing the others.
 - **Debounced NUT `ONBATT`**: the `upssched.conf` snippet now starts a 15 s grace timer on battery and only forwards `onbatt` (and, on recovery, `online`) for a sustained outage — brief utility dips no longer page. `LOWBATT` stays immediate. The dispatcher maps the fired `onbatt_grace` timer to the orchestrator's `onbatt`.
 - NUT `upsmon.conf` snippet and Deployment docs now spell out the full `MONITOR`
   contract — connect-host (`@localhost` only on the `upsd` host), `powervalue`
