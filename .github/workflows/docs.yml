@@ -34,7 +34,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install "mkdocs-material>=9.5"
-      - run: mkdocs build --site-dir site
+      # --strict fails the build on broken links or pages missing from the nav,
+      # so the published site can't silently drift from the docs in the repo.
+      - run: mkdocs build --strict --site-dir site
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
