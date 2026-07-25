@@ -46,3 +46,15 @@ def test_base_record_has_envelope() -> None:
     rec = base_record("notification")
     assert rec["kind"] == "notification"
     assert "time" in rec and "unix_time" in rec and "boot_id" in rec
+
+
+def test_append_event_writes_record(tmp_path) -> None:
+    from ups_orchestrator.jsonlog import append_event
+
+    log = tmp_path / "events.jsonl"
+    append_event(log, "onbatt", ups_name="ups1", ups_label="U1", message="hi")
+    import json
+
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["event"] == "onbatt" and rec["ups"] == "ups1" and rec["label"] == "U1"
+    assert rec["snapshot"] is None  # no snapshot passed

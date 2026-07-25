@@ -82,3 +82,4 @@ source = ["ups_orchestrator"]
 # dashboard.render_png needs matplotlib (optional), so exclude it from the floor.
 omit = ["*/dashboard.py"]
 exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:", "raise NotImplementedError"]
+fail_under = 85
