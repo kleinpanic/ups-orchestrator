@@ -559,7 +559,7 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
     load = snap.load
     if load is None:
         return
-    policy = deps.load_step
+    policy = ups.load_step if ups.load_step is not None else deps.load_step
     window = list(state.recent_loads)
     state.recent_loads = (window + [load])[-max(1, policy.window_polls) :]
     if not policy.enabled or not window:

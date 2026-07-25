@@ -53,7 +53,10 @@
           "enabled": false,
           "cmd": "sudo /sbin/shutdown -h now"
         }
-      ]
+      ],
+      "load_step": {
+        "drop_percent": 30
+      }
     },
     "ups2": {
       "label": "Desk UPS",

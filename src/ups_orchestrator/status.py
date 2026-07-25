@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,29 @@ _CLEAR_EOS = "\033[J"
 _BLOCKS = "▁▂▃▄▅▆▇█"
 _GAUGE_W = 14
 _SPARK_MIN = "▏"
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _vlen(text: str) -> int:
+    """Visible length — the printable width once ANSI colour codes are stripped."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def _panel(title: str, title_vlen: int, lines: list[str], *, use_color: bool) -> list[str]:
+    """Box a card's content lines under a titled top border, ANSI-width aware."""
+    inner = max([title_vlen, *(_vlen(x) for x in lines)]) if lines else title_vlen
+    tl, tr, bl, br, h, v = (
+        ("╭", "╮", "╰", "╯", "─", "│") if use_color else ("+", "+", "+", "+", "-", "|")
+    )  # noqa: E501
+    dim = _DIM if use_color else ""
+    reset = _RESET if use_color else ""
+    top = f"{dim}{tl}{h} {reset}{title} {dim}{h * (inner - title_vlen - 1)}{tr}{reset}"
+    out = [top]
+    for x in lines:
+        out.append(f"{dim}{v}{reset} {x}{' ' * (inner - _vlen(x))} {dim}{v}{reset}")
+    out.append(f"{dim}{bl}{h * (inner + 2)}{br}{reset}")
+    return out
 
 
 def _classify(snap: UpsSnapshot) -> tuple[str, str]:
@@ -94,15 +118,17 @@ def _card(
         return f"{code}{text}{_RESET}" if use_color else text
 
     state, scolor = _classify(snap)
+    title = f"{c(ups_label, _BOLD)}  {c(state, scolor)}"
+
     v_in = "—" if snap.input_voltage is None else f"{snap.input_voltage:.0f}V"
     v_out = "" if snap.output_voltage is None else f" / {snap.output_voltage:.0f}V out"
-    header = f"{c(ups_label, _BOLD)}  {c(state, scolor)}  {c(f'in {v_in}{v_out}', _DIM)}"
+    volt = f"Input   {c(f'{v_in}{v_out}', _DIM)}"
 
     charge = snap.charge
     bv = f"  {snap.battery_voltage:.1f}V" if snap.battery_voltage is not None else ""
     rt = "" if snap.runtime_seconds is None else f"  ~{fmt_duration(snap.runtime_seconds)} to 0%"
     batt = (
-        f"  Battery {_gauge((charge or 0) / 100, _battery_color(charge), use_color=use_color)} "
+        f"Battery {_gauge((charge or 0) / 100, _battery_color(charge), use_color=use_color)} "
         f"{'—' if charge is None else f'{charge:>3}%'}{bv}{c(rt, _DIM)}"
     )
 
@@ -115,16 +141,15 @@ def _card(
     )
     wtext = "" if watts is None or nominal is None else f"  {watts}/{nominal} W"
     htext = "" if head is None else c(f"  {head} W free", _DIM)
-    loadline = (
-        f"  Load    {lg} {'—' if load is None else f'{load:>3}%'} {snap.load_level}{wtext}{htext}"
-    )
+    lpct = "—" if load is None else f"{load:>3}%"
+    loadline = f"Load    {lg} {lpct} {snap.load_level}{wtext}{htext}"
 
-    lines = ["", header, batt, loadline]
+    inner = [volt, batt, loadline]
     spark = _sparkline(watts_hist)
     if spark:
         rng = f"{min(watts_hist)}–{max(watts_hist)} W, 30m"
-        lines.append(f"  Draw    {c(spark, _CYAN)} {c(rng, _DIM)}")
-    return lines
+        inner.append(f"Draw    {c(spark, _CYAN)} {c(rng, _DIM)}")
+    return ["", *_panel(title, _vlen(title), inner, use_color=use_color)]
 
 
 def render(

@@ -10,6 +10,7 @@ Modes::
     ups-orchestrator audit               # incident-oriented journald/UPS report
     ups-orchestrator baseline            # per-UPS draw baseline from recorder history
     ups-orchestrator selftest [ups]      # run a NUT battery self-test and alert on failure
+    ups-orchestrator control <action>    # beeper/battery-test instant commands (all UPSes)
     ups-orchestrator boot-audit          # one-shot post-boot abrupt-loss alert
     ups-orchestrator record              # high-frequency UPS telemetry recorder
     ups-orchestrator power-dashboard     # render/post a live+history power image
@@ -417,6 +418,91 @@ def _cmd_selftest(argv: list[str]) -> int:
     return 1 if any_problem else 0
 
 
+# Safe instant commands only. Power/shutdown commands (load.off, shutdown.*,
+# driver.killpower) are deliberately NOT exposed here — they cut power to
+# everything on the UPS and belong to the gated shutdown path, not a CLI verb.
+_CONTROL_ACTIONS = {
+    "beeper-mute": "beeper.mute",
+    "beeper-disable": "beeper.disable",
+    "beeper-enable": "beeper.enable",
+    "test-quick": "test.battery.start.quick",
+    "test-deep": "test.battery.start.deep",
+    "test-stop": "test.battery.stop",
+}
+
+# Emoji per action family, for the Discord counterpart of a control run.
+_CONTROL_EMOJI = {"beeper": "🔇", "test": "🔋"}
+
+
+def _cmd_control(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ups-orchestrator control",
+        description="Run a safe instant command on one or all UPSes (beeper/battery test). "
+        "These CyberPower units expose no display control.",
+    )
+    parser.add_argument("action", choices=sorted(_CONTROL_ACTIONS))
+    parser.add_argument("ups", nargs="?", help="UPS name (default: every configured UPS)")
+    parser.add_argument("--user-env", default="UPS_NUT_ADMIN_USER")
+    parser.add_argument("--password-env", default="UPS_NUT_ADMIN_PASSWORD")
+    parser.add_argument(
+        "--no-notify", action="store_true", help="skip the Discord notification counterpart"
+    )
+    args = parser.parse_args(argv)
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    user = os.environ.get(args.user_env, "").strip()
+    password = os.environ.get(args.password_env, "")
+    if not user or not password:
+        LOG.error("control: NUT admin creds not set (%s / %s)", args.user_env, args.password_env)
+        return 2
+
+    from ups_orchestrator.nut import upscmd
+
+    command = _CONTROL_ACTIONS[args.action]
+    targets = [args.ups] if args.ups else list(cfg.upses)
+    # (label, ok, detail) per UPS actually acted on — drives both CLI and Discord.
+    results: list[tuple[str, bool, str]] = []
+    for name in targets:
+        ups = cfg.ups(name)
+        if ups is None:
+            LOG.warning("control: unconfigured UPS %r — skipping", name)
+            continue
+        rc, out, err = upscmd(ups.name, command, user=user, password=password)
+        ok = rc == 0
+        detail = "OK" if ok else f"FAIL: {(err or out or 'upscmd error').splitlines()[0]}"
+        print(f"{ups.label}: {args.action} ({command}) -> {detail}")
+        results.append((ups.label, ok, detail))
+
+    any_fail = any(not ok for _, ok, _ in results)
+    if results and not args.no_notify:
+        _notify_control(cfg, args.action, command, results, any_fail)
+    return 1 if any_fail else 0
+
+
+def _notify_control(
+    cfg: Config,
+    action: str,
+    command: str,
+    results: list[tuple[str, bool, str]],
+    any_fail: bool,
+) -> None:
+    """Post the Discord counterpart of a control run (one summary embed)."""
+    from ups_orchestrator.notify import Level, Notification
+
+    emoji = _CONTROL_EMOJI.get(action.split("-", 1)[0], "🎛️")
+    ok_n = sum(1 for _, ok, _ in results if ok)
+    level = Level.WARNING if any_fail else Level.SUCCESS
+    note = Notification(
+        title=f"{emoji} control: {action} — {ok_n}/{len(results)} OK",
+        body=f"`{command}` across {len(results)} UPS(es)",
+        level=level,
+        fields=[(label, detail) for label, _, detail in results],
+    )
+    _build_deps(cfg).notifier.send(note)
+
+
 def _cmd_webui(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator webui")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (localhost by default)")
@@ -594,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error(
             "usage: ups-orchestrator "
             "<event|tick|watch|status|report|audit|baseline|selftest|boot-audit|record|"
-            "power-dashboard|webui|notify-test|logs> [...]"
+            "power-dashboard|webui|control|notify-test|logs> [...]"
         )
         return 0
 
@@ -609,6 +695,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_baseline(args[1:])
     if mode == "selftest":
         return _cmd_selftest(args[1:])
+    if mode == "control":
+        return _cmd_control(args[1:])
     if mode == "webui":
         return _cmd_webui(args[1:])
     if mode == "boot-audit":

@@ -8,7 +8,9 @@ SYSTEMD_DIR    := /etc/systemd/system
 ENV_FILE       := /etc/ups-orchestrator.env
 STATE_DIR      := /var/lib/$(PROJECT)
 
-.PHONY: help venv lint type test coverage check deploy deploy-user-service nut-snippets
+ACTION ?= beeper-mute
+
+.PHONY: help venv lint type test coverage check deploy deploy-code deploy-user-service nut-snippets nut-control-user control
 
 help:
 	@echo "Targets:"
@@ -17,8 +19,11 @@ help:
 	@echo "  coverage             Run pytest with branch coverage + term-missing"
 	@echo "  mutation             Targeted mutation test of critical logic"
 	@echo "  check                All three"
-	@echo "  deploy               System install (needs root): sudo make deploy"
+	@echo "  deploy               Full system install (needs root): sudo make deploy"
+	@echo "  deploy-code          Redeploy just the code into /opt (NO sudo once owned)"
 	@echo "  deploy-user-service  Enable the --user poll-loop service (NO sudo)"
+	@echo "  nut-control-user     Create least-priv NUT control user (root): sudo make nut-control-user"
+	@echo "  control ACTION=x     Run a control action on all UPSes (e.g. ACTION=beeper-mute)"
 	@echo "  nut-snippets         Print the NUT config changes to apply by hand"
 
 venv:
@@ -43,9 +48,25 @@ mutation:
 
 check: lint type test
 
-# System install (root): venv + /etc config+env + /var/lib state + dispatcher + ACLs.
+# System install (root): venv + /etc config+env + /var/lib state + dispatcher +
+# ACLs + control user, and hands /opt ownership to the installing user.
 deploy:
 	@deploy/install.sh
+
+# Redeploy just the code into the existing /opt venv. No sudo once `deploy` has
+# handed /opt to you; falls back to a clear message if you don't own it yet.
+deploy-code:
+	@/opt/ups-orchestrator/venv/bin/pip install -q --force-reinstall --no-deps "$(BASE)" \
+	  && echo "redeployed $(PROJECT) into /opt" \
+	  || echo "cannot write /opt venv — run 'sudo make deploy' once to take ownership"
+
+# Least-privilege NUT control user + env creds (root): sudo make nut-control-user
+nut-control-user:
+	@deploy/nut-control-user.sh
+
+# Run a control action across every configured UPS (needs admin creds in env).
+control:
+	@$(ORCH) control $(ACTION)
 
 # Poll-loop as a systemd --user service (NO sudo).
 deploy-user-service:

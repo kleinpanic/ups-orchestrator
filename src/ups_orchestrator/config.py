@@ -245,6 +245,10 @@ class UpsConfig:
     # Legacy pre-policy scope value, still parsed so old config files load.
     shutdown_scope: str = "remote"
     shutdown_policy: ShutdownPolicy = field(default_factory=ShutdownPolicy)
+    # Per-UPS load-step override; None falls back to the global load_step policy.
+    # Useful to raise drop_percent on a UPS with bursty load so routine job churn
+    # doesn't page while other UPSes keep the sensitive default.
+    load_step: LoadStepPolicy | None = None
 
     @classmethod
     def from_dict(
@@ -266,6 +270,7 @@ class UpsConfig:
             shutdown_targets=targets,
             shutdown_scope=_norm_scope(data.get("shutdown_scope"), default_scope),
             shutdown_policy=shutdown_policy or ShutdownPolicy(),
+            load_step=LoadStepPolicy.from_dict(data["load_step"]) if "load_step" in data else None,
         )
 
 

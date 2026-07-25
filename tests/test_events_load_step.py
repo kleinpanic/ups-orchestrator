@@ -163,3 +163,31 @@ def test_state_roundtrip_and_legacy_migration() -> None:
     assert restored.last_load_step_notified == 1234
     legacy = UpsState.from_dict({"last_load": 31})
     assert legacy.recent_loads == [31]
+
+
+def test_per_ups_load_step_override_beats_global() -> None:
+    # The Rack UPS noise fix: a per-UPS drop_percent=30 override must NOT trip on
+    # a routine 20-point drop, even though the global default (15) would.
+    from ups_orchestrator.config import UpsConfig
+
+    deps, notifier, log = deps_for(
+        [snap("OL", load=45), snap("OL", load=25)],  # 20-point drop
+        policy=LoadStepPolicy(drop_percent=15),
+    )
+    ups = UpsConfig(name="ups1", label="Rack", load_step=LoadStepPolicy(drop_percent=30))
+    state = UpsState()
+    dispatch("tick", ups, state, deps)
+    dispatch("tick", ups, state, deps)
+    assert drops(log) == []
+    assert notifier.sent == []
+
+
+def test_no_override_falls_back_to_global_policy() -> None:
+    deps, notifier, log = deps_for(
+        [snap("OL", load=45), snap("OL", load=25)],
+        policy=LoadStepPolicy(drop_percent=15),
+    )
+    ups, state = make_ups(), UpsState()  # make_ups → load_step None → global applies
+    dispatch("tick", ups, state, deps)
+    dispatch("tick", ups, state, deps)
+    assert len(drops(log)) == 1  # global (15) trips on the 20-point drop
