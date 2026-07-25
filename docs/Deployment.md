@@ -63,6 +63,100 @@ upsc -l   # your UPSes should be listed
 For multiple USB UPSes with the same vendor/product id, pin each section with a
 `serial = ...` line. `nut-scanner -U` is the quickest way to list those serials.
 
+## 2b. Enroll NUT secondaries (`monitor add`)
+
+Network-reachable, nut-capable boxes shut *themselves* down as NUT secondaries
+instead of being pushed a shutdown over SSH (the credential-minimal, coordinated
+design — see [SSH vs. native NUT](Shutdown-Mechanisms.md)). `monitor add` runs on
+the **primary** (eulerpi5) as root and drives the whole enrollment:
+
+```bash
+sudo ups-orchestrator monitor add mt --ssh mt --ups cyberpower --os arch --powervalue 1
+```
+
+What it does, in order:
+
+1. **Bootstrap the primary.** Append the LAN `LISTEN` to `/etc/nut/upsd.conf`,
+   add the `[upsmon_secondary]` account to `/etc/nut/upsd.users`, then run a
+   **full** `systemctl restart nut-server`. A `reload` is a **no-op** for
+   `LISTEN` — `upsd` only binds its sockets at start, so a reload leaves it on
+   localhost and the secondary never connects. This is why the flow restarts
+   rather than reloads.
+2. **Firewall.** Add the secondary's source IP to the dedicated
+   `table inet ups_orchestrator` nftables set (never the operator's own
+   `filter`/`input` chain), write `/etc/nftables.conf`, and `nft -f` it — then
+   **restart the crowdsec bouncer** (see the warning below).
+3. **Remote install/config.** Over the `ssh` alias: install the NUT client for
+   the box's distro (`nut` on Arch, `nut-client` on Ubuntu/Debian), write a
+   secondary `upsmon.conf` (`powervalue 1`, `MINSUPPLIES 1`, `DEADTIME 30`, and
+   **no** `POWERDOWNFLAG`/`killpower` — a secondary has no UPS to power off),
+   and enable `nut-monitor`.
+4. **Verify.** Confirm the secondary reads its UPS off the primary's `upsd`.
+
+The secondary's NUT password comes from `UPS_NUT_SECONDARY_PASSWORD` in
+`/etc/ups-orchestrator.env` and must match the `[upsmon_secondary]` entry on the
+primary. It is never written to `config.json`.
+
+!!! danger "Mandatory: restart crowdsec after every `nft -f`"
+    Debian's `/etc/nftables.conf` opens with `flush ruleset`, which wipes
+    crowdsec's `crowdsec`/`crowdsec6` tables. The bouncer does **not** recreate
+    them on a plain reload — only a **restart** does. So every nftables reload
+    must be followed by:
+
+    ```bash
+    sudo nft -f /etc/nftables.conf
+    sudo systemctl restart crowdsec-firewall-bouncer
+    ```
+
+    `monitor add` does this for you. To make the guard permanent across *future*
+    reloads, install the shipped `PartOf=nftables.service` drop-in
+    (`deploy/nftables/crowdsec-partof.conf`):
+
+    ```bash
+    sudo systemctl edit crowdsec-firewall-bouncer   # paste the [Unit] stanza
+    sudo systemctl daemon-reload
+    ```
+
+    Warning sign that the guard is missing: `nft list tables` shows no `crowdsec`
+    table after an enrollment or reload.
+
+Also apply the `nut-monitor` network-online drop-in
+(`deploy/nut/nut-monitor-network-online.conf`) on each secondary so `upsmon`
+starts after the network is actually up, not merely configured — otherwise it
+logs a spurious comm-loss on boot until DHCP settles.
+
+### Known limitation: primary-dies-first (b2 / c-OL)
+
+The native secondary model has one irreducible hole. Secondaries monitor `upsd`
+**on the primary** over TCP. If the primary (eulerpi5) or the network switch
+between them dies on an **otherwise healthy grid**, the secondaries are left
+last-known-`OL` and *blind*: `upsmon` treats prolonged comm-loss as a **warning
+(NOCOMM), not a shutdown**, by design. They stay up but unprotected against a
+*subsequent* outage until the feed returns.
+
+**Option A (shipped mitigation).** Each secondary runs `powervalue 1` +
+`MINSUPPLIES 1` + `DEADTIME 30`. This covers every path where the grid is *really*
+down: a genuine on-battery outage still triggers shutdown, and if the primary
+dies mid-outage (everything already `OB`), each secondary's local
+`DEADTIME`-on-`OB` timer declares the UPS dead and shuts down (dead-UPS
+inference, Path B2). What Option A does **not** cover is the *healthy-grid*
+crash: primary or switch dies while everything is `OL`, so there is no `OB`
+state to infer from — NOCOMM warnings only, no shutdown.
+
+**Do not claim the SSH/serial backup closes this hole.** The default-off backup
+runs *on eulerpi5* — it dies with the primary (mode b) and cannot cross a dark
+switch (mode c). Stating otherwise would be a documentation correctness bug.
+
+**Option B (the designated future fix, not implemented here):** a second,
+independent `upsd` (e.g. on the rpi4, in a separate power + network domain) that
+the secondaries also monitor. That gives a surviving monitor when the primary is
+gone. It is a topology change, deferred to a future phase.
+
+**Wiring recommendation (mitigation D):** put the network switch **and** eulerpi5
+on the longest-runtime UPS. It does not close the b2/c-OL hole, but it shrinks the
+window in which the coordinator or its network path goes dark before the
+secondaries.
+
 ## 3. User services (no sudo)
 
 ```bash

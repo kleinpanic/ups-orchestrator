@@ -101,9 +101,11 @@ It removes pathologies 2–5 outright — but it introduces **one new gap of its
     But if the primary (or the network switch) dies on an otherwise **healthy grid**,
     the secondaries are left up-but-blind until the feed returns. `upsmon` treats
     prolonged comm-loss as a *warning*, not a shutdown — by design. The durable fix
-    is a **second, independent `upsd`** the secondaries also monitor; until then this
-    is a documented limitation, and the default-off serial deadman below is the
-    stop-gap.
+    is a **second, independent `upsd`** the secondaries also monitor (Option B,
+    deferred). The default-off serial/SSH backup below does **not** cover this hole:
+    it runs on the primary, so it dies with the primary and can't cross a dark
+    switch. See [Deployment → Known limitation: primary-dies-first](Deployment.md)
+    for the full covered/uncovered breakdown and the shipped Option A mitigation.
 
 ## The honest trade-off
 
@@ -126,10 +128,13 @@ network-independent. What native NUT fixes is the *credential inversion*, the
 Keep the orchestrator as the **policy brain**, but prefer *wrapping* NUT over
 pushing SSH:
 
-- **Network-reachable, nut-capable boxes** → run them as **NUT secondaries** with
-  `powervalue 1` + `MINSUPPLIES 1` so each self-triggers on its own `OB LB` (the
-  primary here is `powervalue 0` for those UPSes and won't raise FSD for them).
-  Credential-minimal, coordinated, no SSH fan-out.
+- **Network-reachable, nut-capable boxes** → enroll them as **NUT secondaries**
+  with `ups-orchestrator monitor add` (see
+  [Deployment → Enroll NUT secondaries](Deployment.md)). The CLI writes each
+  secondary with `powervalue 1` + `MINSUPPLIES 1` + `DEADTIME 30` so it
+  self-triggers on its own `OB LB` (the primary here is `powervalue 0` for those
+  UPSes and won't raise FSD for them). Credential-minimal, coordinated, no SSH
+  fan-out.
 - **Serial** → keep as the **network-independent backstop** for the boxes that
   matter most. This is the only path that survives the outage-network case, so it
   is not replaceable by either SSH or native NUT.

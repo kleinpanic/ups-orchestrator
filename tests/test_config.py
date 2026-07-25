@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, dual_regime_conflicts
 
 
 def _write(tmp_path: Path, data: dict[str, object]) -> Path:
@@ -160,6 +160,109 @@ def test_shutdown_policy_parses_central_surface(tmp_path: Path) -> None:
     assert cfg.shutdown_policy.internal.enabled is False
     assert cfg.shutdown_policy.internal.battery_below == 8
     assert cfg.shutdown_policy.internal.runtime_below == 60
+
+
+def test_nut_server_defaults_when_absent(tmp_path: Path) -> None:
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    cfg = Config.load(p, env={})
+    assert cfg.nut_server.listen == ("127.0.0.1", "::1")
+    assert cfg.nut_server.port == 3493
+    assert cfg.nut_server.secondary_user == "upsmon_secondary"
+
+
+def test_nut_server_parses(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "nut_server": {
+                "listen": ["127.0.0.1", "192.168.1.125"],
+                "port": 3494,
+                "secondary_user": "sec",
+            },
+            "upses": {"u1": {"label": "U1"}},
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert cfg.nut_server.listen == ("127.0.0.1", "192.168.1.125")
+    assert cfg.nut_server.port == 3494
+    assert cfg.nut_server.secondary_user == "sec"
+
+
+def test_monitored_machines_parse(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [
+                {"name": "mt", "ssh": "mt", "ups": "cyberpower", "powervalue": 2},
+                "not-a-dict",
+            ],
+            "upses": {"u1": {"label": "U1"}},
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert len(cfg.monitored_machines) == 1
+    m = cfg.monitored_machines[0]
+    assert m.name == "mt" and m.ssh == "mt" and m.ups == "cyberpower"
+    assert m.powervalue == 2
+    assert m.backup.enabled is False  # default-off backup
+
+
+def test_monitored_machine_to_dict_preserves_unknown_keys() -> None:
+    # WR-02: an operator-authored per-machine key (e.g. _comment) must survive a
+    # parse → to_dict round-trip instead of being dropped by known-fields-only.
+    from ups_orchestrator.config import MonitoredMachine
+
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "_comment": "kitchen pi", "tag": 7}
+    )
+    out = m.to_dict()
+    assert out["_comment"] == "kitchen pi"
+    assert out["tag"] == 7
+    # Known fields are still normalized/emitted.
+    assert out["name"] == "mt" and out["ups"] == "cyberpower"
+    assert out["backup"] == {"enabled": False, "kind": "remote"}
+
+
+def test_monitored_machines_default_empty(tmp_path: Path) -> None:
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    cfg = Config.load(p, env={})
+    assert cfg.monitored_machines == ()
+
+
+def test_dual_regime_conflict_detected(caplog, tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [{"name": "mt", "ssh": "mt", "ups": "u1"}],
+            "upses": {
+                "u1": {
+                    "label": "U1",
+                    "shutdown_targets": [{"name": "mt", "enabled": True}],
+                }
+            },
+        },
+    )
+    with caplog.at_level("WARNING"):
+        cfg = Config.load(p, env={})
+    assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ("mt",)
+    assert any("mt" in rec.message for rec in caplog.records)
+
+
+def test_dual_regime_no_conflict_when_target_disabled(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [{"name": "mt", "ssh": "mt", "ups": "u1"}],
+            "upses": {
+                "u1": {
+                    "label": "U1",
+                    "shutdown_targets": [{"name": "mt", "enabled": False}],
+                }
+            },
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ()
 
 
 def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> None:

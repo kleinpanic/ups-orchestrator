@@ -12,11 +12,17 @@ any mutant survives. Add a mutation whenever you add behaviour worth pinning.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Never let a mutant's bytecode outlive the source restore. Without this, a
+# restored .py whose mtime lands in the same second as the mutated write keeps
+# the mutated .pyc cached, poisoning the next clean run with a phantom failure.
+_CHILD_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
@@ -116,6 +122,132 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "step = max(1, len(pts) // 600)",
         "webui: history downsample cap",
     ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        '        "    upsmon secondary\\n"\n'
+        '        f"{_UPSMON_END}\\n"\n'
+        "    )\n"
+        '    if stripped == "" or stripped.endswith("\\n"):\n'
+        "        new_text = stripped + block\n"
+        "    else:\n"
+        '        new_text = stripped + "\\n" + block\n'
+        "    return new_text, new_text != text",
+        '        "    upsmon secondary\\n"\n'
+        '        f"{_UPSMON_END}\\n"\n'
+        "    )\n"
+        '    if stripped == "" or stripped.endswith("\\n"):\n'
+        "        new_text = stripped + block\n"
+        "    else:\n"
+        '        new_text = stripped + "\\n" + block\n'
+        "    return new_text, True",
+        "nutclient: upsd.users upsert idempotency (changed always True)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        '    if not saddrs:\n        return ""',
+        '    if not saddrs:\n        return render_nft_block(["0.0.0.0"], port)',
+        "nutclient: empty-saddrs drops table",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        'if not inside and stripped.startswith("MONITOR "):',
+        "if False:",
+        "nutclient: guard non-marker MONITOR refusal bypassed",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        'if mode in ("MODE=standalone", "MODE=netserver"):',
+        "if False:",
+        "nutclient: guard MODE=standalone/netserver refusal bypassed",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "if not any(tok in status.split() for tok in _STATUS_TOKENS):",
+        "if False:",
+        "nutclient: verify status-token match bypassed",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "changed = conf_changed or users_changed",
+        "changed = conf_changed and users_changed",
+        "nutclient: bootstrap either-changed restart predicate (or -> and)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    rc, _out, err = run_local(list(_RESTART_NUT), None)\n"
+        "        if rc != 0:\n"
+        '            log.append(f"nut-server restart failed: {_redact(err, password)}")\n'
+        "            return 4, log",
+        "    rc, _out, err = run_local(list(_RESTART_NUT), None)\n"
+        "        if False:\n"
+        '            log.append(f"nut-server restart failed: {_redact(err, password)}")\n'
+        "            return 4, log",
+        "nutclient: bootstrap restart-before-nft short-circuit bypassed",
+    ),
+    (
+        "src/ups_orchestrator/cli.py",
+        "    if not password:\n"
+        '        LOG.error("monitor add: %s not set in the environment", _SECRET_ENV)\n'
+        "        return 2",
+        "    if not password:\n"
+        '        LOG.error("monitor add: %s not set in the environment", _SECRET_ENV)\n'
+        "        return 0",
+        "cli: monitor add missing-password exit-code (2 -> 0)",
+    ),
+    (
+        "src/ups_orchestrator/cli.py",
+        "    if not ok:\n"
+        '        LOG.error("monitor add: verification failed: %s", detail)\n'
+        "        return 5",
+        "    if not ok:\n"
+        '        LOG.error("monitor add: verification failed: %s", detail)\n'
+        "        return 0",
+        "cli: monitor add verify-fail exit-code (5 -> 0)",
+    ),
+    (
+        "src/ups_orchestrator/cli.py",
+        "    if conflicts and not args.force:",
+        "    if conflicts and args.force:",
+        "cli: monitor add dual-regime --force refusal predicate flipped",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "return bool(_NUT_NAME_RE.match(name))",
+        "return True",
+        "nutclient: valid_nut_name always-true (injection charset bypassed)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        '    if not valid_nut_name(ups):\n        return False, f"invalid UPS name: {ups!r}"',
+        '    if False:\n        return False, f"invalid UPS name: {ups!r}"',
+        "nutclient: verify ups-name guard bypassed",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        '    if not valid_ip(primary):\n        return False, f"invalid primary IP: {primary!r}"',
+        '    if False:\n        return False, f"invalid primary IP: {primary!r}"',
+        "nutclient: verify primary-ip guard bypassed",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    if timeout <= 0:",
+        "    if False:",
+        "nutclient: verify nonpositive-timeout guard bypassed",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        'f"timeout {timeout} upsc {ups}@{primary} ups.status"',
+        'f"upsc {ups}@{primary} ups.status"',
+        "nutclient: verify drops the timeout bound (WR-03 regression)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    if saddrs is not None:\n"
+        "        rc, out, err = apply_nft(nft_path, saddrs, run_nft, restart_bouncer)",
+        "    if saddrs is None:\n"
+        "        rc, out, err = apply_nft(nft_path, saddrs, run_nft, restart_bouncer)",
+        "nutclient: bootstrap --no-firewall skip inverted (CR-02 regression)",
+    ),
 ]
 
 
@@ -140,6 +272,7 @@ def main() -> int:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=_CHILD_ENV,
             )
             returncode = proc.returncode
         except subprocess.TimeoutExpired:

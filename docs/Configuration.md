@@ -26,6 +26,8 @@ Local forensic logs are controlled by:
 | `countdown_every_seconds` | `60` | On-battery countdown post cadence (`0` turns it off) |
 | `load_step` | on | Output-load collapse detection (a downstream device dying) |
 | `shutdown` | disabled | Central opt-in policy for orchestrator-managed shutdowns |
+| `nut_server` | localhost-only | Primary-side `upsd` exposure (see below) |
+| `monitored_machines` | `[]` | NUT secondaries enrolled via `monitor add` (see below) |
 | `upses` | — | Map of NUT device name → per-UPS settings |
 
 ## Shutdown policy
@@ -42,6 +44,75 @@ command runs unless you explicitly enable the policy and the relevant group.
 When battery and runtime readings are both available, both must be at or below
 their group thresholds. That prevents a high battery-percent threshold from
 shutting machines down while the UPS still reports healthy runtime.
+
+## NUT server (`nut_server`)
+
+Primary-side `upsd` exposure. It holds **no secrets** — the secondary NUT
+password never lives here.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `listen` | `["127.0.0.1", "::1"]` | Addresses `upsd` binds. Localhost-only by default |
+| `port` | `3493` | `upsd` TCP port |
+| `secondary_user` | `upsmon_secondary` | The `upsd.users` account secondaries authenticate as |
+
+`listen` is localhost-only on a fresh config so `upsd` is never silently exposed
+to the network. `monitor add` appends the primary's LAN address at enrollment
+time (and applies the matching `upsd.conf` LISTEN + a full `nut-server`
+restart — see [Deployment](Deployment.md)). A LISTEN change needs a **full
+restart**, not a reload.
+
+## Monitored machines (`monitored_machines`)
+
+A NUT secondary — a UPS-fed box that runs `upsmon` as `secondary`, monitors the
+primary's `upsd` over TCP, and shuts *itself* down. This is the native,
+credential-minimal graceful-shutdown path (see
+[SSH vs. native NUT](Shutdown-Mechanisms.md)). The array ships **empty**; entries
+are added by `monitor add`, not by hand.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `name` | — | Machine name (also the `ssh` alias if none given) |
+| `ssh` | `""` | `ssh_config` Host alias used to bootstrap the secondary |
+| `ups` | `""` | NUT UPS name the machine is powered by (e.g. `cyberpower`) |
+| `powervalue` | `1` | `1` = powered by this UPS (counts toward `MINSUPPLIES`); never `0` for a real feed |
+| `os` | `auto` | `auto` \| `arch` \| `ubuntu` \| `debian` — picks the install/config path |
+| `shutdown_cmd` | `/sbin/shutdown -h now` | Command the secondary runs on trigger |
+| `ip` | `""` | Resolved source IP added to the firewall `saddr` set |
+| `backup` | `{enabled: false, kind: "remote"}` | Optional SSH/serial **backup** below the native path |
+
+Worked example (kept out of `config.example.json` so the shipped file stays
+empty — a copied-into-production example would push a half-formed entry into the
+firewall set):
+
+```json
+"monitored_machines": [
+  { "name": "mt",    "ssh": "mt",    "ups": "cyberpower",  "powervalue": 1, "os": "arch",   "ip": "192.168.1.140", "backup": { "enabled": false, "kind": "serial" } },
+  { "name": "spark", "ssh": "spark", "ups": "cyberpower3", "powervalue": 1, "os": "ubuntu", "ip": "192.168.1.141", "backup": { "enabled": false, "kind": "remote" } }
+]
+```
+
+### The secondary NUT password
+
+The secondary's NUT credential lives in `/etc/ups-orchestrator.env` as
+`UPS_NUT_SECONDARY_PASSWORD`, **never** in `config.json`. It must match the
+`[upsmon_secondary]` entry in `/etc/nut/upsd.users` on the primary (see
+`deploy/nut/upsd.users.snippet`). `config.json` carries no secret.
+
+### Dual-regime guard (`monitor add --force`)
+
+A machine can be governed by **two** shutdown regimes at once: a native NUT
+secondary (fires below LB) *and* an enabled `shutdown_target` on the same UPS
+(fires on the shared external-group thresholds). That is a double-shutdown risk,
+so `monitor add` **refuses without `--force`** when it detects a machine that is
+both an enrolled secondary and an enabled `shutdown_target` on its UPS.
+`Config.load` logs the same conflict as a warning.
+
+!!! note "Per-machine below-LB thresholds are deferred"
+    A true per-machine *below-LB threshold* regime (each backup firing at its own
+    point beneath its UPS's LB) is a **deferred** follow-up. Per-target
+    `battery_below` / `runtime_below` are parsed for compatibility but **ignored
+    at runtime** — do not rely on them as an implemented per-machine regime.
 
 ## Load-step drop detection
 

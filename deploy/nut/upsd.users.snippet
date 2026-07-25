@@ -1,0 +1,17 @@
+# Merge into /etc/nut/upsd.users on the PRIMARY (eulerpi5) — the account the
+# secondaries authenticate as.
+#
+# NEVER commit the real password. `CHANGE_ME` below is a placeholder; the real
+# value is set from UPS_NUT_SECONDARY_PASSWORD (see deploy/ups-orchestrator.env.example)
+# and MUST match the password each secondary carries in its own upsmon.conf
+# MONITOR line. `monitor add` writes the real value for you.
+#
+# `upsmon secondary` grants read-only status access (no SET/FSD authority) — the
+# least privilege a netclient needs to poll ups.status and self-trigger.
+#
+# File mode: 0640 root:nut (nut-group members read; mirror deploy/nut-control-user.sh).
+# Fall back to 0600 root:root if the `nut` group is unavailable on this host.
+
+[upsmon_secondary]
+    password = CHANGE_ME
+    upsmon secondary

@@ -10,10 +10,43 @@ The host running the daemon is protected separately by NUT's own
 devices a UPS feeds.
 
 !!! note "SSH is the fallback, not the primary path"
-    Native NUT (upsmon secondary) is the primary graceful-shutdown mechanism; the
-    `remote` (SSH) / `serial` targets here are a configurable, **default-off**
-    backup. See [SSH vs. native NUT](Shutdown-Mechanisms.md) for the full analysis,
-    the failure modes, and when each path applies.
+    Native NUT (upsmon secondary, enrolled via `monitor add`) is the primary
+    graceful-shutdown mechanism; the `remote` (SSH) / `serial` targets here are a
+    configurable, **default-off** backup. See
+    [SSH vs. native NUT](Shutdown-Mechanisms.md) for the full analysis, the
+    failure modes, and when each path applies.
+
+### Where the backup sits relative to native LB
+
+The backup is a **last-resort deadman**, and where you place its threshold
+depends on whether the machine already has a native secondary:
+
+- **Machine WITH a native secondary** (e.g. mt/spark, enrolled via `monitor add`):
+  the backup must sit **strictly below** that UPS's LB point. It fires only if
+  native shutdown *didn't* while the primary was still alive — a deadman for
+  "FSD/`OB LB` didn't do its job." Placed above LB it would race the native path
+  and double-shut-down. (This is the same dual-regime conflict `monitor add`
+  refuses without `--force`.)
+- **Machine with NO native secondary** (e.g. an appliance that can't run
+  nut-client): keep an early/high threshold — the backup *is* its graceful path,
+  not a deadman, so there is nothing below LB to defer to.
+
+The backup does **not** cover the primary-dies-first (b2/c-OL) hole: it runs on
+the primary and dies with it. See
+[Deployment → Known limitation](Deployment.md).
+
+### Chosen defaults for the open questions
+
+These were live-environment unknowns resolved to defaults, not blockers:
+
+- **DEADTIME 30** on secondaries (the ≥3×POLLFREQ floor for POLLFREQ 5).
+- **Per-host nft scope** — each secondary's source IP added to the dedicated
+  `table inet ups_orchestrator` set, not a broad allow.
+- **Serial-cable presence unknown** → backup `kind` defaults to `remote`; switch
+  to `serial` where a console cable exists (network-independent, survives a dark
+  switch).
+- **`nut` group present** → snippet/secret files at `0640 root:nut`, with a
+  `0600 root:root` fallback where the group is unavailable.
 
 ## Kinds
 
