@@ -694,7 +694,12 @@ _UPSD_CONF_PATH = "/etc/nut/upsd.conf"
 _UPSD_USERS_PATH = "/etc/nut/upsd.users"
 _REMOTE_UPSMON_PATH = "/etc/nut/upsmon.conf"
 _REMOTE_NUT_CONF_PATH = "/etc/nut/nut.conf"
-_NFT_PATH = "/etc/nftables.d/ups-orchestrator.nft"
+# The accept is spliced into the operator's input base chain, which lives in the
+# fragment that /etc/nftables.conf includes — NOT a dedicated file of our own.
+# _NFT_PATH is the fragment we edit; _NFT_RELOAD_PATH is the top-level file handed
+# to `nft -f` so the whole ruleset (with the include) is reloaded atomically.
+_NFT_PATH = "/etc/nftables.d/main.nft"
+_NFT_RELOAD_PATH = "/etc/nftables.conf"
 
 
 def _monitor_run_nft(path: str) -> tuple[int, str, str]:  # pragma: no cover — live only
@@ -859,7 +864,9 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     # 2) firewall: rewrite the saddr set from survivors (unless --no-firewall)
     if not args.no_firewall:
         restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
-        rc, _out, err = nutclient.apply_nft(_NFT_PATH, saddrs, _monitor_run_nft, restart)
+        rc, _out, err = nutclient.apply_nft(
+            _NFT_PATH, saddrs, _monitor_run_nft, restart, reload_path=_NFT_RELOAD_PATH
+        )
         if rc != 0:
             LOG.error("monitor remove: firewall reload failed: %s", err)
             return 4
@@ -1004,6 +1011,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             run_nft=_monitor_run_nft,
             restart_bouncer=restart,
             is_root=is_root,
+            nft_reload_path=_NFT_RELOAD_PATH,
         )
     except OSError as exc:
         # A boundary failure (read/write/mkdir on /etc) must surface as a clean

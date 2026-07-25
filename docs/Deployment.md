@@ -82,10 +82,19 @@ What it does, in order:
    `LISTEN` — `upsd` only binds its sockets at start, so a reload leaves it on
    localhost and the secondary never connects. This is why the flow restarts
    rather than reloads.
-2. **Firewall.** Add the secondary's source IP to the dedicated
-   `table inet ups_orchestrator` nftables set (never the operator's own
-   `filter`/`input` chain), write `/etc/nftables.conf`, and `nft -f` it — then
-   **restart the crowdsec bouncer** (see the warning below).
+2. **Firewall.** Splice a marked, reversible
+   `tcp dport 3493 ip saddr { … } accept` rule **into the operator's own input
+   base chain** (the one carrying `hook input` / `policy drop`, in
+   `/etc/nftables.d/main.nft`), reload the top-level `/etc/nftables.conf`, then
+   **restart the crowdsec bouncer** (see the warning below). The rule *must* live
+   in that base chain: nftables evaluates every base chain on the `input` hook,
+   and an `accept` in a self-contained `policy accept` table at negative priority
+   is terminal only for its own chain — the packet still reaches the `policy drop`
+   base chain and is dropped, so the port never opens (the symptom is a `upsc`
+   *timeout*, not a refusal). The marked block makes the edit idempotent and
+   `monitor remove` reverses it cleanly. `/etc/nftables.d/main.nft` must already
+   exist and contain the input base chain — enrollment errors clearly if it does
+   not, rather than writing a rule that lands nowhere.
 3. **Remote install/config.** Over the `ssh` alias: install the NUT client for
    the box's distro (`nut` on Arch, `nut-client` on Ubuntu/Debian), write a
    secondary `upsmon.conf` (`powervalue 1`, `MINSUPPLIES 1`, `DEADTIME 30`, and

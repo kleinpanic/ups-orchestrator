@@ -144,9 +144,9 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/nutclient.py",
-        '    if not saddrs:\n        return ""',
-        '    if not saddrs:\n        return render_nft_block(["0.0.0.0"], port)',
-        "nutclient: empty-saddrs drops table",
+        '    if not saddrs:\n        return ""\n    members = ", ".join(saddrs)',
+        '    if not saddrs:\n        saddrs = ["0.0.0.0"]\n    members = ", ".join(saddrs)',
+        "nutclient: empty-saddrs drops accept rule",
     ),
     (
         "src/ups_orchestrator/nutclient.py",
@@ -242,11 +242,15 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/nutclient.py",
-        "    if saddrs is not None:\n"
-        "        rc, out, err = apply_nft(nft_path, saddrs, run_nft, restart_bouncer)",
-        "    if saddrs is None:\n"
-        "        rc, out, err = apply_nft(nft_path, saddrs, run_nft, restart_bouncer)",
+        "    if saddrs is not None:\n        rc, out, err = apply_nft(",
+        "    if saddrs is None:\n        rc, out, err = apply_nft(",
         "nutclient: bootstrap --no-firewall skip inverted (CR-02 regression)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    hook = _NFT_INPUT_HOOK_RE.search(stripped)\n    if hook is None:",
+        "    hook = _NFT_INPUT_HOOK_RE.search(stripped)\n    if hook is not None:",
+        "nutclient: upsert nft requires an input-hook chain (LIVE BUG #1 splice target)",
     ),
 ]
 

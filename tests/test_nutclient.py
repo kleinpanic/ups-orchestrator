@@ -11,6 +11,27 @@ import pytest
 
 from ups_orchestrator import nutclient
 
+# A realistic policy-drop input base chain, mirroring the live box: the operator
+# owns the `input` hook at priority 0 with `policy drop`, and a ct
+# established/related fast-path near the top. The upsd accept must land INSIDE
+# this chain (after the ct accept) — a self-contained negative-priority table
+# would be traversed but its accept could not override this chain's drop.
+POLICY_DROP_RULESET = """\
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        iif "lo" accept
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+"""
+
 
 class FakeSSH:
     """Records (alias, command, stdin) calls; returns queued canned tuples.
@@ -192,52 +213,100 @@ def test_upsmon_rejects_quote_in_shutdown_cmd():
 # --- render_upsd_* snippets (pure) --------------------------------------------
 
 
-# --- render_nft_block / upsert_nft_block (pure) -------------------------------
+# --- render_nft_accept_rule / upsert_nft_input_chain (pure) -------------------
+#
+# LIVE BUG #1 regression: the accept must be spliced INTO the operator's
+# policy-drop input base chain (where nftables honours it), NOT into a
+# self-contained negative-priority table whose accept the drop chain overrides.
 
 
-def test_nft_block_uses_dedicated_table():
-    block = nutclient.render_nft_block(["192.168.1.40", "192.168.1.50"])
-    assert "table inet ups_orchestrator" in block
-    assert "type filter hook input priority filter - 5; policy accept;" in block
-    assert "tcp dport 3493 ip saddr { 192.168.1.40, 192.168.1.50 } accept" in block
-    # Never an edit to the user's chain. The forbidden top-level rule form is
-    # constructed here so the module source never contains the literal.
-    assert ("add " + "rule inet filter input") not in block
+def test_accept_rule_is_a_marked_chain_line_not_a_table():
+    rule = nutclient.render_nft_accept_rule(["192.168.1.40", "192.168.1.50"])
+    assert "tcp dport 3493 ip saddr { 192.168.1.40, 192.168.1.50 } accept" in rule
+    assert "# BEGIN UPS-ORCHESTRATOR MANAGED" in rule
+    # No dedicated table / hooked chain of our own — the old broken form.
+    assert "table inet ups_orchestrator" not in rule
+    assert "hook input" not in rule
 
 
-def test_nft_block_empty_saddrs_is_empty():
-    assert nutclient.render_nft_block([]) == ""
+def test_accept_rule_empty_saddrs_is_empty():
+    assert nutclient.render_nft_accept_rule([]) == ""
 
 
-def test_upsert_inserts_once():
-    text, changed = nutclient.upsert_nft_block("flush ruleset\n", ["192.168.1.40"])
+def test_upsert_lands_inside_policy_drop_chain_after_ct_accept():
+    """The accept is honoured only if it sits in the chain owning the input hook.
+
+    Pins that the marked accept lands (a) inside the `policy drop` base chain's
+    braces, (b) after its ct established/related accept, and (c) before the chain
+    closes — i.e. in the evaluation path where a policy-drop firewall accepts it.
+    """
+    text, changed = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.114"])
     assert changed is True
-    assert "table inet ups_orchestrator" in text
-    assert text.startswith("flush ruleset\n")
+    rule_line = "tcp dport 3493 ip saddr { 192.168.1.114 } accept"
+    assert rule_line in text
+
+    # It falls between this chain's ct-accept and the chain's closing brace, i.e.
+    # inside the policy-drop chain's evaluation path.
+    chain_open = text.index("type filter hook input priority filter; policy drop;")
+    ct_pos = text.index("ct state established,related accept", chain_open)
+    rule_pos = text.index(rule_line)
+    chain_close = text.index("chain forward")  # next chain marks our chain's end
+    assert ct_pos < rule_pos < chain_close
+    # And it is indented as a chain rule (inside the braces), not column 0.
+    line = next(ln for ln in text.splitlines() if rule_line in ln)
+    assert line.startswith("        ")
+
+
+def test_upsert_no_input_hook_chain_raises():
+    # A ruleset with no `hook input` base chain has nowhere the accept would be
+    # honoured — refuse rather than write a silently-useless rule.
+    with pytest.raises(ValueError, match="hook input"):
+        nutclient.upsert_nft_input_chain("table inet filter {\n}\n", ["192.168.1.40"])
 
 
 def test_upsert_is_idempotent():
-    once, _ = nutclient.upsert_nft_block("base\n", ["192.168.1.40"])
-    twice, changed = nutclient.upsert_nft_block(once, ["192.168.1.40"])
+    once, _ = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.40"])
+    twice, changed = nutclient.upsert_nft_input_chain(once, ["192.168.1.40"])
     assert changed is False
     assert twice == once
 
 
 def test_upsert_rewrites_set_on_change():
-    once, _ = nutclient.upsert_nft_block("base\n", ["192.168.1.40"])
-    twice, changed = nutclient.upsert_nft_block(once, ["192.168.1.40", "192.168.1.50"])
+    once, _ = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.40"])
+    twice, changed = nutclient.upsert_nft_input_chain(once, ["192.168.1.40", "192.168.1.50"])
     assert changed is True
     assert "192.168.1.50" in twice
-    # Only one MANAGED block — the old one was replaced, not appended.
+    # Only one MANAGED block — the old rule was replaced in place, not appended.
     assert twice.count("# BEGIN UPS-ORCHESTRATOR MANAGED") == 1
 
 
-def test_upsert_empty_saddrs_drops_block():
-    once, _ = nutclient.upsert_nft_block("base\n", ["192.168.1.40"])
-    dropped, changed = nutclient.upsert_nft_block(once, [])
+def test_upsert_empty_saddrs_drops_rule():
+    once, _ = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.40"])
+    dropped, changed = nutclient.upsert_nft_input_chain(once, [])
     assert changed is True
-    assert "table inet ups_orchestrator" not in dropped
+    assert "192.168.1.40" not in dropped
     assert "# BEGIN UPS-ORCHESTRATOR MANAGED" not in dropped
+    # Stripping the marked rule restores the original ruleset byte-for-byte.
+    assert dropped == POLICY_DROP_RULESET
+
+
+def test_upsert_falls_back_to_after_brace_without_ct_accept():
+    # A chain with no ct established/related line: the accept goes right after the
+    # chain's opening brace (still inside the policy-drop chain).
+    ruleset = (
+        "table inet filter {\n"
+        "    chain input {\n"
+        "        type filter hook input priority filter; policy drop;\n"
+        '        iif "lo" accept\n'
+        "    }\n"
+        "}\n"
+    )
+    text, changed = nutclient.upsert_nft_input_chain(ruleset, ["192.168.1.40"])
+    assert changed is True
+    hook_pos = text.index("hook input")
+    rule_pos = text.index("tcp dport 3493")
+    lo_pos = text.index('iif "lo" accept')
+    assert hook_pos < rule_pos < lo_pos
 
 
 # --- remote_config_guard (pure) ----------------------------------------------
@@ -466,8 +535,8 @@ def test_upsd_users_overwrites_change_me_placeholder():
 
 
 def test_apply_nft_restarts_bouncer_after_reload(tmp_path):
-    conf = tmp_path / "nftables.conf"
-    conf.write_text("flush ruleset\n")
+    conf = tmp_path / "main.nft"
+    conf.write_text(POLICY_DROP_RULESET)
     order: list[str] = []
 
     def run_nft(path: str) -> tuple[int, str, str]:
@@ -480,12 +549,32 @@ def test_apply_nft_restarts_bouncer_after_reload(tmp_path):
     rc, _out, _err = nutclient.apply_nft(str(conf), ["192.168.1.40"], run_nft, restart_bouncer)
     assert rc == 0
     assert order == [f"nft:{conf}", "restart"]
-    assert "table inet ups_orchestrator" in conf.read_text()
+    # The accept landed inside the policy-drop chain, not a table of our own.
+    written = conf.read_text()
+    assert "tcp dport 3493 ip saddr { 192.168.1.40 } accept" in written
+    assert "table inet ups_orchestrator" not in written
+
+
+def test_apply_nft_reload_path_reloads_toplevel_not_fragment(tmp_path):
+    # The base chain lives in an included fragment; `nft -f` must reload the
+    # top-level file that pulls it in, so the whole ruleset is reloaded.
+    conf = tmp_path / "main.nft"
+    conf.write_text(POLICY_DROP_RULESET)
+    reloaded: list[str] = []
+    rc, _out, _err = nutclient.apply_nft(
+        str(conf),
+        ["192.168.1.40"],
+        lambda p: (reloaded.append(p), (0, "", ""))[1],
+        lambda: None,
+        reload_path="/etc/nftables.conf",
+    )
+    assert rc == 0
+    assert reloaded == ["/etc/nftables.conf"]
 
 
 def test_apply_nft_no_change_skips_reload(tmp_path):
-    conf = tmp_path / "nftables.conf"
-    first, _ = nutclient.upsert_nft_block("base\n", ["192.168.1.40"])
+    conf = tmp_path / "main.nft"
+    first, _ = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.40"])
     conf.write_text(first)
     called: list[str] = []
 
@@ -501,25 +590,37 @@ def test_apply_nft_no_change_skips_reload(tmp_path):
     assert called == []
 
 
-def test_apply_nft_missing_file_and_parent_treated_as_empty(tmp_path):
-    # CR-01: on first enrollment the nft include file (and its parent dir) do not
-    # exist yet — nothing else creates them. apply_nft must create the parent and
-    # write a fresh table instead of raising FileNotFoundError.
-    conf = tmp_path / "nftables.d" / "ups-orchestrator.nft"  # parent absent
-    order: list[str] = []
-
-    def run_nft(path: str) -> tuple[int, str, str]:
-        order.append("nft")
-        return 0, "", ""
-
-    rc, _out, _err = nutclient.apply_nft(
-        str(conf), ["192.168.1.40"], run_nft, lambda: order.append("restart")
+def test_apply_nft_missing_base_chain_file_is_error(tmp_path):
+    # LIVE BUG #1: the base-chain file is a hard prerequisite — the accept must
+    # land in the operator's existing input chain, so a missing file is a clear
+    # rc-2 error, NOT a silent "write a fresh useless table" as the old code did.
+    conf = tmp_path / "nftables.d" / "main.nft"  # does not exist
+    called: list[str] = []
+    rc, _out, err = nutclient.apply_nft(
+        str(conf),
+        ["192.168.1.40"],
+        lambda p: (called.append("nft"), (0, "", ""))[1],
+        lambda: called.append("restart"),
     )
-    assert rc == 0
-    assert order == ["nft", "restart"]
-    assert conf.exists()
-    assert "table inet ups_orchestrator" in conf.read_text()
-    assert "192.168.1.40" in conf.read_text()
+    assert rc == 2
+    assert called == []  # never reloaded or restarted
+    assert "not found" in err
+
+
+def test_apply_nft_no_input_hook_chain_is_error(tmp_path):
+    # A file present but with no `hook input` base chain: rc 2, no reload.
+    conf = tmp_path / "main.nft"
+    conf.write_text("table inet filter {\n}\n")
+    called: list[str] = []
+    rc, _out, err = nutclient.apply_nft(
+        str(conf),
+        ["192.168.1.40"],
+        lambda p: (called.append("nft"), (0, "", ""))[1],
+        lambda: called.append("restart"),
+    )
+    assert rc == 2
+    assert called == []
+    assert "hook input" in err
 
 
 # --- bootstrap_primary (impure orchestration) --------------------------------
@@ -557,7 +658,7 @@ def _bootstrap_kwargs(tmp_path, **overrides):
     upsd_users = tmp_path / "upsd.users"
     upsd_users.write_text("")
     nft = tmp_path / "nftables.conf"
-    nft.write_text("flush ruleset\n")
+    nft.write_text(POLICY_DROP_RULESET)
     kwargs = {
         "lan_ip": "192.168.1.125",
         "port": 3493,

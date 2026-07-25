@@ -9,9 +9,14 @@ Two research corrections are load-bearing and enforced here:
 
 * A secondary's ``upsmon.conf`` OMITS ``POWERDOWNFLAG`` entirely — powering off
   the UPS is primary-only. A netclient must never disarm a UPS it does not own.
-* The firewall rule lives in a dedicated ``table inet ups_orchestrator`` with
-  its own hooked input chain, never an edit to the user's ``filter``/``input``
-  chain, so a reload coexists with crowdsec by construction.
+* The firewall accept is spliced into the operator's own input base chain — the
+  one that owns the ``input`` hook and (typically) carries ``policy drop`` — via
+  a marked, idempotent, reversible rule. A self-contained table at negative
+  priority does NOT work here: nftables evaluates every base chain on the hook,
+  and an accept in a ``policy accept`` −5 chain is terminal only for that chain,
+  so the packet still reaches the ``policy drop`` priority-0 chain and is dropped
+  (the live enrollment symptom: ``upsc`` timed out, the port never opened). The
+  rule stays crowdsec-safe — the bouncer is restarted after every ``nft -f``.
 """
 
 from __future__ import annotations
@@ -252,63 +257,122 @@ def upsert_upsd_users(text: str, user: str, password: str) -> tuple[str, bool]:
     return new_text, new_text != text
 
 
-# --- dedicated-table nftables render / upsert (pure) --------------------------
+# --- base-input-chain nftables render / upsert (pure) -------------------------
+#
+# LIVE BUG (device-death of the negative-priority dedicated table): the original
+# design placed the accept in its OWN ``table inet ups_orchestrator`` base chain
+# at ``priority filter - 5; policy accept``. nftables evaluates EVERY base chain
+# registered on the ``input`` hook in ascending priority order; an ``accept``
+# verdict is terminal only for the chain that issues it — it does NOT stop the
+# packet from also traversing the operator's ``priority 0; policy drop`` base
+# chain, whose ``policy drop`` then drops the packet. So the port never opened
+# on a policy-drop firewall (upsc TIMED OUT rather than being refused).
+#
+# The accept must therefore be inserted INTO the base chain that owns the
+# ``input`` hook — the one carrying ``policy drop`` — so the drop chain itself
+# accepts the packet. We render a marked, idempotent, reversible rule and splice
+# it in just after that chain's ct established/related accept.
 
 _NFT_BEGIN = "# BEGIN UPS-ORCHESTRATOR MANAGED"
 _NFT_END = "# END UPS-ORCHESTRATOR MANAGED"
 
+# Pins the real input base chain by its ``hook input`` declaration (the chain
+# name is free-form: input/INPUT/inbound). We only splice into a chain that
+# actually owns the input hook, so the accept lands where a policy-drop chain
+# evaluates it.
+_NFT_INPUT_HOOK_RE = re.compile(r"^([ \t]*)type\s+filter\s+hook\s+input\b", re.MULTILINE)
+# A ct established/related accept inside that chain — our rule goes right after
+# it so the conntrack fast-path stays first and our narrow accept precedes any
+# later drop/reject in the same chain.
+_NFT_CT_ACCEPT_RE = re.compile(
+    r"^([ \t]*)ct\s+state\s+.*\b(?:established|related)\b.*accept.*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 
-def render_nft_block(saddrs: Sequence[str], port: int = 3493) -> str:
-    """Render a self-contained ``table inet ups_orchestrator`` marker block. PURE.
 
-    The table owns its own hooked input chain at ``priority filter - 5`` with
-    ``policy accept``, so it coexists with crowdsec by construction and never
-    edits the user's chains. Empty ``saddrs`` → empty string (the table is
-    dropped entirely rather than left matching nothing).
+def render_nft_accept_rule(
+    saddrs: Sequence[str], port: int = 3493, indent: str = "        "
+) -> str:
+    """Render the marked accept rule to splice into the input base chain. PURE.
+
+    Returns a ``# BEGIN/END`` marker block wrapping a single
+    ``tcp dport <port> ip saddr { … } accept`` line at ``indent``. Empty
+    ``saddrs`` → empty string (the rule is removed rather than left matching an
+    empty set, which ``nft -f`` rejects).
     """
     if not saddrs:
         return ""
     members = ", ".join(saddrs)
     return (
-        f"{_NFT_BEGIN}\n"
-        "table inet ups_orchestrator {\n"
-        "    chain input {\n"
-        "        type filter hook input priority filter - 5; policy accept;\n"
-        f'        tcp dport {port} ip saddr {{ {members} }} accept comment "upsd NUT secondaries"\n'
-        "    }\n"
-        "}\n"
-        f"{_NFT_END}\n"
+        f"{indent}{_NFT_BEGIN}\n"
+        f"{indent}tcp dport {port} ip saddr {{ {members} }} accept "
+        f'comment "upsd NUT secondaries"\n'
+        f"{indent}{_NFT_END}\n"
     )
 
 
 def _strip_nft_block(text: str) -> str:
-    """Remove any existing MANAGED block (and its trailing newline) from ``text``."""
+    """Remove any existing MANAGED block (and its leading indent) from ``text``.
+
+    Strips from the start of the ``# BEGIN`` line — including its own indentation
+    — through the newline after ``# END``, so re-inserting is a byte-clean replace
+    that leaves no dangling blank-indented line behind.
+    """
     start = text.find(_NFT_BEGIN)
     if start == -1:
         return text
+    line_start = text.rfind("\n", 0, start)
+    line_start = 0 if line_start == -1 else line_start + 1
     end = text.find(_NFT_END, start)
     if end == -1:
         return text
     end = text.find("\n", end)
     end = len(text) if end == -1 else end + 1
-    return text[:start] + text[end:]
+    return text[:line_start] + text[end:]
 
 
-def upsert_nft_block(text: str, saddrs: Sequence[str], port: int = 3493) -> tuple[str, bool]:
-    """Insert/replace/drop the MANAGED nft block. PURE.
+def upsert_nft_input_chain(text: str, saddrs: Sequence[str], port: int = 3493) -> tuple[str, bool]:
+    """Insert/replace/drop the MANAGED accept inside the input base chain. PURE.
 
-    Returns ``(new_text, changed)`` where ``changed`` is ``False`` only when the
-    result is byte-identical to ``text`` (idempotent). Empty ``saddrs`` removes
-    the block; a present block is replaced in place; an absent block is appended.
+    Splices the marked accept into the input base chain that owns the ``input``
+    hook (typically ``policy drop``) — the ONLY place an accept is honoured
+    against a policy-drop firewall (see the module note above). The rule is placed
+    right after the chain's ct established/related accept when present, else
+    immediately after the chain's opening brace, so it sits near the top and
+    precedes any later drop/reject in the same chain.
+
+    Returns ``(new_text, changed)``; ``changed`` is ``False`` only when the result
+    is byte-identical (idempotent). Empty ``saddrs`` removes the rule. Raises
+    :class:`ValueError` when no ``hook input`` base chain exists — refusing to
+    write a rule that would silently land nowhere useful.
     """
     stripped = _strip_nft_block(text)
-    block = render_nft_block(saddrs, port)
-    if not block:
-        new_text = stripped
-    elif stripped == "" or stripped.endswith("\n"):
-        new_text = stripped + block
+    if not saddrs:
+        return stripped, stripped != text
+
+    hook = _NFT_INPUT_HOOK_RE.search(stripped)
+    if hook is None:
+        raise ValueError(
+            "no `type filter hook input` base chain found — cannot insert the "
+            "upsd accept where a policy-drop chain will honour it"
+        )
+
+    # Prefer to sit right after the ct established/related accept in the same
+    # chain (keeps the conntrack fast-path first). Fall back to just after the
+    # chain's opening brace.
+    ct = _NFT_CT_ACCEPT_RE.search(stripped, hook.end())
+    if ct is not None:
+        insert_at = ct.end() + 1  # past the ct line's trailing newline
+        indent = ct.group(1) or "        "
     else:
-        new_text = stripped + "\n" + block
+        # No ct fast-path: sit right after the `type … hook input …` line so the
+        # accept is the first concrete rule in the chain. Reuse that line's
+        # indentation (captured group 1).
+        indent = hook.group(1) or "        "
+        nl = stripped.find("\n", hook.end())
+        insert_at = nl + 1 if nl != -1 else len(stripped)
+    rule = render_nft_accept_rule(saddrs, port, indent=indent)
+    new_text = stripped[:insert_at] + rule + stripped[insert_at:]
     return new_text, new_text != text
 
 
@@ -441,29 +505,39 @@ def apply_nft(
     saddrs: Sequence[str],
     run_nft: RunNft,
     restart_bouncer: Callable[[], None],
+    reload_path: str | None = None,
 ) -> tuple[int, str, str]:
-    """Upsert the nft block, reload, then restart the bouncer. IMPURE.
+    """Splice the accept into the input base chain, reload, restart the bouncer.
+
+    IMPURE. ``path`` is the file that CONTAINS the operator's input base chain
+    (e.g. ``/etc/nftables.d/main.nft``); the accept is inserted into that chain
+    so a ``policy drop`` firewall honours it. This is a hard prerequisite — unlike
+    the old dedicated-table file, this file is NOT created on demand: a missing
+    file or a file with no ``hook input`` base chain is a clear error (return code
+    2) rather than a silently-useless write.
 
     Reloading flushes crowdsec's tables, so ``restart_bouncer`` MUST run after
     every successful reload — the bouncer does not auto-recreate them. When the
     upsert makes no change, the reload and restart are skipped entirely.
 
-    On first enrollment the nft include file does not exist yet — nothing else
-    creates it. A missing file (or missing parent dir) is treated as empty so
-    the first ``monitor add`` writes a fresh table instead of raising
-    ``FileNotFoundError`` after upsd was already reconfigured and restarted.
+    ``reload_path`` is the file handed to ``nft -f`` (default: ``path``). Where
+    the base chain lives in an ``include``d fragment, the operator reloads the
+    top-level ``/etc/nftables.conf`` that pulls it in; pass it here so the full
+    ruleset — not just the fragment — is reloaded.
     """
     conf = Path(path)
-    conf.parent.mkdir(parents=True, exist_ok=True)
     try:
         text = conf.read_text()
     except FileNotFoundError:
-        text = ""
-    new_text, changed = upsert_nft_block(text, saddrs)
+        return 2, "", f"{path}: nftables base-chain file not found — cannot open the upsd port"
+    try:
+        new_text, changed = upsert_nft_input_chain(text, saddrs)
+    except ValueError as exc:
+        return 2, "", str(exc)
     if not changed:
         return 0, "no change", ""
     conf.write_text(new_text)
-    rc, out, err = run_nft(path)
+    rc, out, err = run_nft(reload_path or path)
     if rc != 0:
         return rc, out, err
     restart_bouncer()
@@ -497,6 +571,7 @@ def bootstrap_primary(
     restart_bouncer: Callable[[], None],
     is_root: bool,
     dry_run: bool = False,
+    nft_reload_path: str | None = None,
 ) -> tuple[int, list[str]]:
     """Bootstrap the primary: expose upsd on the LAN and authorize the secondary.
 
@@ -565,7 +640,9 @@ def bootstrap_primary(
             return 4, log
 
     if saddrs is not None:
-        rc, out, err = apply_nft(nft_path, saddrs, run_nft, restart_bouncer)
+        rc, out, err = apply_nft(
+            nft_path, saddrs, run_nft, restart_bouncer, reload_path=nft_reload_path
+        )
         if rc != 0:
             log.append(f"nft apply failed: {_redact(err, password)}")
             return 4, log
