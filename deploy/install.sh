@@ -19,7 +19,22 @@ echo ">> system venv install"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q --force-reinstall --no-deps "$REPO"
+# /usr/local/bin is on every user's PATH incl. the `nut` user that runs the
+# upssched dispatcher during an outage — it cannot enter the 0700 repo home, so
+# the binary must live on a system path, not ~/.local/bin.
 ln -sf "$VENV/bin/ups-orchestrator" /usr/local/bin/ups-orchestrator
+
+echo ">> granting '$RUN_USER' perms so future redeploys need no sudo"
+# Own the venv as the install user (group nut so the `nut` user keeps rx), and
+# add the user to nut. After this, `make deploy-code` redeploys without root.
+chown -R "$RUN_USER":nut /opt/ups-orchestrator
+chmod -R g+rX /opt/ups-orchestrator
+id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx nut || { usermod -aG nut "$RUN_USER"; echo "   added $RUN_USER to nut (re-login for it to take effect)"; }
+# Convenience symlink on the user's own PATH (does not replace the system one).
+RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+[ -n "$RUN_HOME" ] && install -d -o "$RUN_USER" -g "$RUN_USER" "$RUN_HOME/.local/bin" \
+  && ln -sf "$VENV/bin/ups-orchestrator" "$RUN_HOME/.local/bin/ups-orchestrator" \
+  && chown -h "$RUN_USER":"$RUN_USER" "$RUN_HOME/.local/bin/ups-orchestrator"
 
 echo ">> config / state / dispatcher"
 install -d -o root -g nut -m 0750 /etc/ups-orchestrator
@@ -47,6 +62,9 @@ $RUN_USER ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown, /sbin/powerof
 SUDOERS
 chmod 0440 /etc/sudoers.d/ups-orchestrator
 visudo -cf /etc/sudoers.d/ups-orchestrator >/dev/null && echo "   sudoers OK" || { echo "   sudoers INVALID — removing"; rm -f /etc/sudoers.d/ups-orchestrator; }
+
+echo ">> NUT control user (beeper + battery test; least privilege)"
+"$REPO/deploy/nut-control-user.sh" || echo "   control-user setup skipped (NUT not ready?)"
 
 echo ">> NUT: appending UPS sections to ups.conf (idempotent; edit the snippet's"
 echo "   vendorid/productid first — see deploy/nut/ups.conf.snippet)"
