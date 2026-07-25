@@ -12,6 +12,8 @@
   <img src="https://img.shields.io/badge/runtime%20deps-0-3fb950" alt="Zero runtime deps">
   <img src="https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white" alt="Ruff">
   <img src="https://img.shields.io/badge/types-mypy%20strict-2a6db2" alt="mypy strict">
+  <img src="https://img.shields.io/badge/coverage-87%25-3fb950" alt="Coverage">
+  <img src="https://img.shields.io/badge/mutation-100%25-3fb950" alt="Mutation score">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
 </p>
 
@@ -25,7 +27,38 @@ central opt-in policy says the UPS is both on battery and close to empty.
 Works with any NUT-supported UPS and monitors **any number** of them. Nothing is
 hard-coded to a model.
 
-📖 **Full docs: the [project wiki](https://github.com/kleinpanic/ups-orchestrator/wiki).**
+📖 **Full docs: the [project wiki](https://github.com/kleinpanic/ups-orchestrator/wiki) · [GitHub Pages site](https://kleinpanic.github.io/ups-orchestrator/).**
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph HW["Power"]
+    UPS[("UPS × N<br/>(USB/serial)")]
+  end
+  subgraph NUT["Network UPS Tools"]
+    DRV[driver] --> UPSD[upsd]
+    UPSD --> UPSMON[upsmon]
+    UPSMON -->|NOTIFYCMD| SCHED[upssched]
+  end
+  subgraph ORCH["ups-orchestrator"]
+    WATCH[["watch loop<br/>poll + policy"]]
+    EVENTS[[event handlers]]
+    REC[[recorder]]
+    CTL[[control / selftest]]
+  end
+  UPS --> DRV
+  UPSD -->|upsc reads| WATCH
+  UPSD -->|upsc reads| REC
+  SCHED -->|event dispatch| EVENTS
+  CTL -->|upscmd| UPSD
+  WATCH --> EVENTS
+  EVENTS -->|embeds| DISCORD["Discord webhook"]
+  CTL -->|embeds| DISCORD
+  EVENTS -->|gated policy| SHUT["shutdown targets<br/>serial · SSH · local"]
+  REC --> STORE[("samples · state · JSONL logs<br/>/var/lib")]
+  WATCH --> STORE
+```
 
 ## Design
 
@@ -153,6 +186,8 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
   "discord_username": "UPS Orchestrator",
   "poll_seconds": 30,            // how often the watch loop checks policy
   "countdown_every_seconds": 60, // on-battery countdown post cadence (0 = off)
+  "onbatt_notify_grace_seconds": 20, // a transfer must persist this long before it
+                                 // pages (suppresses grid blips + self-test transfers)
   "shutdown": {
     "enabled": false,            // master switch for orchestrator shutdowns
     "require_power_outage": true,
@@ -221,10 +256,21 @@ ups-orchestrator report            # send the load report webhook now
 ups-orchestrator power-dashboard --out d.png   # render live+history power image
 ups-orchestrator power-dashboard --hours 168 --post   # post the image to Discord
 ups-orchestrator notify-test       # send a test embed and print delivery result
+ups-orchestrator baseline          # per-UPS draw stats (median/p95/mean) from recorder history
+ups-orchestrator selftest          # run a NUT battery self-test per UPS, alert on failure
+ups-orchestrator control beeper-mute   # safe instant cmd across all UPSes (also posts to Discord)
+ups-orchestrator webui             # local web dashboard (stdlib http.server; localhost only)
 ups-orchestrator audit             # summarize boot, UPS/NUT, local logs, state, and shutdown evidence
 ups-orchestrator logs events       # tail local UPS event/decision JSONL
 ups-orchestrator logs notifications
 ```
+
+`control` and `selftest` run NUT instant commands, so they need admin creds in the
+environment (`UPS_NUT_ADMIN_USER` / `UPS_NUT_ADMIN_PASSWORD`) — never the config.
+`control` actions: `beeper-mute` / `beeper-disable` / `beeper-enable`,
+`test-quick` / `test-deep` / `test-stop`. Power-cutting commands are intentionally
+not exposed here. These consumer CyberPower units have **no** software display/LCD
+control (no instant command, no settable variable), so displays can't be toggled.
 
 **Power dashboard.** `power-dashboard` renders a PNG — a card per UPS (status,
 battery, load, runtime) plus a draw-history line chart from the recorder samples

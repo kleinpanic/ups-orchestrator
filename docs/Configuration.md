@@ -69,7 +69,7 @@ so pair it with a reachability check on the device.
 
 Each key under `upses` is a NUT device name (whatever you called it in
 `ups.conf`). A UPS has a `label` (used in the embeds) and a list of
-`shutdown_targets`; see [Shutdown Targets](Shutdown-Targets).
+`shutdown_targets`; see [Shutdown Targets](Shutdown-Targets.md).
 
 ```json
 {

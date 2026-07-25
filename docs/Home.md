@@ -11,10 +11,10 @@ that ships with NUT) and runs well on a Raspberry Pi.
 
 ## Where to go next
 
-- **[Configuration](Configuration)**: the `config.json` reference.
-- **[Shutdown Targets](Shutdown-Targets)**: serial vs SSH vs local, policy gates, ordering.
-- **[Deployment](Deployment)**: system install, the NUT wiring, the watch service.
-- **[Architecture](Architecture)**: how the event path and poll loop fit together.
+- **[Configuration](Configuration.md)**: the `config.json` reference.
+- **[Shutdown Targets](Shutdown-Targets.md)**: serial vs SSH vs local, policy gates, ordering.
+- **[Deployment](Deployment.md)**: system install, the NUT wiring, the watch service.
+- **[Architecture](Architecture.md)**: how the event path and poll loop fit together.
 
 ## Commands
 
