@@ -73,6 +73,11 @@ def test_http_endpoints_round_trip(monkeypatch, tmp_path) -> None:
             assert data["upses"][0]["status"] == "OL"
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
             assert b"UPS Power" in r.read()
+        # /api/history with an hours query — exercises the clamp/parse branch.
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/history?hours=12", timeout=5
+        ) as r:
+            assert "series" in json.loads(r.read())
         req = urllib.request.Request(f"http://127.0.0.1:{port}/nope")
         try:
             urllib.request.urlopen(req, timeout=5)

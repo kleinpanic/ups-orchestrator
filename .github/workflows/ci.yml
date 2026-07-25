@@ -38,7 +38,7 @@ jobs:
         run: python -m pip install -e ".[dashboard]"
 
       - name: Pytest (with branch coverage gate)
-        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=80
+        run: pytest -q --cov --cov-report=term-missing --cov-fail-under=85
 
   secrets:
     runs-on: ubuntu-latest

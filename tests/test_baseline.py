@@ -41,6 +41,7 @@ def test_compute_baselines_over_window(tmp_path) -> None:
     assert s1.samples == 10  # the throwaway lead line is dropped; 10 real samples remain
     assert s1.lo == 100 and s1.hi == 190
     assert s1.median == 145  # midpoint of 100..190
+    assert s1.mean == 145  # round(sum(100..190)/10) — pins mean against a */× mutant
     assert stats["ups2"].samples == 0  # no data → empty, not a crash
 
 

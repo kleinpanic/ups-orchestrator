@@ -64,6 +64,12 @@ def test_run_selftest_skips_on_battery() -> None:
         called["start"] += 1
         return 0, "", ""
 
+    # Advancing clock + short timeout: a correct guard skips before the poll loop,
+    # so the clock is never read. If the guard is ever broken (e.g. the on-battery
+    # check flipped or->and), the loop it wrongly enters hits the deadline within a
+    # couple of ticks and the assertions below fail *fast* — so that mutant dies by
+    # a clean assertion failure, never by hanging the suite.
+    ticks = iter(range(0, 100, 5))
     r = run_selftest(
         "ups1",
         _snap("OB DISCHRG"),
@@ -72,7 +78,9 @@ def test_run_selftest_skips_on_battery() -> None:
         start=_start,
         read_result=lambda _u: "x",
         sleep=lambda _s: None,
-        clock=lambda: 0.0,
+        clock=lambda: next(ticks),
+        poll=1.0,
+        timeout=10.0,
     )
     assert r.outcome == "skipped"
     assert called["start"] == 0  # never started a test while on battery

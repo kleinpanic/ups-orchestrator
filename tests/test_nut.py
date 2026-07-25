@@ -150,3 +150,48 @@ def test_upscmd_handles_oserror(monkeypatch) -> None:
     monkeypatch.setattr(nut.subprocess, "run", boom)
     rc, _out, err = nut.upscmd("ups1", "x", user="u", password="p")
     assert rc == 1 and "upscmd missing" in err
+
+
+class _R:
+    def __init__(self, rc: int, out: str, err: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def test_upsc_var_success_failure_and_error(monkeypatch) -> None:
+    monkeypatch.setattr(nut.subprocess, "run", lambda *_a, **_k: _R(0, "42\n"))
+    assert nut.upsc_var("ups1", "battery.charge") == "42"
+    monkeypatch.setattr(nut.subprocess, "run", lambda *_a, **_k: _R(1, ""))
+    assert nut.upsc_var("ups1", "x") is None  # non-zero rc
+    monkeypatch.setattr(nut.subprocess, "run", lambda *_a, **_k: _R(0, "   \n"))
+    assert nut.upsc_var("ups1", "x") is None  # blank → None
+
+    def _boom(*_a, **_k):
+        raise OSError("no upsc")
+
+    monkeypatch.setattr(nut.subprocess, "run", _boom)
+    assert nut.upsc_var("ups1", "x") is None
+
+
+def test_upsc_vars_empty_on_failure(monkeypatch) -> None:
+    monkeypatch.setattr(nut.subprocess, "run", lambda *_a, **_k: _R(1, "", "denied"))
+    assert nut.upsc_vars("ups1") == {}
+
+    def _boom(*_a, **_k):
+        raise nut.subprocess.SubprocessError()
+
+    monkeypatch.setattr(nut.subprocess, "run", _boom)
+    assert nut.upsc_vars("ups1") == {}
+
+
+def test_load_properties_handle_none() -> None:
+    snap = UpsSnapshot("OL", 100, 600, None, 120.0)
+    assert snap.load_margin_percent is None
+    assert snap.load_level == "UNKNOWN"
+    assert snap.load_is_high is False
+
+
+def test_numeric_parsers_reject_garbage() -> None:
+    assert nut._as_int("not-a-number") is None
+    assert nut._as_int(None) is None
+    assert nut._as_float("nope") is None
+    assert nut._as_float(None) is None

@@ -273,3 +273,41 @@ def test_control_failure_notifies_warning(env_config, monkeypatch) -> None:
     rec = _patch_recorder(monkeypatch)
     assert cli.main(["control", "test-quick"]) == 1
     assert rec.sent[0].level is Level.WARNING
+
+
+def test_power_dashboard_writes_out(env_config, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("ups_orchestrator.dashboard.render_png", lambda *_a, **_k: b"PNGDATA")
+    out = tmp_path / "d.png"
+    assert cli.main(["power-dashboard", "--out", str(out)]) == 0
+    assert out.read_bytes() == b"PNGDATA"
+
+
+def test_power_dashboard_posts(env_config, monkeypatch) -> None:
+    monkeypatch.setattr("ups_orchestrator.dashboard.render_png", lambda *_a, **_k: b"PNG")
+    monkeypatch.setattr("ups_orchestrator.dashboard.post_png", lambda *_a, **_k: (True, 200))
+    assert cli.main(["power-dashboard", "--post"]) == 0
+
+
+def test_power_dashboard_nothing_to_do_returns_2(env_config, monkeypatch) -> None:
+    monkeypatch.setattr("ups_orchestrator.dashboard.render_png", lambda *_a, **_k: b"PNG")
+    assert cli.main(["power-dashboard"]) == 2
+
+
+def test_power_dashboard_matplotlib_missing(env_config, monkeypatch, tmp_path) -> None:
+    def _boom(*_a, **_k):
+        raise ImportError("no matplotlib")
+
+    monkeypatch.setattr("ups_orchestrator.dashboard.render_png", _boom)
+    assert cli.main(["power-dashboard", "--out", str(tmp_path / "x.png")]) == 1
+
+
+def test_send_dashboard_swallows_render_error(env_config, monkeypatch) -> None:
+    from ups_orchestrator import cli as climod
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("render blew up")
+
+    monkeypatch.setattr("ups_orchestrator.dashboard.render_png", _boom)
+    cfg = climod._load_config()
+    ok, status = climod._send_dashboard(cfg, hours=24)
+    assert ok is False and status == 0  # degrades, never raises
