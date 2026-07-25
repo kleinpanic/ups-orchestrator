@@ -41,9 +41,7 @@ nav:
   - Home: index.md
   - Architecture: Architecture.md
   - Configuration: Configuration.md
-  - Shutdown:
-      - Targets & policy: Shutdown-Targets.md
-      - SSH vs. native NUT: Shutdown-Mechanisms.md
+  - Shutdown targets: Shutdown-Targets.md
   - Deployment: Deployment.md
 
 # Home.md is the GitHub-wiki landing page; the MkDocs site uses index.md instead.
