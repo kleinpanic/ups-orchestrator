@@ -82,11 +82,44 @@ def test_onbatt_records_state_and_notifies() -> None:
 def test_online_reports_outage_duration() -> None:
     notifier = FakeNotifier()
     deps, _ = make_deps(notifier, snap("OL"), now=1300)
-    state = UpsState(onbatt_since=1000)
+    state = UpsState(onbatt_since=1000, onbatt_notified=True)
     dispatch("online", make_ups(), state, deps)
     assert state.onbatt_since is None
     assert notifier.sent[0].level is Level.SUCCESS
     assert ("Outage duration", "5m 0s") in notifier.sent[0].fields
+
+
+def test_tick_within_grace_does_not_page() -> None:
+    # A fresh transfer sets onbatt_since but must not page inside the grace window
+    # (this is what keeps blips and self-tests silent).
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OB"), now=1000, countdown_every=0)
+    state = UpsState()
+    dispatch("tick", make_ups(), state, deps)
+    assert notifier.sent == []
+    assert state.onbatt_since == 1000
+    assert state.onbatt_notified is False
+
+
+def test_tick_pages_after_grace_once() -> None:
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OB"), now=1030, countdown_every=0)  # 30s >= 20 grace
+    state = UpsState(onbatt_since=1000)
+    dispatch("tick", make_ups(), state, deps)
+    assert "ON BATTERY" in notifier.sent[0].title
+    assert state.onbatt_notified is True
+    dispatch("tick", make_ups(), state, deps)  # second poll must not re-page
+    assert len(notifier.sent) == 1
+
+
+def test_online_silent_when_outage_never_paged() -> None:
+    # Power restored after a sub-grace blip: no ON BATTERY was sent, so no RESTORED.
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL"), now=1005)
+    state = UpsState(onbatt_since=1000)  # onbatt_notified defaults False
+    dispatch("online", make_ups(), state, deps)
+    assert notifier.sent == []
+    assert state.onbatt_since is None
 
 
 def test_lowbatt_only_notifies() -> None:
@@ -107,7 +140,7 @@ def test_tick_silent_when_online() -> None:
 def test_tick_countdown_when_on_battery() -> None:
     notifier = FakeNotifier()
     deps, _ = make_deps(notifier, snap("OB", runtime=420))
-    state = UpsState(onbatt_since=1)
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
     dispatch("tick", make_ups(), state, deps)
     assert "still on battery" in notifier.sent[0].title
 
@@ -115,7 +148,8 @@ def test_tick_countdown_when_on_battery() -> None:
 def test_tick_countdown_respects_cadence() -> None:
     notifier = FakeNotifier()
     deps, _ = make_deps(notifier, snap("OB"), now=1000, countdown_every=60)
-    state = UpsState(onbatt_since=1, last_tick_notified=990)  # only 10s since last
+    # only 10s since last countdown, and already paged
+    state = UpsState(onbatt_since=1, last_tick_notified=990, onbatt_notified=True)
     dispatch("tick", make_ups(), state, deps)
     assert notifier.sent == []
 
@@ -123,14 +157,14 @@ def test_tick_countdown_respects_cadence() -> None:
 def test_tick_countdown_disabled() -> None:
     notifier = FakeNotifier()
     deps, _ = make_deps(notifier, snap("OB"), countdown_every=0)
-    dispatch("tick", make_ups(), UpsState(onbatt_since=1), deps)
+    dispatch("tick", make_ups(), UpsState(onbatt_since=1, onbatt_notified=True), deps)
     assert notifier.sent == []
 
 
 def test_target_fires_on_battery_threshold() -> None:
     notifier = FakeNotifier()
     deps, calls = make_deps(notifier, snap("OB", charge=18), countdown_every=0)
-    state = UpsState(onbatt_since=1)
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
     ups = make_ups(
         targets=(_remote(),),
         shutdown_policy=shutdown_policy(external_battery_below=20, external_runtime_below=None),

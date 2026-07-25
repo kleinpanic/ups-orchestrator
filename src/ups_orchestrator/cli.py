@@ -147,6 +147,7 @@ def _build_deps(cfg: Config) -> Deps:
     return Deps(
         notifier=notifier,
         countdown_every=cfg.countdown_every_seconds,
+        onbatt_notify_grace=cfg.onbatt_notify_grace_seconds,
         event_log=_event_log,
         load_step=cfg.load_step,
         sample_path=_sample_path(),
