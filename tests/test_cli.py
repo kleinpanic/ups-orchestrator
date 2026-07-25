@@ -196,3 +196,31 @@ def test_webui_command_invokes_serve(env_config, monkeypatch) -> None:
     monkeypatch.setattr("ups_orchestrator.webui.serve", fake_serve)
     assert cli.main(["webui", "--host", "0.0.0.0", "--port", "9001"]) == 0
     assert seen == {"host": "0.0.0.0", "port": 9001}
+
+
+def test_control_beeper_mute_all(env_config, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("UPS_NUT_ADMIN_USER", "admin")
+    monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
+    calls: list[tuple[str, str]] = []
+
+    def fake_upscmd(name, command, **_kw):
+        calls.append((name, command))
+        return 0, "OK", ""
+
+    monkeypatch.setattr("ups_orchestrator.nut.upscmd", fake_upscmd)
+    assert cli.main(["control", "beeper-mute"]) == 0
+    assert calls == [("ups1", "beeper.mute")]
+    assert "beeper-mute" in capsys.readouterr().out
+
+
+def test_control_without_creds_errors(env_config, monkeypatch) -> None:
+    monkeypatch.delenv("UPS_NUT_ADMIN_USER", raising=False)
+    monkeypatch.delenv("UPS_NUT_ADMIN_PASSWORD", raising=False)
+    assert cli.main(["control", "beeper-mute"]) == 2
+
+
+def test_control_reports_failure(env_config, monkeypatch) -> None:
+    monkeypatch.setenv("UPS_NUT_ADMIN_USER", "admin")
+    monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
+    monkeypatch.setattr("ups_orchestrator.nut.upscmd", lambda *_a, **_k: (1, "", "access denied"))
+    assert cli.main(["control", "test-quick"]) == 1
