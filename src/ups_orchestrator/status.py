@@ -38,7 +38,9 @@ def _vlen(text: str) -> int:
 def _panel(title: str, title_vlen: int, lines: list[str], *, use_color: bool) -> list[str]:
     """Box a card's content lines under a titled top border, ANSI-width aware."""
     inner = max([title_vlen, *(_vlen(x) for x in lines)]) if lines else title_vlen
-    tl, tr, bl, br, h, v = ("╭", "╮", "╰", "╯", "─", "│") if use_color else ("+", "+", "+", "+", "-", "|")  # noqa: E501
+    tl, tr, bl, br, h, v = (
+        ("╭", "╮", "╰", "╯", "─", "│") if use_color else ("+", "+", "+", "+", "-", "|")
+    )  # noqa: E501
     dim = _DIM if use_color else ""
     reset = _RESET if use_color else ""
     top = f"{dim}{tl}{h} {reset}{title} {dim}{h * (inner - title_vlen - 1)}{tr}{reset}"
