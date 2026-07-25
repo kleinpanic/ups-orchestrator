@@ -130,16 +130,26 @@ def main() -> int:
             continue
         path.write_text(original.replace(old, new, 1))
         try:
+            # Hard timeout: a mutant can turn a bounded loop into an infinite one
+            # (e.g. a guard flip that makes a settle-loop never exit). A hang means
+            # the suite *would* have caught it, so count it KILLED — never let a
+            # single mutant wedge the whole harness.
             proc = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q", "-x", "--no-header"],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                timeout=120,
             )
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            returncode = -1  # hang == detectable == killed
+            print(f"  KILLED   {desc} (suite hung — mutant caused a non-terminating loop)")
         finally:
             path.write_text(original)
-        if proc.returncode != 0:
-            print(f"  KILLED   {desc}")
+        if returncode != 0:
+            if returncode != -1:
+                print(f"  KILLED   {desc}")
             killed += 1
         else:
             print(f"  SURVIVED {desc}   <-- add a test that pins this")
