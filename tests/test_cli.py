@@ -224,3 +224,52 @@ def test_control_reports_failure(env_config, monkeypatch) -> None:
     monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
     monkeypatch.setattr("ups_orchestrator.nut.upscmd", lambda *_a, **_k: (1, "", "access denied"))
     assert cli.main(["control", "test-quick"]) == 1
+
+
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    def send(self, note):
+        self.sent.append(note)
+        from ups_orchestrator.notify import DeliveryResult
+
+        return DeliveryResult(configured=True, ok=True)
+
+
+def _patch_recorder(monkeypatch) -> _RecordingNotifier:
+    rec = _RecordingNotifier()
+    monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: rec)
+    return rec
+
+
+def test_control_sends_discord_counterpart(env_config, monkeypatch) -> None:
+    monkeypatch.setenv("UPS_NUT_ADMIN_USER", "admin")
+    monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
+    monkeypatch.setattr("ups_orchestrator.nut.upscmd", lambda *_a, **_k: (0, "OK", ""))
+    rec = _patch_recorder(monkeypatch)
+    assert cli.main(["control", "beeper-mute"]) == 0
+    assert len(rec.sent) == 1
+    note = rec.sent[0]
+    assert "beeper-mute" in note.title and "1/1 OK" in note.title
+    assert note.fields == [("U1", "OK")]
+
+
+def test_control_no_notify_skips_discord(env_config, monkeypatch) -> None:
+    monkeypatch.setenv("UPS_NUT_ADMIN_USER", "admin")
+    monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
+    monkeypatch.setattr("ups_orchestrator.nut.upscmd", lambda *_a, **_k: (0, "OK", ""))
+    rec = _patch_recorder(monkeypatch)
+    assert cli.main(["control", "beeper-mute", "--no-notify"]) == 0
+    assert rec.sent == []
+
+
+def test_control_failure_notifies_warning(env_config, monkeypatch) -> None:
+    from ups_orchestrator.notify import Level
+
+    monkeypatch.setenv("UPS_NUT_ADMIN_USER", "admin")
+    monkeypatch.setenv("UPS_NUT_ADMIN_PASSWORD", "pw")
+    monkeypatch.setattr("ups_orchestrator.nut.upscmd", lambda *_a, **_k: (1, "", "access denied"))
+    rec = _patch_recorder(monkeypatch)
+    assert cli.main(["control", "test-quick"]) == 1
+    assert rec.sent[0].level is Level.WARNING

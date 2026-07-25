@@ -430,6 +430,9 @@ _CONTROL_ACTIONS = {
     "test-stop": "test.battery.stop",
 }
 
+# Emoji per action family, for the Discord counterpart of a control run.
+_CONTROL_EMOJI = {"beeper": "🔇", "test": "🔋"}
+
 
 def _cmd_control(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
@@ -441,6 +444,9 @@ def _cmd_control(argv: list[str]) -> int:
     parser.add_argument("ups", nargs="?", help="UPS name (default: every configured UPS)")
     parser.add_argument("--user-env", default="UPS_NUT_ADMIN_USER")
     parser.add_argument("--password-env", default="UPS_NUT_ADMIN_PASSWORD")
+    parser.add_argument(
+        "--no-notify", action="store_true", help="skip the Discord notification counterpart"
+    )
     args = parser.parse_args(argv)
 
     cfg = _load_config()
@@ -456,7 +462,8 @@ def _cmd_control(argv: list[str]) -> int:
 
     command = _CONTROL_ACTIONS[args.action]
     targets = [args.ups] if args.ups else list(cfg.upses)
-    any_fail = False
+    # (label, ok, detail) per UPS actually acted on — drives both CLI and Discord.
+    results: list[tuple[str, bool, str]] = []
     for name in targets:
         ups = cfg.ups(name)
         if ups is None:
@@ -466,8 +473,34 @@ def _cmd_control(argv: list[str]) -> int:
         ok = rc == 0
         detail = "OK" if ok else f"FAIL: {(err or out or 'upscmd error').splitlines()[0]}"
         print(f"{ups.label}: {args.action} ({command}) -> {detail}")
-        any_fail = any_fail or not ok
+        results.append((ups.label, ok, detail))
+
+    any_fail = any(not ok for _, ok, _ in results)
+    if results and not args.no_notify:
+        _notify_control(cfg, args.action, command, results, any_fail)
     return 1 if any_fail else 0
+
+
+def _notify_control(
+    cfg: Config,
+    action: str,
+    command: str,
+    results: list[tuple[str, bool, str]],
+    any_fail: bool,
+) -> None:
+    """Post the Discord counterpart of a control run (one summary embed)."""
+    from ups_orchestrator.notify import Level, Notification
+
+    emoji = _CONTROL_EMOJI.get(action.split("-", 1)[0], "🎛️")
+    ok_n = sum(1 for _, ok, _ in results if ok)
+    level = Level.WARNING if any_fail else Level.SUCCESS
+    note = Notification(
+        title=f"{emoji} control: {action} — {ok_n}/{len(results)} OK",
+        body=f"`{command}` across {len(results)} UPS(es)",
+        level=level,
+        fields=[(label, detail) for label, _, detail in results],
+    )
+    _build_deps(cfg).notifier.send(note)
 
 
 def _cmd_webui(argv: list[str]) -> int:
