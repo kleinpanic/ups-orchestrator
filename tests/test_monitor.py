@@ -689,9 +689,7 @@ def test_add_first_enrollment_nonexistent_nft_path_succeeds(cfg_path, add_env, m
     monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
     monkeypatch.setattr(cli, "_monitor_run_nft", nft)
     monkeypatch.setattr(cli, "_NFT_PATH", str(nft_path))
-    rc = cli.main(
-        ["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "1.2.3.4"]
-    )
+    rc = cli.main(["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "1.2.3.4"])
     assert rc == 0
     assert nft.calls == [str(nft_path)]  # reload ran on the freshly-created file
     assert "table inet ups_orchestrator" in nft_path.read_text()
