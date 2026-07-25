@@ -9,13 +9,6 @@ The host running the daemon is protected separately by NUT's own
 `upsmon SHUTDOWNCMD`; orchestrator targets are optional extra actions for the
 devices a UPS feeds.
 
-!!! note "SSH is the convenient path, not the robust one"
-    The `remote` (SSH) transport has real failure modes during an outage — it
-    depends on the network staying up, and it reimplements what NUT's native
-    primary/secondary shutdown already does. See
-    [SSH vs. native NUT](Shutdown-Mechanisms.md) for the full analysis and when to
-    prefer each path.
-
 ## Kinds
 
 - **`serial`**: send the command over a serial console (`device` + `baud`) into
