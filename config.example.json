@@ -5,6 +5,13 @@
   "discord_avatar_url": "",
   "poll_seconds": 30,
   "countdown_every_seconds": 60,
+  "nut_server": {
+    "listen": ["127.0.0.1", "::1"],
+    "port": 3493,
+    "secondary_user": "upsmon_secondary"
+  },
+  "monitored_machines__comment": "NUT secondaries enrolled via `monitor add`. Ships EMPTY: install.sh copies this file into production, so a worked example here would push a half-formed entry into the nft set. See docs/Configuration.md for the field shape and a worked mt/spark example.",
+  "monitored_machines": [],
   "load_step": {
     "enabled": true,
     "drop_percent": 15,
@@ -30,6 +37,7 @@
   "upses": {
     "ups1": {
       "label": "Rack UPS",
+      "shutdown_targets__comment": "Default-off SSH/serial BACKUP path, below native NUT secondary shutdown. See docs/Shutdown-Targets.md — for a machine with a native secondary this MUST sit below its UPS's LB point (a deadman); for a machine with no secondary it stays the graceful path.",
       "shutdown_targets": [
         {
           "name": "fileserver",

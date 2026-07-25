@@ -1,0 +1,21 @@
+# Merge into /etc/nut/upsd.conf on the PRIMARY (eulerpi5) — exposes upsd on the LAN.
+#
+# The default install listens on localhost only. Secondaries (mt/spark) reach
+# upsd over TCP/3493, so the primary must also LISTEN on its LAN address.
+#
+# CRITICAL — a LISTEN change needs a FULL restart, not a reload:
+#
+#     systemctl restart nut-server
+#
+# `systemctl reload nut-server` is a NO-OP for LISTEN: upsd only binds its
+# sockets at start, so a reload leaves it still bound to localhost only and the
+# secondaries never connect (RESEARCH.md pitfall 1). The `monitor add` CLI does
+# the full restart for you; this snippet is the operator reference / rollback.
+#
+# Keep the existing localhost lines so local upsc/upsmon on the primary still
+# work, and add the LAN address. Least privilege: expose only the primary's own
+# LAN IP, never 0.0.0.0.
+
+LISTEN 127.0.0.1 3493
+LISTEN ::1 3493
+LISTEN 192.168.1.125 3493

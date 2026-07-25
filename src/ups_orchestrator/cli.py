@@ -26,18 +26,22 @@ handler never wedges NUT's pipeline; failures are logged.
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import json
 import logging
 import os
 import signal
 import socket
+import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
 
-from ups_orchestrator import audit, recorder, report
+from ups_orchestrator import audit, nutclient, recorder, report
 from ups_orchestrator import status as status_view
-from ups_orchestrator.config import Config, UpsConfig
+from ups_orchestrator.config import Config, MonitoredMachine, UpsConfig, dual_regime_conflicts
 from ups_orchestrator.events import Deps, dispatch
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
@@ -670,6 +674,416 @@ def _cmd_record(argv: list[str]) -> int:
     return 0
 
 
+# ---- monitor CLI family (NUT secondary enrollment) --------------------------
+#
+# Injectable seams: tests monkeypatch these module-level callables so the whole
+# enrollment sequence drives against recording fakes with no live host. Live
+# runs use nutclient's real default runners (excluded from the coverage floor).
+_monitor_run_ssh = nutclient._default_run_ssh
+
+
+def _monitor_run_local(  # pragma: no cover — live only
+    argv: Sequence[str], stdin: str | None = None
+) -> tuple[int, str, str]:
+    proc = subprocess.run(list(argv), input=stdin, capture_output=True, text=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+_SECRET_ENV = "UPS_NUT_SECONDARY_PASSWORD"
+_UPSD_CONF_PATH = "/etc/nut/upsd.conf"
+_UPSD_USERS_PATH = "/etc/nut/upsd.users"
+_REMOTE_UPSMON_PATH = "/etc/nut/upsmon.conf"
+_REMOTE_NUT_CONF_PATH = "/etc/nut/nut.conf"
+_NFT_PATH = "/etc/nftables.d/ups-orchestrator.nft"
+
+
+def _monitor_run_nft(path: str) -> tuple[int, str, str]:  # pragma: no cover — live only
+    return nutclient._default_run_local(["nft", "-f", path])
+
+
+def _monitor_restart_bouncer() -> None:  # pragma: no cover — live only
+    nutclient._default_run_local(["systemctl", "restart", "crowdsec-firewall-bouncer"])
+
+
+def _monitor_primary_ip(cfg: Config, override: str | None) -> str:
+    """First non-loopback LISTEN address (the LAN IP the secondary connects to)."""
+    if override:
+        return override
+    for addr in cfg.nut_server.listen:
+        if addr not in ("127.0.0.1", "::1", "localhost"):
+            return addr
+    return "127.0.0.1"
+
+
+def _survivor_saddrs(machines: tuple[MonitoredMachine, ...]) -> list[str]:
+    """nft saddr union from monitored machines, empty IPs filtered out.
+
+    An empty-ip survivor would render an invalid ``ip saddr { }`` and fail
+    ``nft -f``; drop it (deduplicated, order-preserving).
+    """
+    out: list[str] = []
+    for m in machines:
+        ip = m.ip.strip()
+        if ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+def _monitor_persist(cfg_path: Path, machines: list[dict[str, object]]) -> None:
+    """Write monitored_machines back by mutating the RAW config dict, atomically.
+
+    Unknown keys (e.g. a ``_comment``) are preserved because we round-trip the
+    parsed JSON rather than a frozen Config. The write is temp+fsync+os.replace
+    (state.py pattern) so a crash mid-write can't corrupt the file the watch
+    service reads. The secondary password is never among the written fields.
+    """
+    import tempfile
+
+    raw = json.loads(cfg_path.read_text())
+    raw["monitored_machines"] = machines
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=cfg_path.parent,
+            prefix=f".{cfg_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            json.dump(raw, tmp, indent=2, sort_keys=True)
+            tmp.write("\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        tmp_path.replace(cfg_path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _monitor_find(cfg: Config, name: str) -> MonitoredMachine | None:
+    lname = name.strip().lower()
+    for m in cfg.monitored_machines:
+        if m.name.strip().lower() == lname:
+            return m
+    return None
+
+
+_REMOTE_DISARM = (
+    "sudo systemctl disable --now nut-monitor.service; "
+    "sudo rm -f /etc/systemd/system/nut-monitor.service.d/network-online.conf; "
+    "sudo systemctl daemon-reload; "
+    "printf 'MODE=none\\n' | sudo install -m 0640 -o root -g nut /dev/stdin "
+    f"{_REMOTE_NUT_CONF_PATH}"
+)
+
+
+def _monitor_list(cfg: Config) -> int:
+    if not cfg.monitored_machines:
+        print("no machines enrolled")
+        return 0
+    for m in cfg.monitored_machines:
+        backup = "backup:on" if m.backup.enabled else "backup:off"
+        print(f"{m.name}\tssh={m.ssh}\tups={m.ups}\tos={m.os}\tip={m.ip or '-'}\t{backup}")
+    return 0
+
+
+def _monitor_verify(cfg: Config, argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator monitor verify")
+    parser.add_argument("name")
+    parser.add_argument("--timeout", type=int, default=10, help="seconds to await a result")
+    parser.add_argument("--deep", action="store_true", help="also grep the remote auth journal")
+    parser.add_argument("--primary-ip", help="override the LAN address the secondary connects to")
+    args = parser.parse_args(argv)
+
+    machine = _monitor_find(cfg, args.name)
+    if machine is None:
+        LOG.error("monitor verify: unknown machine %r", args.name)
+        return 2
+    if args.primary_ip and not _valid_ip(args.primary_ip):
+        LOG.error("monitor verify: --primary-ip %r is not a valid IP literal", args.primary_ip)
+        return 2
+    # machine.ups is config-sourced (monitored_machines[].ups) and flows into a
+    # remote shell string in verify_secondary; refuse a metachar-bearing value
+    # here instead of executing it.
+    if not nutclient.valid_nut_name(machine.ups):
+        LOG.error("monitor verify: config UPS name %r for %s is invalid", machine.ups, machine.name)
+        return 2
+    primary = _monitor_primary_ip(cfg, args.primary_ip)
+    ok, detail = nutclient.verify_secondary(
+        machine.ssh,
+        machine.ups,
+        primary,
+        _monitor_run_ssh,
+        timeout=args.timeout,
+        deep=args.deep,
+    )
+    print(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
+    return 0 if ok else 1
+
+
+def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator monitor remove")
+    parser.add_argument("name")
+    parser.add_argument(
+        "--keep-remote", action="store_true", help="do not disarm the secondary over SSH"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="print the plan, mutate nothing")
+    parser.add_argument("--no-firewall", action="store_true", help="skip the nft rewrite")
+    parser.add_argument("--no-restart-bouncer", action="store_true", help="skip bouncer restart")
+    args = parser.parse_args(argv)
+
+    machine = _monitor_find(cfg, args.name)
+    if machine is None:
+        LOG.error("monitor remove: unknown machine %r", args.name)
+        return 2
+
+    survivors = tuple(m for m in cfg.monitored_machines if m is not machine)
+    saddrs = _survivor_saddrs(survivors)
+
+    if args.dry_run:
+        disarm = "skip (--keep-remote)" if args.keep_remote else machine.ssh
+        fw = "skip (--no-firewall)" if args.no_firewall else saddrs
+        print(f"[dry-run] disarm remote: {disarm}")
+        print(f"[dry-run] firewall: {fw}")
+        print(f"[dry-run] persist: drop {machine.name} (config written LAST)")
+        return 0
+
+    # 1) disarm remote (unless --keep-remote)
+    if not args.keep_remote:
+        rc, _out, err = _monitor_run_ssh(machine.ssh, _REMOTE_DISARM, None)
+        if rc != 0:
+            LOG.error("monitor remove: remote disarm failed: %s", err)
+            return 3
+
+    # 2) firewall: rewrite the saddr set from survivors (unless --no-firewall)
+    if not args.no_firewall:
+        restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
+        rc, _out, err = nutclient.apply_nft(_NFT_PATH, saddrs, _monitor_run_nft, restart)
+        if rc != 0:
+            LOG.error("monitor remove: firewall reload failed: %s", err)
+            return 4
+
+    # 3) persist config LAST (so a firewall failure leaves config unchanged)
+    _monitor_persist(cfg_path, [m.to_dict() for m in survivors])
+    print(f"removed {machine.name}")
+    return 0
+
+
+def _valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_remote_ip(alias: str, explicit: str | None) -> str | None:
+    """RESEARCH.md §4 order: explicit --ip → SSH_CONNECTION field 1 → None.
+
+    ``echo $SSH_CONNECTION`` is expanded by the remote shell; field 1 is the
+    client source address upsd actually sees, so it is the most correct saddr.
+    Returns a validated IP literal or ``None`` when nothing usable resolves.
+    """
+    if explicit:
+        return explicit.strip() if _valid_ip(explicit) else None
+    rc, out, _err = _monitor_run_ssh(alias, "echo $SSH_CONNECTION", None)
+    if rc == 0:
+        fields = out.split()
+        if fields and _valid_ip(fields[0]):
+            return fields[0]
+    return None
+
+
+def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ups-orchestrator monitor add")
+    parser.add_argument("name")
+    parser.add_argument("--ssh", required=True, help="ssh_config alias for the secondary")
+    parser.add_argument("--ups", required=True, help="NUT UPS name the secondary draws from")
+    parser.add_argument("--ip", help="explicit source IP (skips SSH_CONNECTION probe)")
+    parser.add_argument("--os", default="auto", choices=("auto", "arch", "ubuntu", "debian"))
+    parser.add_argument("--powervalue", type=int, default=1, choices=(0, 1))
+    parser.add_argument("--shutdown-cmd", default="/sbin/shutdown -h now")
+    parser.add_argument("--primary-ip", help="override the LAN address in the MONITOR line")
+    parser.add_argument("--dry-run", action="store_true", help="print the plan, mutate nothing")
+    parser.add_argument("--no-firewall", action="store_true", help="skip the nft open")
+    parser.add_argument("--no-restart-bouncer", action="store_true", help="skip bouncer restart")
+    parser.add_argument("--force", action="store_true", help="override refuse-on-existing guards")
+    args = parser.parse_args(argv)
+
+    # 1. up-front arg validation (rc 2)
+    if '"' in args.shutdown_cmd:
+        LOG.error("monitor add: --shutdown-cmd must not contain a double-quote")
+        return 2
+    if args.ip and not _valid_ip(args.ip):
+        LOG.error("monitor add: --ip %r is not a valid IP literal", args.ip)
+        return 2
+    if not nutclient.valid_nut_name(args.ups):
+        LOG.error("monitor add: --ups %r is not a valid NUT UPS name", args.ups)
+        return 2
+    if args.primary_ip and not _valid_ip(args.primary_ip):
+        LOG.error("monitor add: --primary-ip %r is not a valid IP literal", args.primary_ip)
+        return 2
+
+    # 2. password from env ONLY — never invent, never store (rc 2 if absent)
+    password = os.environ.get(_SECRET_ENV, "")
+    if not password:
+        LOG.error("monitor add: %s not set in the environment", _SECRET_ENV)
+        return 2
+
+    # 3. dual-regime --force gate (rc 2 without --force)
+    candidate = MonitoredMachine(
+        name=args.name,
+        ssh=args.ssh,
+        ups=args.ups,
+        powervalue=args.powervalue,
+        os=args.os,
+        shutdown_cmd=args.shutdown_cmd,
+    )
+    target = args.name.strip().lower()
+    others = tuple(m for m in cfg.monitored_machines if m.name.strip().lower() != target)
+    conflicts = dual_regime_conflicts((*others, candidate), cfg.upses)
+    if conflicts and not args.force:
+        LOG.error(
+            "monitor add: %s is both an enrolled secondary and an enabled shutdown_target "
+            "on its UPS (double-shutdown risk) — pass --force to override",
+            args.name,
+        )
+        return 2
+
+    # 4. resolve the remote source IP (validated literal)
+    ip = _resolve_remote_ip(args.ssh, args.ip)
+    if not ip:
+        LOG.error("monitor add: could not resolve a valid source IP for %s", args.ssh)
+        return 2
+
+    primary = _monitor_primary_ip(cfg, args.primary_ip)
+    ns = cfg.nut_server
+    # Carry a pre-existing entry's raw dict so re-adding (idempotent replace)
+    # preserves that machine's operator-authored keys (e.g. a _comment).
+    existing = _monitor_find(cfg, args.name)
+    entry = MonitoredMachine(
+        name=args.name,
+        ssh=args.ssh,
+        ups=args.ups,
+        powervalue=args.powervalue,
+        os=args.os,
+        shutdown_cmd=args.shutdown_cmd,
+        ip=ip,
+        raw=dict(existing.raw) if existing is not None else {},
+    )
+    saddrs = _survivor_saddrs((*others, entry))
+
+    if args.dry_run:
+        print(f"[dry-run] resolve ip: {ip}")
+        print(
+            f"[dry-run] bootstrap primary: LISTEN {primary}, user {ns.secondary_user} "
+            "(password <redacted>), nft " + ("skip" if args.no_firewall else str(saddrs))
+        )
+        print(f"[dry-run] remote bootstrap: {args.ssh} detect/install/write/enable")
+        print("[dry-run] verify (deep) then persist entry (no password)")
+        return 0
+
+    # 5. bootstrap primary WITH the real password (upsd.users + LISTEN + restart + nft)
+    is_root = os.geteuid() == 0
+    restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
+    try:
+        rc, log = nutclient.bootstrap_primary(
+            lan_ip=primary,
+            port=ns.port,
+            user=ns.secondary_user,
+            password=password,
+            # --no-firewall must SKIP the nft step, not pass []: an empty saddr
+            # set tears down the whole managed table (revoking every enrolled
+            # secondary). Only the genuine last-removed path in `remove` clears it.
+            saddrs=None if args.no_firewall else saddrs,
+            upsd_conf_path=_UPSD_CONF_PATH,
+            upsd_users_path=_UPSD_USERS_PATH,
+            nft_path=_NFT_PATH,
+            run_local=_monitor_run_local,
+            run_nft=_monitor_run_nft,
+            restart_bouncer=restart,
+            is_root=is_root,
+        )
+    except OSError as exc:
+        # A boundary failure (read/write/mkdir on /etc) must surface as a clean
+        # exit code, not an uncaught traceback that leaves the operator guessing
+        # how far the half-applied primary got.
+        LOG.error("monitor add: primary bootstrap failed at a filesystem boundary: %s", exc)
+        return 4
+    if rc != 0:
+        for line in log:
+            LOG.error("monitor add: %s", line)
+        return 4
+
+    # 6. remote bootstrap: detect → install → write config (password on stdin) → enable
+    os_kind = args.os if args.os != "auto" else nutclient.detect_os(args.ssh, _monitor_run_ssh)
+    rc, _o, _e = nutclient.install_nut_client(args.ssh, os_kind, _monitor_run_ssh)
+    if rc != 0:
+        LOG.error("monitor add: remote nut-client install failed")
+        return 3
+    upsmon_text = nutclient.render_upsmon_conf(
+        args.ups,
+        primary,
+        ns.secondary_user,
+        password,
+        args.shutdown_cmd,
+        powervalue=args.powervalue,
+    )
+    rc, reason = nutclient.write_remote_nut_config(
+        args.ssh,
+        upsmon_text,
+        nutclient.render_nut_conf(),
+        _REMOTE_UPSMON_PATH,
+        _REMOTE_NUT_CONF_PATH,
+        _monitor_run_ssh,
+        force=args.force,
+    )
+    if rc != 0:
+        LOG.error("monitor add: remote config write refused/failed: %s", reason)
+        return 3
+    rc, _o, _e = nutclient.enable_nut_monitor(args.ssh, _monitor_run_ssh)
+    if rc != 0:
+        LOG.error("monitor add: remote nut-monitor enable failed")
+        return 3
+
+    # 7. deep verify (catches a wrong/placeholder password — plain upsc is unauth)
+    ok, detail = nutclient.verify_secondary(
+        args.ssh, args.ups, primary, _monitor_run_ssh, timeout=10, deep=True
+    )
+    if not ok:
+        LOG.error("monitor add: verification failed: %s", detail)
+        return 5
+
+    # 8. persist by name (idempotent), no password, unknown keys preserved
+    kept = [m.to_dict() for m in others]
+    kept.append(entry.to_dict())
+    _monitor_persist(cfg_path, kept)
+    print(f"enrolled {args.name} ({ip}) on {args.ups}")
+    return 0
+
+
+def _cmd_monitor(argv: list[str]) -> int:
+    if not argv:
+        LOG.error("usage: ups-orchestrator monitor <add|list|verify|remove> [...]")
+        return 2
+    action, rest = argv[0], argv[1:]
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    cfg_path = _config_path()
+    if action == "list":
+        return _monitor_list(cfg)
+    if action == "verify":
+        return _monitor_verify(cfg, rest)
+    if action == "remove":
+        return _monitor_remove(cfg, cfg_path, rest)
+    if action == "add":
+        return _monitor_add(cfg, cfg_path, rest)
+    LOG.error("monitor: unknown action %r", action)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     logging.basicConfig(
@@ -681,7 +1095,7 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error(
             "usage: ups-orchestrator "
             "<event|tick|watch|status|report|audit|baseline|selftest|boot-audit|record|"
-            "power-dashboard|webui|control|notify-test|logs> [...]"
+            "power-dashboard|webui|control|monitor|notify-test|logs> [...]"
         )
         return 0
 
@@ -710,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_record(args[1:])
     if mode == "power-dashboard":
         return _cmd_power_dashboard(args[1:])
+    if mode == "monitor":
+        return _cmd_monitor(args[1:])
     if mode == "watch":
         return _cmd_watch()
     return _cmd_event(mode, _resolve_ups_name(args[1] if len(args) > 1 else None))

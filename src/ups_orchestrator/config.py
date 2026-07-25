@@ -10,10 +10,13 @@ setups, but ``config.example.json`` ships it empty.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_ups_name(name: str) -> str:
@@ -181,6 +184,119 @@ class LoadStepPolicy:
 
 
 @dataclass(frozen=True)
+class NutServer:
+    """Primary-side ``upsd`` exposure settings — holds no secrets.
+
+    ``listen`` defaults to localhost only; the LAN address is appended to the
+    tuple at enrollment time by the CLI, so a fresh config never silently
+    exposes ``upsd`` to the network. The secondary NUT password is sourced from
+    the environment at use time, never stored here (SC6).
+    """
+
+    listen: tuple[str, ...] = ("127.0.0.1", "::1")
+    port: int = 3493
+    secondary_user: str = "upsmon_secondary"
+
+    @classmethod
+    def from_dict(cls, data: object) -> NutServer:
+        if not isinstance(data, dict):
+            return cls()
+        raw_listen = data.get("listen")
+        listen: tuple[str, ...] = cls.listen
+        if isinstance(raw_listen, list):
+            listen = tuple(e for e in raw_listen if isinstance(e, str))
+        return cls(
+            listen=listen,
+            port=_as_int(data.get("port"), 3493),
+            secondary_user=str(data.get("secondary_user", "upsmon_secondary")),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "listen": list(self.listen),
+            "port": self.port,
+            "secondary_user": self.secondary_user,
+        }
+
+
+@dataclass(frozen=True)
+class BackupShutdown:
+    """Reframed SSH/serial backup shutdown for a monitored machine — default off."""
+
+    enabled: bool = False
+    kind: str = "remote"  # "remote" | "serial"
+
+    @classmethod
+    def from_dict(cls, data: object) -> BackupShutdown:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=_as_bool(data.get("enabled"), False),
+            kind=str(data.get("kind", "remote")),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {"enabled": self.enabled, "kind": self.kind}
+
+
+@dataclass(frozen=True)
+class MonitoredMachine:
+    """A NUT secondary enrolled via ``monitor add``.
+
+    Carries no password: the secondary's NUT credential is sourced from the
+    environment at use time (SC6). ``to_dict`` emits only the known fields so
+    plan 04 can append a fresh entry into the raw config dict without leaking
+    any secret.
+    """
+
+    name: str
+    ssh: str = ""  # ssh_config alias
+    ups: str = ""  # NUT UPS name (e.g. "cyberpower")
+    powervalue: int = 1  # 1 = powered by this UPS (counts to MINSUPPLIES)
+    os: str = "auto"  # "auto" | "arch" | "ubuntu" | "debian"
+    shutdown_cmd: str = "/sbin/shutdown -h now"
+    ip: str = ""  # resolved source IP for the nft saddr set
+    backup: BackupShutdown = field(default_factory=BackupShutdown)
+    # The original raw entry, so operator-authored keys (e.g. a per-machine
+    # ``_comment``) survive an add/remove round-trip instead of being dropped by
+    # a known-fields-only to_dict. Never carries a secret — the config holds none.
+    raw: dict[str, object] = field(default_factory=dict, compare=False)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> MonitoredMachine:
+        ssh = str(data.get("ssh", ""))
+        return cls(
+            name=str(data.get("name", ssh or "machine")),
+            ssh=ssh,
+            ups=str(data.get("ups", "")),
+            powervalue=_as_int(data.get("powervalue"), 1),
+            os=str(data.get("os", "auto")),
+            shutdown_cmd=str(data.get("shutdown_cmd", "/sbin/shutdown -h now")),
+            ip=str(data.get("ip", "")),
+            backup=BackupShutdown.from_dict(data.get("backup")),
+            raw=dict(data),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        # Merge known fields into the preserved raw entry so unknown operator keys
+        # (a _comment, a custom tag) are not lost on the next persist.
+        merged: dict[str, object] = dict(self.raw)
+        merged.update(
+            {
+                "name": self.name,
+                "ssh": self.ssh,
+                "ups": self.ups,
+                "powervalue": self.powervalue,
+                "os": self.os,
+                "shutdown_cmd": self.shutdown_cmd,
+                "ip": self.ip,
+                "backup": self.backup.to_dict(),
+            }
+        )
+        return merged
+
+
+@dataclass(frozen=True)
 class ShutdownTarget:
     """A machine to shut down when its UPS runs low on battery.
 
@@ -274,6 +390,32 @@ class UpsConfig:
         )
 
 
+def dual_regime_conflicts(
+    monitored_machines: tuple[MonitoredMachine, ...],
+    upses: dict[str, UpsConfig],
+) -> tuple[str, ...]:
+    """Return names of machines governed by BOTH shutdown regimes.
+
+    A conflict is a machine that is enrolled as a native NUT secondary AND is
+    an *enabled* ``shutdown_target`` on the UPS it references. The native
+    secondary fires below LB while the shutdown_target uses the shared
+    external-group thresholds — a double-shutdown risk. This is the single
+    shared detector: ``Config.load`` warns on it, and ``monitor add`` (plan 04)
+    refuses without ``--force``. Matching is case-insensitive on the machine name.
+    """
+    conflicts: list[str] = []
+    for m in monitored_machines:
+        ups = upses.get(normalize_ups_name(m.ups))
+        if ups is None:
+            continue
+        name_lower = m.name.strip().lower()
+        for t in ups.shutdown_targets:
+            if t.enabled and t.name.strip().lower() == name_lower:
+                conflicts.append(m.name)
+                break
+    return tuple(conflicts)
+
+
 @dataclass(frozen=True)
 class Config:
     """Top-level configuration for all monitored UPSes."""
@@ -288,6 +430,8 @@ class Config:
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
     discord_username: str = "UPS Orchestrator"
     discord_avatar_url: str = ""
+    nut_server: NutServer = field(default_factory=NutServer)
+    monitored_machines: tuple[MonitoredMachine, ...] = ()
 
     def ups(self, name: str) -> UpsConfig | None:
         """Look up a UPS by NUT name, returning ``None`` if it is not configured."""
@@ -325,6 +469,23 @@ class Config:
             if isinstance(data, dict)
         }
 
+        machines_raw = raw.get("monitored_machines", [])
+        monitored_machines = (
+            tuple(MonitoredMachine.from_dict(m) for m in machines_raw if isinstance(m, dict))
+            if isinstance(machines_raw, list)
+            else ()
+        )
+
+        conflicts = dual_regime_conflicts(monitored_machines, upses)
+        if conflicts:
+            logger.warning(
+                "Machine(s) %s are both an enrolled NUT secondary and an enabled "
+                "shutdown_target on the same UPS: the native secondary fires below LB "
+                "while the shutdown_target uses the shared external-group thresholds, "
+                "a double-shutdown risk deferred to a follow-up.",
+                ", ".join(conflicts),
+            )
+
         return cls(
             webhook_url=webhook,
             upses=upses,
@@ -337,4 +498,6 @@ class Config:
             load_step=LoadStepPolicy.from_dict(raw.get("load_step")),
             discord_username=str(raw.get("discord_username", "UPS Orchestrator")),
             discord_avatar_url=str(raw.get("discord_avatar_url", "")),
+            nut_server=NutServer.from_dict(raw.get("nut_server")),
+            monitored_machines=monitored_machines,
         )
