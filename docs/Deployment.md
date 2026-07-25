@@ -82,10 +82,19 @@ What it does, in order:
    `LISTEN` — `upsd` only binds its sockets at start, so a reload leaves it on
    localhost and the secondary never connects. This is why the flow restarts
    rather than reloads.
-2. **Firewall.** Add the secondary's source IP to the dedicated
-   `table inet ups_orchestrator` nftables set (never the operator's own
-   `filter`/`input` chain), write `/etc/nftables.conf`, and `nft -f` it — then
-   **restart the crowdsec bouncer** (see the warning below).
+2. **Firewall.** Splice a marked, reversible
+   `tcp dport 3493 ip saddr { … } accept` rule **into the operator's own input
+   base chain** (the one carrying `hook input` / `policy drop`, in
+   `/etc/nftables.d/main.nft`), reload the top-level `/etc/nftables.conf`, then
+   **restart the crowdsec bouncer** (see the warning below). The rule *must* live
+   in that base chain: nftables evaluates every base chain on the `input` hook,
+   and an `accept` in a self-contained `policy accept` table at negative priority
+   is terminal only for its own chain — the packet still reaches the `policy drop`
+   base chain and is dropped, so the port never opens (the symptom is a `upsc`
+   *timeout*, not a refusal). The marked block makes the edit idempotent and
+   `monitor remove` reverses it cleanly. `/etc/nftables.d/main.nft` must already
+   exist and contain the input base chain — enrollment errors clearly if it does
+   not, rather than writing a rule that lands nowhere.
 3. **Remote install/config.** Over the `ssh` alias: install the NUT client for
    the box's distro (`nut` on Arch, `nut-client` on Ubuntu/Debian), write a
    secondary `upsmon.conf` (`powervalue 1`, `MINSUPPLIES 1`, `DEADTIME 30`, and
@@ -96,6 +105,22 @@ What it does, in order:
 The secondary's NUT password comes from `UPS_NUT_SECONDARY_PASSWORD` in
 `/etc/ups-orchestrator.env` and must match the `[upsmon_secondary]` entry on the
 primary. It is never written to `config.json`.
+
+**Address resolution.** Two addresses matter and both are auto-detected, but a
+WAN/NAT SSH path can fool the defaults — override explicitly when in doubt:
+
+- *The secondary's source IP* (the nftables `saddr`, and what `upsd` sees). It is
+  resolved by running `ip -o route get <primary>` **on the secondary** and taking
+  the `src` — the real address the box sources packets from toward the primary.
+  `$SSH_CONNECTION` is only a fallback, because over a WAN/NAT hop its client
+  field is the **gateway**, not the machine's LAN IP. Pass `--ip <addr>` to
+  override.
+- *The primary's LAN IP* (the `MONITOR` line and the `LISTEN` the secondary dials).
+  It is taken from the first non-loopback `nut_server.listen` entry, else
+  auto-detected via a local `ip route get` toward the secondary. If neither
+  yields a LAN address, enrollment **errors** (rather than silently binding
+  `upsd` to localhost and failing at verify) — pass `--primary-ip <addr>` or add
+  a LAN address to `nut_server.listen`.
 
 !!! danger "Mandatory: restart crowdsec after every `nft -f`"
     Debian's `/etc/nftables.conf` opens with `flush ruleset`, which wipes
