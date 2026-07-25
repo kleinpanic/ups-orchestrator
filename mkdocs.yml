@@ -25,9 +25,14 @@ theme:
         name: Dark mode
   features:
     - navigation.instant
+    - navigation.tracking
     - navigation.top
     - navigation.sections
+    - navigation.footer
     - content.code.copy
+    - content.action.edit
+    - search.highlight
+    - search.suggest
     - toc.integrate
   icon:
     repo: fontawesome/brands/github
@@ -36,8 +41,14 @@ nav:
   - Home: index.md
   - Architecture: Architecture.md
   - Configuration: Configuration.md
-  - Shutdown targets: Shutdown-Targets.md
+  - Shutdown:
+      - Targets & policy: Shutdown-Targets.md
+      - SSH vs. native NUT: Shutdown-Mechanisms.md
   - Deployment: Deployment.md
+
+# Home.md is the GitHub-wiki landing page; the MkDocs site uses index.md instead.
+not_in_nav: |
+  Home.md
 
 markdown_extensions:
   - admonition
