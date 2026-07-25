@@ -58,6 +58,29 @@ def test_status_empty_config() -> None:
     assert "(no UPSes configured)" in status.render(cfg, color=False, now=0)
 
 
+def test_vlen_ignores_ansi() -> None:
+    assert status._vlen("abc") == 3
+    assert status._vlen(f"{status._RED}abc{status._RESET}") == 3
+
+
+def test_panel_borders_align_even_with_color() -> None:
+    # Every rendered line must share the same visible width, colour or not.
+    lines = status._panel(
+        f"{status._BOLD}Title{status._RESET}",
+        status._vlen(f"{status._BOLD}Title{status._RESET}"),
+        [f"{status._CYAN}short{status._RESET}", "a much longer content line here"],
+        use_color=True,
+    )
+    widths = {status._vlen(x) for x in lines}
+    assert len(widths) == 1  # top, body, bottom all equal visible width
+
+
+def test_panel_ascii_fallback_when_no_color() -> None:
+    lines = status._panel("T", 1, ["body"], use_color=False)
+    assert lines[0].startswith("+-") and lines[-1].startswith("+-")
+    assert all("\033[" not in x for x in lines)
+
+
 def test_battery_and_load_gauge_colors_by_threshold() -> None:
     assert status._battery_color(100) == status._GREEN
     assert status._battery_color(45) == status._YELLOW
