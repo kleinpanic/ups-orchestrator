@@ -115,6 +115,9 @@ class Deps:
     serial_shutdown: Callable[[ShutdownTarget], tuple[int, str, str]] = _default_serial_shutdown
     now: Callable[[], int] = field(default_factory=lambda: lambda: int(time.time()))
     countdown_every: int = 60  # seconds between on-battery countdown posts; 0 = off
+    # A transfer must persist this many seconds before the poll loop pages ON
+    # BATTERY, so grid blips and battery self-tests (both brief) don't alarm.
+    onbatt_notify_grace: int = 20
     event_log: EventLogger = _noop_event_log
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
     sample_path: Path | None = None  # recorder JSONL, for draw-history sparklines
@@ -227,6 +230,7 @@ def handle_onbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     state.onbatt_since = now
     state.shutdowns_sent = []
     state.last_tick_notified = now  # delay first countdown by one cadence
+    state.onbatt_notified = True  # this path pages now, so the poll loop won't re-page
     state.last_status = snap.status
     _log_event(deps, "onbatt", ups, snap, "Utility power lost; UPS is on battery.")
     deps.notifier.send(
@@ -245,9 +249,11 @@ def handle_onbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     snap = deps.read_snapshot(ups.name)
     outage = None if state.onbatt_since is None else max(0, deps.now() - state.onbatt_since)
+    paged = state.onbatt_notified  # did this outage ever page ON BATTERY?
     state.onbatt_since = None
     state.shutdowns_sent = []
     state.last_tick_notified = None
+    state.onbatt_notified = False
     state.last_status = snap.status
     fields = _snapshot_fields(snap)
     if outage is not None:
@@ -258,16 +264,19 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
         ups,
         snap,
         "Utility power restored.",
-        {"outage_seconds": outage},
+        {"outage_seconds": outage, "paged": paged},
     )
-    deps.notifier.send(
-        Notification(
-            title=f"✅ {ups.label} — POWER RESTORED",
-            body="Back on utility power. Shutdown state has been reset.",
-            level=Level.SUCCESS,
-            fields=fields,
+    # Only announce restoration if we announced the outage — a sub-grace blip or a
+    # self-test transfer stays silent on both ends.
+    if paged:
+        deps.notifier.send(
+            Notification(
+                title=f"✅ {ups.label} — POWER RESTORED",
+                body="Back on utility power. Shutdown state has been reset.",
+                level=Level.SUCCESS,
+                fields=fields,
+            )
         )
-    )
 
 
 def handle_lowbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
@@ -646,11 +655,17 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
             snap,
             "Poll loop detected on-battery state before/without onbatt callback.",
         )
+
+    # Defer the page until the transfer has persisted past the grace window, so a
+    # brief blip or a battery self-test (which also transfers to battery) that
+    # clears within the window never alarms. Once sent, don't re-page this outage.
+    if not state.onbatt_notified and (now - state.onbatt_since) >= deps.onbatt_notify_grace:
+        state.onbatt_notified = True
         deps.notifier.send(
             Notification(
                 title=f"🔋 {ups.label} — ON BATTERY",
                 body=(
-                    "Poll loop detected the UPS on battery. "
+                    "Poll loop confirms the UPS on battery beyond the notify grace. "
                     "This covers cases where the NUT event callback is missed."
                 ),
                 level=Level.WARNING,
@@ -660,8 +675,13 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
     _run_shutdown_targets(ups, state, deps, snap)
 
-    if deps.countdown_every > 0 and (
-        state.last_tick_notified is None or (now - state.last_tick_notified) >= deps.countdown_every
+    if (
+        state.onbatt_notified
+        and deps.countdown_every > 0
+        and (
+            state.last_tick_notified is None
+            or (now - state.last_tick_notified) >= deps.countdown_every
+        )
     ):
         state.last_tick_notified = now
         _log_event(

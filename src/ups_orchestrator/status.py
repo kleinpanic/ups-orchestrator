@@ -25,7 +25,6 @@ _CLEAR_EOS = "\033[J"
 
 _BLOCKS = "▁▂▃▄▅▆▇█"
 _GAUGE_W = 14
-_SPARK_MIN = "▏"
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 

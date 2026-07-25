@@ -25,6 +25,10 @@ class UpsState:
     last_status: str | None = None
     recent_loads: list[int] = field(default_factory=list)
     last_load_step_notified: int | None = None
+    # True once the ON BATTERY page has been sent for the current outage — keeps a
+    # transfer that clears within the notify grace (a blip or our own self-test)
+    # from ever paging, and stops the poll loop re-paging a persistent outage.
+    onbatt_notified: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
@@ -48,6 +52,7 @@ class UpsState:
             last_status=str(data["last_status"]) if data.get("last_status") is not None else None,
             recent_loads=recent,
             last_load_step_notified=_opt_int(data.get("last_load_step_notified")),
+            onbatt_notified=bool(data.get("onbatt_notified", False)),
         )
 
 

@@ -282,6 +282,7 @@ class Config:
     upses: dict[str, UpsConfig]
     poll_seconds: int = 30
     countdown_every_seconds: int = 60
+    onbatt_notify_grace_seconds: int = 20
     shutdown_scope: str = "remote"  # legacy default; retained for config compatibility
     shutdown_policy: ShutdownPolicy = field(default_factory=ShutdownPolicy)
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
@@ -330,6 +331,7 @@ class Config:
             # poll_on_battery_seconds is the pre-0.3 name; honoured for back-compat.
             poll_seconds=_as_int(raw.get("poll_seconds", raw.get("poll_on_battery_seconds")), 30),
             countdown_every_seconds=_as_int(raw.get("countdown_every_seconds"), 60),
+            onbatt_notify_grace_seconds=max(0, _as_int(raw.get("onbatt_notify_grace_seconds"), 20)),
             shutdown_scope=global_scope,
             shutdown_policy=shutdown_policy,
             load_step=LoadStepPolicy.from_dict(raw.get("load_step")),
