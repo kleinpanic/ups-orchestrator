@@ -362,6 +362,10 @@ class BackupShutdown:
 
     enabled: bool = False
     kind: str = "remote"  # "remote" | "serial"
+    # MED-07: the raw sub-object, so operator keys inside ``backup`` survive a persist
+    # the way ``MonitoredMachine.raw`` makes top-level ones survive. Non-comparing and
+    # non-hashed, exactly like its parent's — it is provenance, not identity.
+    raw: dict[str, object] = field(default_factory=dict, compare=False)
 
     @classmethod
     def from_dict(cls, data: object) -> BackupShutdown:
@@ -370,10 +374,16 @@ class BackupShutdown:
         return cls(
             enabled=_as_bool(data.get("enabled"), False),
             kind=str(data.get("kind", "remote")),
+            raw=dict(data),
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {"enabled": self.enabled, "kind": self.kind}
+        # MED-07: merge rather than replace. The raw round-trip is documented as
+        # preserving operator-authored keys and did so at the TOP level only — this
+        # emitted exactly {enabled, kind} and overwrote whatever else the operator had
+        # written inside ``backup``, so an unrelated `monitor add` silently edited
+        # their file.
+        return {**self.raw, "enabled": self.enabled, "kind": self.kind}
 
 
 def derive_shutdown_method(ssh: str, ups: str, backup: BackupShutdown) -> str:
@@ -572,6 +582,15 @@ class MonitoredMachine:
             # carried across verbatim instead, which keeps the degrade idempotent and
             # keeps the notice quoting what they actually wrote.
             merged.setdefault("serial_baud", nested_serial["baud"])
+        # MED-07: the nested block was popped WHOLE, taking every key the flat lift
+        # does not read (a `parity`, an operator `_note`) with it. Re-emit the
+        # residue, minus the two keys the flat fields are now the authority for — so
+        # LO-14's "never two contradictory sources of truth" still holds, and the
+        # operator's other keys are not silently deleted by an unrelated command.
+        if isinstance(nested_serial, dict):
+            residue = {k: v for k, v in nested_serial.items() if k not in ("device", "baud")}
+            if residue:
+                merged["serial"] = residue
         return merged
 
 

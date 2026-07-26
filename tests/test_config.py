@@ -2180,3 +2180,46 @@ def test_disarm_target_does_not_raise_on_a_ups_whose_name_differs_from_its_key()
     _machines_out, _upses_out, notices = _apply_degrades(machines, {"cyberpower": ups})
 
     assert notices  # it reported rather than raising
+
+
+def test_to_dict_preserves_operator_sub_keys_under_backup_and_serial() -> None:
+    # MED-07. The raw round-trip is documented as preserving operator-authored keys and
+    # did so at the TOP level only: BackupShutdown.to_dict emitted exactly
+    # {enabled, kind}, and merged.pop("serial") took the nested block whole. An
+    # unrelated `monitor add`/`monitor remove` therefore silently edited the operator's
+    # file. Same class as HI-01, without the safety consequence.
+    record: dict[str, object] = {
+        "name": "mt",
+        "ups": "cyberpower",
+        "shutdown_method": "serial",
+        "_comment": "top level survives",
+        "backup": {"enabled": False, "kind": "remote", "_tag": "x"},
+        "serial": {"device": "/dev/ttyUSB0", "baud": 9600, "parity": "8N1", "_note": "keep me"},
+    }
+
+    out = MonitoredMachine.from_dict(record).to_dict()
+
+    assert out["_comment"] == "top level survives"
+    assert out["backup"] == {"enabled": False, "kind": "remote", "_tag": "x"}
+    # The flat fields stay the single authority for device/baud (LO-14)...
+    assert out["serial_device"] == "/dev/ttyUSB0"
+    assert out["serial_baud"] == 9600
+    # ...and the residue the flat lift cannot express is not destroyed.
+    assert out["serial"] == {"parity": "8N1", "_note": "keep me"}
+    # It is stable across a second persist, not merely preserved once.
+    assert MonitoredMachine.from_dict(out).to_dict() == out
+
+
+def test_to_dict_emits_no_serial_block_when_the_nested_form_had_nothing_extra() -> None:
+    # LO-14 unchanged for the ordinary shape: no residue, no stale block.
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "serial": {"device": "/dev/ttyUSB0", "baud": 9600}}
+    )
+    assert "serial" not in m.to_dict()
+
+
+def test_backup_raw_does_not_change_machine_equality() -> None:
+    # `raw` is provenance, not identity — compare=False, like MonitoredMachine.raw.
+    plain = BackupShutdown.from_dict({"enabled": True, "kind": "serial"})
+    tagged = BackupShutdown.from_dict({"enabled": True, "kind": "serial", "_tag": "x"})
+    assert plain == tagged
