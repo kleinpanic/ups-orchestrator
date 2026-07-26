@@ -1092,6 +1092,44 @@ def test_named_temporaryfile_confined_to_known_sites() -> None:
     )
 
 
+def test_installer_and_docs_grant_serial_device_access() -> None:
+    """IF-03: nothing shipped granted the serial transport's device access.
+
+    ``grep -rn dialout deploy/ docs/ Makefile README.md`` returned ZERO hits.
+    ``install.sh`` grants the ``nut`` group, ACLs on /etc and /var/lib, and a
+    poweroff sudoers entry — every privilege the daemon needs except the one the
+    serial transport needs, and the serial transport opens ``/dev/ttyUSB*`` ``"wb"``
+    from that same run-user-owned ``systemd --user`` unit. Fresh installs therefore
+    failed every serial push and every ``shutdown rehearse`` with PermissionError;
+    the development box masked it by already being in ``dialout``.
+
+    A source-level assertion is the honest oracle here: the fix IS a deployment
+    grant, and this suite must never add a user to a group or open a real device.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    install = (repo / "deploy" / "install.sh").read_text()
+    assert "usermod -aG dialout" in install, (
+        "deploy/install.sh does not grant the run user serial device access — every "
+        "serial push and 'shutdown rehearse' fails with PermissionError on a fresh "
+        "install (IF-03)"
+    )
+    assert '"$RUN_USER"' in install.split("usermod -aG dialout")[1][:20], (
+        "the dialout grant must target the run user that owns the systemd --user "
+        "watch unit, not root or a literal"
+    )
+
+    deployment = (repo / "docs" / "Deployment.md").read_text()
+    assert "dialout" in deployment, "docs/Deployment.md does not mention dialout (IF-03)"
+    # The second half of IF-03: the upssched dispatcher runs as `nut`, which is not
+    # in dialout, so the docs must answer whether the push is reachable from there
+    # rather than leaving it to fail during an outage.
+    # Whitespace-normalised: the claim must survive a markdown re-wrap.
+    assert "not reachable from the NUT event path" in " ".join(deployment.split()), (
+        "docs/Deployment.md must state plainly whether the serial push is reachable "
+        "from the `nut`-user upssched path (IF-03)"
+    )
+
+
 def test_no_bare_temp_rename_survives_anywhere_in_the_tree() -> None:
     """The other half of the same guard, and the one IF-02/IF-08 slipped through.
 
