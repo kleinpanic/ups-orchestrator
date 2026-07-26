@@ -18,6 +18,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# The single per-machine shutdown method (Option A). A machine carries exactly
+# one EFFECTIVE method: an active method (native/serial/ssh) is mutually exclusive
+# with a legacy shutdown_target on the same UPS. Unknown/blank coerces to "none"
+# (input-validation V5) so a typo can never spuriously activate a transport.
+SHUTDOWN_METHODS = frozenset({"none", "native", "serial", "ssh"})
+
 
 def normalize_ups_name(name: str) -> str:
     """Return the local NUT UPS name from values like ``ups@localhost``."""
@@ -239,6 +245,29 @@ class BackupShutdown:
         return {"enabled": self.enabled, "kind": self.kind}
 
 
+def derive_shutdown_method(
+    raw: dict[str, object], ssh: str, ups: str, backup: BackupShutdown
+) -> str:
+    """Derive the effective shutdown method for a record that predates ``shutdown_method``.
+
+    This is a BACK-COMPAT path only — a newly written record carries an explicit
+    ``shutdown_method`` and never reaches here. The has-ups => ``native`` branch is
+    evaluated FIRST so a Phase-1 native secondary (spark: ups set, backup
+    ``{enabled:false, kind:remote}``) derives to ``native``, never ``ssh``. The
+    ``backup`` projection fires ONLY when ``backup.enabled`` — an absent/disabled
+    backup parses as ``enabled=False, kind="remote"`` and must not turn a native
+    secondary into ssh.
+    """
+    if ups.strip():
+        return "native"
+    if backup.enabled:
+        kind = backup.kind.strip().lower()
+        if kind == "serial":
+            return "serial"
+        return "ssh"  # kind == "remote" (or unknown) maps to the ssh transport
+    return "none"
+
+
 @dataclass(frozen=True)
 class MonitoredMachine:
     """A NUT secondary enrolled via ``monitor add``.
@@ -257,6 +286,11 @@ class MonitoredMachine:
     shutdown_cmd: str = "/sbin/shutdown -h now"
     ip: str = ""  # resolved source IP for the nft saddr set
     backup: BackupShutdown = field(default_factory=BackupShutdown)
+    # The single effective shutdown method (Option A). Default "none"; a legacy
+    # record with no explicit value derives one via ``derive_shutdown_method``.
+    shutdown_method: str = "none"  # "none" | "native" | "serial" | "ssh"
+    serial_device: str = ""  # method == "serial": e.g. /dev/serial/by-id/...
+    serial_baud: int = 9600  # operator-declared; NEVER a silent 115200 (P2-08)
     # The original raw entry, so operator-authored keys (e.g. a per-machine
     # ``_comment``) survive an add/remove round-trip instead of being dropped by
     # a known-fields-only to_dict. Never carries a secret — the config holds none.
@@ -265,15 +299,74 @@ class MonitoredMachine:
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> MonitoredMachine:
         ssh = str(data.get("ssh", ""))
+        ups = str(data.get("ups", ""))
+        name = str(data.get("name", ssh or "machine"))
+        backup = BackupShutdown.from_dict(data.get("backup"))
+
+        # Serial transport fields. Accept flat top-level keys (the dataclass shape)
+        # and a nested ``serial: {device, baud}`` block (the authored form in
+        # RESEARCH §1); flat keys win. serial_baud has NO silent 115200 default.
+        serial_blk = data.get("serial")
+        serial_blk = serial_blk if isinstance(serial_blk, dict) else {}
+        serial_device = str(data.get("serial_device", serial_blk.get("device", "")))
+        serial_baud = _as_int(
+            data.get("serial_baud", serial_blk.get("baud")),
+            9600,
+        )
+
+        # Effective method: an explicit valid shutdown_method always wins; else a
+        # legacy record derives one. Unknown/blank explicit values coerce to "none"
+        # (V5, logged once). Derivation is logged once so an operator sees any
+        # mapping they did not write.
+        if "shutdown_method" in data:
+            raw_method = str(data.get("shutdown_method", "")).strip().lower()
+            if raw_method in SHUTDOWN_METHODS:
+                method = raw_method
+            else:
+                logger.warning(
+                    "monitored machine %r has unknown shutdown_method %r; "
+                    "coercing to 'none'",
+                    name,
+                    data.get("shutdown_method"),
+                )
+                method = "none"
+        else:
+            method = derive_shutdown_method(raw=data, ssh=ssh, ups=ups, backup=backup)
+            if method != "none":
+                logger.warning(
+                    "monitored machine %r has no explicit shutdown_method; "
+                    "derived %r from its legacy shape",
+                    name,
+                    method,
+                )
+
+        # A legacy backup {enabled:true, kind:serial} that derived to "serial" has
+        # no serial_device/serial_baud to project — refuse it with a migration
+        # error instead of silently producing an unfireable serial transport.
+        if (
+            "shutdown_method" not in data
+            and method == "serial"
+            and not serial_device
+        ):
+            raise ValueError(
+                f"monitored machine {name!r} has a legacy backup "
+                f"{{enabled:true, kind:serial}} but no serial device to project; "
+                f"set an explicit shutdown_method:'serial' with serial_device + "
+                f"serial_baud to migrate."
+            )
+
         return cls(
-            name=str(data.get("name", ssh or "machine")),
+            name=name,
             ssh=ssh,
-            ups=str(data.get("ups", "")),
+            ups=ups,
             powervalue=_as_int(data.get("powervalue"), 1),
             os=str(data.get("os", "auto")),
             shutdown_cmd=str(data.get("shutdown_cmd", "/sbin/shutdown -h now")),
             ip=str(data.get("ip", "")),
-            backup=BackupShutdown.from_dict(data.get("backup")),
+            backup=backup,
+            shutdown_method=method,
+            serial_device=serial_device,
+            serial_baud=serial_baud,
             raw=dict(data),
         )
 
@@ -291,6 +384,9 @@ class MonitoredMachine:
                 "shutdown_cmd": self.shutdown_cmd,
                 "ip": self.ip,
                 "backup": self.backup.to_dict(),
+                "shutdown_method": self.shutdown_method,
+                "serial_device": self.serial_device,
+                "serial_baud": self.serial_baud,
             }
         )
         return merged
@@ -322,7 +418,7 @@ class ShutdownTarget:
     host: str = ""
     user: str = ""
     device: str = ""  # serial: e.g. /dev/ttyUSB0
-    baud: int = 115200  # serial baud rate
+    baud: int = 9600  # serial baud rate (matches the live line; never 115200 — P2-08)
     cmd: str = "sudo /sbin/shutdown -h now"
     battery_below: int | None = None
     runtime_below: int | None = None
@@ -344,7 +440,7 @@ class ShutdownTarget:
             host=str(data.get("host", "")),
             user=str(data.get("user", "")),
             device=str(data.get("device", "")),
-            baud=_as_int(data.get("baud"), 115200),
+            baud=_as_int(data.get("baud"), 9600),
             cmd=str(data.get("cmd", "sudo /sbin/shutdown -h now")),
             battery_below=_opt_int(data.get("battery_below")),
             runtime_below=_opt_int(data.get("runtime_below")),
@@ -388,6 +484,31 @@ class UpsConfig:
             shutdown_policy=shutdown_policy or ShutdownPolicy(),
             load_step=LoadStepPolicy.from_dict(data["load_step"]) if "load_step" in data else None,
         )
+
+
+def validate_active_transports(
+    monitored_machines: tuple[MonitoredMachine, ...],
+) -> tuple[str, ...]:
+    """Return per-machine errors for effective methods with invalid transport params.
+
+    ``_as_int`` silently substitutes defaults (config.py:27), so a bad baud never
+    surfaces as a coercion failure — validation must be explicit. A serial method
+    with an empty ``serial_device`` or a non-positive ``serial_baud``, or an ssh
+    method with an empty ssh alias, is a load-time error (finding 3): otherwise
+    ``_default_serial_shutdown`` would open a bogus device or ssh would target no host.
+    """
+    errors: list[str] = []
+    for m in monitored_machines:
+        method = m.shutdown_method.strip().lower()
+        if method == "serial":
+            if not m.serial_device.strip():
+                errors.append(f"{m.name}: serial method with empty serial_device")
+            if m.serial_baud <= 0:
+                errors.append(f"{m.name}: serial method with non-positive serial_baud")
+        elif method == "ssh":
+            if not m.ssh.strip():
+                errors.append(f"{m.name}: ssh method with empty ssh alias")
+    return tuple(errors)
 
 
 def dual_regime_conflicts(
@@ -475,6 +596,12 @@ class Config:
             if isinstance(machines_raw, list)
             else ()
         )
+
+        transport_errors = validate_active_transports(monitored_machines)
+        if transport_errors:
+            raise ValueError(
+                "Invalid active shutdown transport(s): " + "; ".join(transport_errors)
+            )
 
         conflicts = dual_regime_conflicts(monitored_machines, upses)
         if conflicts:
