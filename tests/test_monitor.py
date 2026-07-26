@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1074,17 +1075,57 @@ def test_named_temporaryfile_confined_to_known_sites() -> None:
     # Source-level guard: the defect is a PATTERN (raw tempfile.NamedTemporaryFile
     # + bare .replace()), and the only durable defence against a third copy is a
     # test that notices the pattern re-appearing anywhere else under src/.
+    #
+    # IF-02/IF-08 narrowed this from two sites to one: `state.write_text_preserving_
+    # metadata` is now the whole project's writer, and `_monitor_persist` calls it
+    # rather than carrying its own copy.
     src_dir = Path(ups_orchestrator.__file__).parent
     hits = {
         str(path.relative_to(src_dir))
         for path in sorted(src_dir.rglob("*.py"))
         if "NamedTemporaryFile" in path.read_text()
     }
-    assert hits == {"cli.py", "state.py"}, (
-        "NamedTemporaryFile appeared outside cli.py/_monitor_persist and "
-        "state.py/StateStore.save (T-02-23, 02-09-PLAN.md) — a new temp-file "
-        "write must go through state.replace_preserving_metadata instead of "
-        "reimplementing the unprotected temp+replace idiom"
+    assert hits == {"state.py"}, (
+        "NamedTemporaryFile appeared outside state.write_text_preserving_metadata "
+        "(T-02-23, IF-02, IF-08) — a new temp-file write must go through that "
+        "helper instead of reimplementing the unprotected temp+replace idiom"
+    )
+
+
+def test_no_bare_temp_rename_survives_anywhere_in_the_tree() -> None:
+    """The other half of the same guard, and the one IF-02/IF-08 slipped through.
+
+    Confining ``NamedTemporaryFile`` to one module says nothing about a writer that
+    builds its temp path by hand — which is exactly what ``audit._write_marker``
+    (``path.with_suffix(".tmp")``) and the ``disable-live-shutdown-targets`` heredoc
+    did, in Python and in shell respectively, for the whole of Phase 2. Both ended in
+    a bare ``tmp.replace(dest)``, which hands the destination the temp file's mode,
+    owner and ACL (T-02-23). Scan ``src/`` AND ``deploy/``: the second one is where
+    the higher-blast-radius copy lived, and a guard that only reads ``src/`` would
+    have found nothing.
+
+    Log ROTATION is a different operation and deliberately not matched: there the
+    source is the real file, already carrying the metadata that should survive.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    # Anchored at statement start, so the prose in this repo that NAMES the pattern
+    # (the comments and docstrings recording IF-02/IF-08) is not itself an offender.
+    bare_rename = re.compile(r"^\s*tmp\w*\s*\.replace\s*\(")
+    offenders = []
+    for directory in (repo / "src", repo / "deploy"):
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file() or path.suffix not in (".py", ".sh"):
+                continue
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if bare_rename.search(line):
+                    offenders.append(f"{path.relative_to(repo)}:{lineno}: {line.strip()}")
+    # The single legitimate site: the rename inside the metadata-preserving helper
+    # itself, which has already carried mode/owner/ACL onto the temp file.
+    assert offenders == ["src/ups_orchestrator/state.py:276: tmp_path.replace(dest_path)"], (
+        "a bare temp-file rename over a destination reappeared (IF-02, IF-08, "
+        "T-02-23) — it strips the destination's mode, owner and ACL. Use "
+        "state.write_text_preserving_metadata / write_json_preserving_metadata:\n"
+        + "\n".join(offenders)
     )
 
 

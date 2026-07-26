@@ -276,6 +276,71 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
     tmp_path.replace(dest_path)
 
 
+def write_text_preserving_metadata(dest_path: Path, text: str) -> tuple[int, int, int, int] | None:
+    """Replace ``dest_path``'s contents with ``text``: temp + fsync + atomic rename.
+
+    THE writer for every file this project owns. Four call sites had grown their own
+    copy of this six-line dance — ``StateStore.save``, ``_monitor_persist``,
+    ``audit._write_marker`` and ``deploy/disable-live-shutdown-targets.sh`` — and two
+    of them (IF-02, IF-08) never got the ``replace_preserving_metadata`` migration
+    that T-02-23 introduced, so they kept the bare ``Path.replace`` that hands the
+    destination the TEMP file's 0600-owned-by-the-writer metadata. The
+    ``disable-live-shutdown-targets`` case is the sharp one: it is the documented way
+    to turn shutdown off, it runs as root against
+    ``/etc/ups-orchestrator/config.json``, and it silently took that file from
+    ``0640 root:nut`` plus the installer's ACL to the root umask default — i.e. made
+    a file holding a Discord webhook world-readable, with no warning and nothing
+    visibly broken.
+
+    A helper that only some writers use is how that recurred, so there is now one
+    helper and no writer outside it. ``tests/test_state.py`` greps for a bare
+    ``.replace(`` on a destination path to keep it that way.
+
+    The parent directory is created if absent, the temp file is unlinked on any
+    failure, and the fsync happens before the rename so a power loss cannot leave the
+    destination pointing at a partial inode.
+
+    Returns the ``_stat_key`` of the inode just written, read off the temp file
+    BEFORE the rename carries it into place. ``StateStore`` needs that identity to
+    tell its own write from another process's; callers that do not care ignore it.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=dest_path.parent,
+            prefix=f".{dest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(text)
+            # Durability: flush userspace + kernel buffers before the atomic rename,
+            # so a power loss right after it can't leave the destination pointing at
+            # a zero-length/partial inode. Matches recorder.py/jsonlog.py.
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        # Read the key off the TEMP inode, before the rename that carries it to the
+        # destination. Statting the destination afterwards would race a writer that
+        # got in first, and the caller would then adopt THEIR key as its own and
+        # never notice their content. `replace_preserving_metadata` may chmod and
+        # chown in between, and neither touches dev/ino/size/mtime_ns.
+        stamp = _stat_key(tmp_path)
+        replace_preserving_metadata(tmp_path, dest_path)
+        return stamp
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def write_json_preserving_metadata(dest_path: Path, payload: object, *, indent: int | None) -> None:
+    """``write_text_preserving_metadata`` for a JSON document, newline-terminated."""
+    write_text_preserving_metadata(
+        dest_path, json.dumps(payload, indent=indent, sort_keys=True) + "\n"
+    )
+
+
 def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
     """Identity of the file's CURRENT contents, or ``None`` when it is absent.
 
@@ -391,33 +456,6 @@ class StateStore:
         """Atomically persist all UPS states (write to temp, then replace)."""
         self._absorb_external_writes()
         payload = {name: asdict(st) for name, st in self._states.items()}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                tmp_path = Path(tmp.name)
-                json.dump(payload, tmp, indent=2, sort_keys=True)
-                tmp.write("\n")
-                # Durability: flush userspace + kernel buffers before the atomic
-                # rename, so a power loss right after replace() can't leave the
-                # state file pointing at a zero-length/partial inode. Matches the
-                # fsync in recorder.py/jsonlog.py.
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            # Read the key off the TEMP inode, before the rename that carries it to
-            # the destination. Statting the destination afterwards would race a
-            # writer that got in first, and we would then adopt THEIR key as ours and
-            # never reload their content. `replace_preserving_metadata` may chmod and
-            # chown in between, and neither touches dev/ino/size/mtime_ns.
-            stamp = _stat_key(tmp_path)
-            replace_preserving_metadata(tmp_path, self.path)
-            self._seen = stamp
-        finally:
-            if tmp_path is not None and tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
+        self._seen = write_text_preserving_metadata(
+            self.path, json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        )

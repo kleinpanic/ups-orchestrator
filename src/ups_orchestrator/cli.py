@@ -82,7 +82,7 @@ from ups_orchestrator.events import (
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
-from ups_orchestrator.state import StateStore, UpsState, replace_preserving_metadata
+from ups_orchestrator.state import StateStore, UpsState, write_json_preserving_metadata
 
 LOG = logging.getLogger("ups_orchestrator")
 
@@ -955,34 +955,17 @@ def _monitor_persist(cfg_path: Path, machines: list[dict[str, object]]) -> None:
     """Write monitored_machines back by mutating the RAW config dict, atomically.
 
     Unknown keys (e.g. a ``_comment``) are preserved because we round-trip the
-    parsed JSON rather than a frozen Config. The write is
-    temp+fsync+replace_preserving_metadata (state.py) so a crash mid-write
-    can't corrupt the file the watch service reads, and the replace itself
-    can't strip the mode/owner/ACL the installer gave the file (T-02-23).
-    The secondary password is never among the written fields.
+    parsed JSON rather than a frozen Config. The write goes through
+    ``state.write_json_preserving_metadata`` (temp + fsync + metadata-preserving
+    rename) so a crash mid-write can't corrupt the file the watch service reads, and
+    the rename itself can't strip the mode/owner/ACL the installer gave the file
+    (T-02-23). That helper is now the project's only writer: IF-02 and IF-08 were
+    two sites that had grown their own copy of this dance and never got the T-02-23
+    migration. The secondary password is never among the written fields.
     """
-    import tempfile
-
     raw = json.loads(cfg_path.read_text())
     raw["monitored_machines"] = machines
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=cfg_path.parent,
-            prefix=f".{cfg_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            tmp_path = Path(tmp.name)
-            json.dump(raw, tmp, indent=2, sort_keys=True)
-            tmp.write("\n")
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        replace_preserving_metadata(tmp_path, cfg_path)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    write_json_preserving_metadata(cfg_path, raw, indent=2)
 
 
 def _monitor_find(cfg: Config, name: str) -> MonitoredMachine | None:
