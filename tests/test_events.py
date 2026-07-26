@@ -1,13 +1,31 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator import events as events_mod
 from ups_orchestrator.config import MonitoredMachine, ShutdownTarget
-from ups_orchestrator.events import _default_serial_shutdown, dispatch, fmt_duration
+from ups_orchestrator.events import (
+    _default_local_shutdown,
+    _default_serial_shutdown,
+    _default_ssh_shutdown,
+    dispatch,
+    fmt_duration,
+)
 from ups_orchestrator.notify import Level
 from ups_orchestrator.state import UpsState
+
+SERIAL_DEVICE = "/dev/ttyUSB0"
+
+
+class _Proc:
+    """Minimal ``CompletedProcess`` stand-in: a return code and two streams."""
+
+    def __init__(self, rc: int, out: str = "", err: str = "") -> None:
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = err
 
 
 class _FakePort:
@@ -26,16 +44,61 @@ class _FakePort:
         return len(data) if data == b"\r" else self._cmd_written
 
 
-def _serial_target() -> ShutdownTarget:
+class _SerialWiring:
+    """What the serial runner actually did — no real device is ever involved."""
+
+    def __init__(self) -> None:
+        self.stty_argv: list[list[str]] = []
+        self.opened: list[str] = []
+
+
+def _wire_serial(
+    monkeypatch,
+    *,
+    device: str = SERIAL_DEVICE,
+    cmd_written: int | None = None,
+    stty: _Proc | None = None,
+    run_raises: BaseException | None = None,
+) -> _SerialWiring:
+    """Drive ``_default_serial_shutdown`` against fakes only.
+
+    ``cmd_written=None`` means the port is expected never to be opened. The attempt is
+    RECORDED rather than raised: the runner now converts every exception into a failure
+    tuple, so a probe that raised would be swallowed and read as an ordinary failure.
+    Assert on ``wiring.opened`` instead.
+    """
+    wiring = _SerialWiring()
+    completed = _Proc(0) if stty is None else stty
+
+    def fake_run(argv, **_kw):
+        wiring.stty_argv.append(list(argv))
+        if run_raises is not None:
+            raise run_raises
+        return completed
+
+    def fake_open(path, *_a, **_k):
+        wiring.opened.append(path)
+        return _FakePort(cmd_written or 0)
+
+    monkeypatch.setattr(events_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(events_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("builtins.open", fake_open)
+    return wiring
+
+
+def _serial_target(*, baud: int | None = 9600) -> ShutdownTarget:
     return ShutdownTarget(  # type: ignore[arg-type]
-        name="r630", kind="serial", enabled=True, device="/dev/ttyUSB0", cmd="poweroff"
+        name="r630",
+        kind="serial",
+        enabled=True,
+        device=SERIAL_DEVICE,
+        baud=baud,
+        cmd="poweroff",
     )
 
 
 def test_serial_short_write_reports_failure(monkeypatch) -> None:
-    monkeypatch.setattr(events_mod.subprocess, "run", lambda *a, **k: None)
-    monkeypatch.setattr(events_mod.time, "sleep", lambda _s: None)
-    monkeypatch.setattr("builtins.open", lambda *a, **k: _FakePort(cmd_written=0))
+    _wire_serial(monkeypatch, cmd_written=0)
 
     rc, _out, err = _default_serial_shutdown(_serial_target())
 
@@ -44,15 +107,125 @@ def test_serial_short_write_reports_failure(monkeypatch) -> None:
 
 
 def test_serial_full_write_succeeds(monkeypatch) -> None:
-    payload_len = len(b"poweroff\n")
-    monkeypatch.setattr(events_mod.subprocess, "run", lambda *a, **k: None)
-    monkeypatch.setattr(events_mod.time, "sleep", lambda _s: None)
-    monkeypatch.setattr("builtins.open", lambda *a, **k: _FakePort(cmd_written=payload_len))
+    _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"))
 
     rc, _out, err = _default_serial_shutdown(_serial_target())
 
     assert rc == 0
     assert err == ""
+
+
+# --- HI-06 (narrowed): a LOCAL line-configuration failure is reported ---------
+#
+# What is proven here is that `stty` rejected the configuration of the LOCAL tty.
+# Nothing in this section observes the far end: `stty -F <dev> <rate>` returns 0 for
+# 9600, 19200, 115200 *and* 0 alike, so a MISMATCHED far-end speed is not detectable
+# by this transport at all (deferred as OQ-02). Only a MALFORMED rate, or a path that
+# cannot be configured, produces the non-zero return code these tests pin.
+
+
+def test_serial_stty_failure_names_device_and_declared_baud(monkeypatch) -> None:
+    wiring = _wire_serial(monkeypatch, stty=_Proc(1, "", "stty: invalid argument '9600'"))
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert SERIAL_DEVICE in err
+    assert "9600" in err
+    assert "invalid argument" in err
+    assert wiring.opened == []  # nothing is written to a line that could not be configured
+
+
+def test_serial_stty_failure_does_not_open_the_port(monkeypatch) -> None:
+    wiring = _wire_serial(monkeypatch, cmd_written=None, stty=_Proc(1, "", "boom"))
+
+    _default_serial_shutdown(_serial_target())
+
+    assert wiring.opened == []
+
+
+def test_serial_declared_baud_reaches_stty_argv_and_the_failure_message(monkeypatch) -> None:
+    # The operator's declared rate is passed verbatim and echoed back on failure — the
+    # orchestrator never substitutes one (P2-08, as narrowed).
+    wiring = _wire_serial(monkeypatch, stty=_Proc(1, "", "unsupported"))
+
+    rc, _out, err = _default_serial_shutdown(_serial_target(baud=19200))
+
+    assert rc == 1
+    assert wiring.stty_argv == [["stty", "-F", SERIAL_DEVICE, "19200", "raw", "-echo"]]
+    assert "19200" in err
+
+
+def test_serial_zero_return_still_reaches_the_success_path(monkeypatch) -> None:
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"), stty=_Proc(0))
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert (rc, err) == (0, "")
+    assert wiring.opened == [SERIAL_DEVICE]
+
+
+# --- T-02-24: a transport runner returns a failure tuple, it never raises ------
+#
+# `state.shutdowns_sent.append` sits AFTER the runner call, so a RAISING runner never
+# marks the target sent, unwinds the whole tick, and the local targets are never
+# reached. `cyberpower` powers BOTH mt and eulerpi5 (this host), so a hung push to mt
+# starves the orchestrator's own poweroff on the battery the two of them share.
+
+
+def test_serial_runner_returns_failure_when_stty_times_out(monkeypatch) -> None:
+    # TimeoutExpired is NOT an OSError, so it escaped the old `except OSError`.
+    wiring = _wire_serial(
+        monkeypatch, run_raises=subprocess.TimeoutExpired(cmd="stty", timeout=5)
+    )
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert SERIAL_DEVICE in err
+    assert wiring.opened == []
+
+
+def test_ssh_runner_returns_failure_when_it_times_out(monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=20)
+
+    monkeypatch.setattr(events_mod.subprocess, "run", boom)
+    target = ShutdownTarget(name="srv", kind="remote", enabled=True, host="h", user="u")  # type: ignore[arg-type]
+
+    rc, _out, err = _default_ssh_shutdown(target)
+
+    assert rc == 1
+    assert "ssh" in err
+    assert "u@h" in err
+
+
+def test_local_runner_returns_failure_when_it_times_out(monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise subprocess.TimeoutExpired(cmd="shutdown", timeout=20)
+
+    monkeypatch.setattr(events_mod.subprocess, "run", boom)
+
+    rc, _out, err = _default_local_shutdown("/sbin/shutdown -h now")
+
+    assert rc == 1
+    assert "local" in err
+
+
+def test_local_runner_returns_failure_on_unbalanced_quote() -> None:
+    # shlex.split raises ValueError before subprocess.run is ever reached.
+    rc, _out, err = _default_local_shutdown('/sbin/shutdown -h "now')
+
+    assert rc == 1
+    assert "local" in err
+
+
+def test_local_runner_returns_failure_on_empty_command() -> None:
+    # subprocess.run([]) raises IndexError before any process is spawned.
+    rc, _out, err = _default_local_shutdown("   ")
+
+    assert rc == 1
+    assert "local" in err
 
 
 def _remote(name: str = "srv", **kw: object) -> ShutdownTarget:
@@ -331,13 +504,6 @@ def test_unknown_event_returns_false() -> None:
     assert dispatch("nonsense", make_ups(), UpsState(), deps) is False
 
 
-class _Proc:
-    def __init__(self, rc: int, out: str = "", err: str = "") -> None:
-        self.returncode = rc
-        self.stdout = out
-        self.stderr = err
-
-
 def test_ssh_shutdown_reports_returncode_and_dest(monkeypatch) -> None:
     from ups_orchestrator.events import _default_ssh_shutdown, ssh_dest
 
@@ -364,14 +530,74 @@ def test_ssh_dest_uses_host_alias_when_no_user() -> None:
 
 
 def test_local_shutdown_reports_returncode(monkeypatch) -> None:
-    from ups_orchestrator.events import _default_local_shutdown
-
     monkeypatch.setattr(
         events_mod.subprocess, "run", lambda *a, **k: _Proc(1, "", "no such command")
     )
     rc, _out, err = _default_local_shutdown("/sbin/shutdown -h now")
     assert rc == 1
     assert "no such command" in err
+
+
+# --- T-02-24 at the CALL SITE: an INJECTED runner that raises ------------------
+#
+# The per-runner handlers cover the three defaults. `Deps` carries injected runners
+# (tests, and any future transport) that they do not cover, and the invariant that
+# matters — shutdowns_sent is always appended and the local targets are always
+# reached — can only be guaranteed where the dispatch happens.
+
+
+def _record_events(deps) -> list[tuple[str, dict[str, object]]]:
+    seen: list[tuple[str, dict[str, object]]] = []
+    deps.event_log = lambda ev, _u, _s, _m, data: seen.append((ev, dict(data or {})))
+    return seen
+
+
+def test_fire_target_reports_a_raising_injected_runner() -> None:
+    notifier = FakeNotifier()
+    deps, _calls = make_deps(notifier, snap("OB LB", charge=8, runtime=90), countdown_every=0)
+    seen = _record_events(deps)
+
+    def boom(_target):
+        raise RuntimeError("the switch is dead")
+
+    deps.ssh_shutdown = boom
+    ups = make_ups("ups1", targets=(_remote("srv"),), shutdown_policy=shutdown_policy())
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+
+    assert state.shutdowns_sent == ["srv"]  # attempted-once still holds
+    results = [data for ev, data in seen if ev == "shutdown_result"]
+    assert len(results) == 1
+    assert results[0]["returncode"] == 1
+    assert "the switch is dead" in str(results[0]["stderr"])
+    assert "shutdown FAILED" in notifier.sent[-1].title
+
+
+def test_local_target_fires_even_when_the_remote_runner_raises() -> None:
+    # THE starvation regression. `cyberpower` powers BOTH mt and eulerpi5 — this host
+    # — so a hung push to mt used to drain the very battery meant to carry the
+    # orchestrator to a clean halt. A raising remote must not strand the local target.
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB LB", charge=8, runtime=90), countdown_every=0)
+
+    def boom(_target):
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=20)
+
+    deps.ssh_shutdown = boom
+    ups = make_ups(
+        "ups1",
+        targets=(_remote("srv"), _local("pi")),
+        shutdown_policy=shutdown_policy(
+            internal_enabled=True, internal_battery_below=10, internal_runtime_below=None
+        ),
+    )
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+
+    assert calls == ["local"]  # the raising remote recorded nothing; the local still fired
+    assert state.shutdowns_sent == ["srv", "pi"]
 
 
 # --- Phase 2: projecting monitored machines into ephemeral shutdown targets ----
