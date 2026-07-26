@@ -1,10 +1,55 @@
 # Shutdown mechanisms: SSH push vs. native NUT
 
-The orchestrator can power down UPS-fed machines three ways — `serial`, `remote`
-(SSH), and `local` (see [Shutdown targets](Shutdown-Targets.md)). The SSH path is
-the convenient one, and it is also the one with the most failure modes. This page
-describes that pathology honestly and asks whether NUT's own distributed-shutdown
-model is a better fit.
+Every enrolled machine (`monitored_machines[]`, see
+[Configuration](Configuration.md)) carries exactly one **effective
+`shutdown_method`**: `none`, `native`, `serial`, or `ssh`. `native` wraps NUT's
+own primary/secondary model (below); `serial` and `ssh` are the orchestrator's
+own **push** transports — it reaches out to the machine over a console cable or
+an SSH connection and sends the shutdown command itself. (The legacy
+per-UPS `shutdown_targets[]` array, described in
+[Shutdown Targets](Shutdown-Targets.md), predates the per-machine model and is
+kept only for back-compat; its `remote`/`serial`/`local` kinds map onto
+`shutdown_method` `ssh`/`serial`/(the local host, which has no
+`monitored_machines` entry at all).) The SSH push path is the convenient one,
+and it is also the one with the most failure modes. This page describes that
+pathology honestly and asks whether NUT's own distributed-shutdown model is a
+better fit.
+
+## Ordering: serial before ssh, and per-machine push vs. per-UPS native
+
+When more than one push-managed machine is due on the same UPS, **serial fires
+before ssh**: serial is network-independent (a console cable, not a route
+through the switch), while ssh dies with the network the same outage may be
+killing. The sort is stable, so declared order still holds within each
+transport.
+
+This is also the point where `native` and a push method are structurally
+different kinds of authority, not two options on a spectrum: `native` is a
+**per-UPS** mechanism — the remote secondary's own `upsmon` reacts to the
+*primary's* NUT-level FSD flag for that UPS, with no orchestrator involvement
+at fire time at all — while `serial`/`ssh` are **per-machine** decisions the
+orchestrator itself makes and executes, one machine at a time, on each poll.
+A `native` machine is therefore **never** projected onto a push attempt (doing
+so would shut it down twice); only `serial`/`ssh` machines are.
+
+**"UPS is close to empty" means two different things for the two authorities.**
+For a `serial`/`ssh` push, "close to empty" is the orchestrator's own
+configured `shutdown.external` group thresholds (`battery_below` /
+`runtime_below`) evaluated against the current snapshot — an operator-tunable
+gate. For `native`, the trigger is NUT's own low-battery (`LB`) condition on
+the primary, which is an entirely separate mechanism with its own thresholds
+configured in NUT itself, not in this orchestrator's config at all.
+
+**Local-last, and what that costs during an outage (D-7).** The watcher host's
+own `local` target — its own poweroff — is always held until every enabled
+remote/serial/push target on the same UPS has been *attempted* (not
+necessarily succeeded — see below). So each enrolled push machine on that UPS
+adds its own transport timeout to the delay before the watcher host powers
+itself off: the serial path's `stty` call plus a settle delay, or the ssh
+path's connect timeout, each running in turn. A push that **fails** does not
+block the local target — only a push that has not yet been *attempted* does —
+so a hung or unreachable machine slows the watcher's own shutdown by its
+timeout, but can never prevent it.
 
 ## What the SSH path actually does
 
@@ -102,10 +147,13 @@ It removes pathologies 2–5 outright — but it introduces **one new gap of its
     the secondaries are left up-but-blind until the feed returns. `upsmon` treats
     prolonged comm-loss as a *warning*, not a shutdown — by design. The durable fix
     is a **second, independent `upsd`** the secondaries also monitor (Option B,
-    deferred). The default-off serial/SSH backup below does **not** cover this hole:
-    it runs on the primary, so it dies with the primary and can't cross a dark
-    switch. See [Deployment → Known limitation: primary-dies-first](Deployment.md)
-    for the full covered/uncovered breakdown and the shipped Option A mitigation.
+    deferred). A `serial`/`ssh` push machine on the same box does **not** cover
+    this hole either: it still runs on the primary, so it dies with the primary
+    and can't cross a dark switch — and in any case a machine cannot be both
+    `native` and a push authority at once (see
+    [Configuration → mutual exclusion](Configuration.md)). See
+    [Deployment → Known limitation: primary-dies-first](Deployment.md) for the
+    full covered/uncovered breakdown and the shipped Option A mitigation.
 
 ## The honest trade-off
 
@@ -135,13 +183,18 @@ pushing SSH:
   self-triggers on its own `OB LB` (the primary here is `powervalue 0` for those
   UPSes and won't raise FSD for them). Credential-minimal, coordinated, no SSH
   fan-out.
-- **Serial** → keep as the **network-independent backstop** for the boxes that
-  matter most. This is the only path that survives the outage-network case, so it
-  is not replaceable by either SSH or native NUT.
-- **SSH / serial backup** → **default-off**, and positioned as a deadman *strictly
-  below* the native LB threshold: it fires only if native shutdown *didn't* while
-  the primary was still alive. It does **not** cover the primary-dies-first hole
-  (it dies with the primary) — that's what the future redundant `upsd` is for.
+- **Serial** → keep as the **network-independent** `shutdown_method` for the
+  boxes that matter most, enrolled with `monitor add --method serial`. This is
+  the only path that survives the outage-network case, so it is not
+  replaceable by either `ssh` or `native`.
+- **`serial` / `ssh` as a machine's shutdown_method** → default-off (the
+  central `shutdown.enabled` gate), and **mutually exclusive with `native`**
+  on the same machine — a machine takes exactly one shutdown authority, never
+  both. A native-plus-deadman regime (a push firing only as a last resort
+  strictly below a native secondary's own LB point) was considered for this
+  phase and **dropped**; it is deferred to a possible future phase. Neither
+  `serial` nor `ssh` covers the primary-dies-first hole (it dies with the
+  primary) — that's what the future redundant `upsd` is for.
 
 The per-box thresholds the current policy layer offers are the one thing plain FSD
 can't express; if that granularity is actually needed, it belongs at the primary's
