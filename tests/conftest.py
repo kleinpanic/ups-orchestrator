@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from ups_orchestrator.config import ShutdownGroupPolicy, ShutdownPolicy, ShutdownTarget, UpsConfig
+from ups_orchestrator.config import (
+    MonitoredMachine,
+    ShutdownGroupPolicy,
+    ShutdownPolicy,
+    ShutdownTarget,
+    UpsConfig,
+)
 from ups_orchestrator.events import Deps
 from ups_orchestrator.notify import DeliveryResult, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot
@@ -69,12 +75,23 @@ def make_deps(
     now: int = 1000,
     ssh_rc: int = 0,
     local_rc: int = 0,
+    serial_rc: int = 0,
     countdown_every: int = 60,
+    monitored_machines: tuple[MonitoredMachine, ...] = (),
+    serial_capture: list[tuple[str, int, str]] | None = None,
 ) -> tuple[Deps, list[str]]:
     """Build Deps wired to fakes; returns (deps, shutdown_calls).
 
     ``calls`` records remote target names and the literal ``"local"`` for the
     local host, in the order they fire.
+
+    ``serial_capture``, when supplied, additionally records the full
+    ``(device, baud, cmd)`` the serial runner was handed. ``calls`` only holds the
+    target name, which would let a wrong baud pass a test unnoticed — and a wrong
+    baud is a silent no-shutdown (P2-08).
+
+    No runner here touches a real host: every shutdown path is a closure, so a test
+    can drive an on-battery-and-low snapshot without any risk of a real power-off.
     """
     calls: list[str] = []
 
@@ -88,7 +105,9 @@ def make_deps(
 
     def _serial(target: ShutdownTarget) -> tuple[int, str, str]:
         calls.append(target.name)
-        return 0, "", ""
+        if serial_capture is not None:
+            serial_capture.append((target.device, target.baud, target.cmd))
+        return serial_rc, "", "" if serial_rc == 0 else "boom"
 
     deps = Deps(
         notifier=notifier,
@@ -98,6 +117,7 @@ def make_deps(
         serial_shutdown=_serial,
         now=lambda: now,
         countdown_every=countdown_every,
+        monitored_machines=monitored_machines,
     )
     return deps, calls
 

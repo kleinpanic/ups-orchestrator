@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator import events as events_mod
-from ups_orchestrator.config import ShutdownTarget
+from ups_orchestrator.config import MonitoredMachine, ShutdownTarget
 from ups_orchestrator.events import _default_serial_shutdown, dispatch, fmt_duration
 from ups_orchestrator.notify import Level
 from ups_orchestrator.state import UpsState
@@ -370,3 +372,133 @@ def test_local_shutdown_reports_returncode(monkeypatch) -> None:
     rc, _out, err = _default_local_shutdown("/sbin/shutdown -h now")
     assert rc == 1
     assert "no such command" in err
+
+
+# --- Phase 2: projecting monitored machines into ephemeral shutdown targets ----
+#
+# Every test below drives the real firing path with *injected* runners (conftest
+# make_deps). Nothing here can open a serial device, run ssh, or halt a host.
+
+# The live by-id path to mt's console; the line is 9600 baud, NOT 115200 (P2-08).
+MT_DEVICE = (
+    "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_CJAQb152808-if00-port0"
+)
+MT_CMD = "/sbin/shutdown -h now"
+SPARK_CMD = "sudo /sbin/shutdown -h +0"
+
+
+def _mt(*, ups: str = "ups1", baud: int = 9600, name: str = "mt") -> MonitoredMachine:
+    return MonitoredMachine(
+        name=name,
+        ups=ups,
+        shutdown_method="serial",
+        serial_device=MT_DEVICE,
+        serial_baud=baud,
+        shutdown_cmd=MT_CMD,
+    )
+
+
+def _spark(*, method: str = "ssh", ups: str = "ups1", name: str = "spark") -> MonitoredMachine:
+    return MonitoredMachine(
+        name=name,
+        ups=ups,
+        ssh="spark",
+        shutdown_method=method,
+        shutdown_cmd=SPARK_CMD,
+    )
+
+
+def _project(ups, machines) -> list[ShutdownTarget]:
+    from ups_orchestrator.events import _machine_targets
+
+    return list(_machine_targets(ups, machines))
+
+
+def _low() -> object:
+    """On battery and past the default external thresholds (15% / 300s)."""
+    return snap("OB LB", charge=8, runtime=90)
+
+
+def test_machine_targets_project_serial_and_ssh() -> None:
+    targets = _project(make_ups("ups1"), (_mt(), _spark()))
+
+    assert [t.name for t in targets] == ["mt", "spark"]
+    serial, ssh = targets
+    assert (serial.kind, serial.enabled, serial.device, serial.baud, serial.cmd) == (
+        "serial",
+        True,
+        MT_DEVICE,
+        9600,
+        MT_CMD,
+    )
+    assert (ssh.kind, ssh.enabled, ssh.host, ssh.cmd) == ("remote", True, "spark", SPARK_CMD)
+
+
+def test_machine_targets_native_exclusion() -> None:
+    # spark's upsmon secondary self-shuts on the primary's FSD. Projecting it as
+    # well would shut the box down twice (P2-06).
+    assert _project(make_ups("ups1"), (_spark(method="native"),)) == []
+
+
+def test_machine_targets_none_method_excluded() -> None:
+    assert _project(make_ups("ups1"), (MonitoredMachine(name="idle", ups="ups1"),)) == []
+
+
+def test_machine_targets_skip_other_ups() -> None:
+    assert _project(make_ups("ups1"), (_mt(ups="ups2"),)) == []
+    # ...and a host-suffixed UPS reference still matches its bare UPS name.
+    assert [t.name for t in _project(make_ups("ups1"), (_mt(ups="ups1@localhost"),))] == ["mt"]
+
+
+def test_machine_targets_duplicate_name_not_swallowed(caplog) -> None:
+    # shutdowns_sent is keyed on target name, so a second "mt" would be dropped by
+    # the dedupe with no trace. The projector drops it loudly instead.
+    with caplog.at_level(logging.ERROR, logger="ups_orchestrator.events"):
+        targets = _project(make_ups("ups1"), (_mt(), _mt()))
+
+    assert [t.name for t in targets] == ["mt"]
+    assert "mt" in caplog.text and "duplicate" in caplog.text.lower()
+
+
+def test_machine_targets_ignore_disabled_legacy_same_name() -> None:
+    # The migration shape: mt keeps a disabled legacy target and gains a machine
+    # record. The disabled target never fires, so it must not block the projection.
+    legacy = ShutdownTarget(name="mt", kind="serial", enabled=False, device="/dev/ttyUSB0")
+    assert [t.name for t in _project(make_ups("ups1", targets=(legacy,)), (_mt(),))] == ["mt"]
+
+
+def test_projection_fires_serial_before_ssh() -> None:
+    # Serial is network-independent; ssh dies with the switch. Order must not depend
+    # on the order the operator happened to declare the machines in.
+    for machines in ((_mt(), _spark()), (_spark(), _mt())):
+        notifier = FakeNotifier()
+        deps, calls = make_deps(
+            notifier, _low(), countdown_every=0, monitored_machines=machines
+        )
+        ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+        dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+        assert calls == ["mt", "spark"]
+
+
+def test_projection_keeps_local_last() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, _low(), countdown_every=0, monitored_machines=(_mt(), _spark())
+    )
+    ups = make_ups(
+        "ups1",
+        targets=(_local("pi"),),
+        shutdown_policy=shutdown_policy(internal_enabled=True, internal_battery_below=10),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+    assert calls == ["mt", "spark", "local"]
+
+
+def test_build_deps_wires_monitored_machines() -> None:
+    from ups_orchestrator.cli import _build_deps
+    from ups_orchestrator.config import Config
+
+    machines = (_mt(), _spark(method="native"))
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, monitored_machines=machines)
+
+    assert _build_deps(cfg).monitored_machines == machines
