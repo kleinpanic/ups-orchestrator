@@ -2358,3 +2358,40 @@ def test_add_dry_run_still_shows_operator_supplied_values(cfg_path, monkeypatch,
     assert "resolve ip: 192.168.1.114" in out
     assert "LISTEN 192.168.1.125" in out
     assert "'192.168.1.114'" in out  # ...and it reaches the previewed nft saddr set
+
+
+# --- ME-C3: --serial-device gets the loader's rule at the argparse boundary -----
+
+
+@pytest.mark.parametrize("device", ["/etc/passwd", "ttyUSB0", "/dev/", "../dev/ttyUSB0"])
+def test_add_refuses_a_serial_device_the_loader_would_disarm(cfg_path, device) -> None:
+    """The CLI must not accept a value `Config.load` disarms on the next read.
+
+    `--serial-baud` was strictly validated and `--serial-device` was checked only
+    for emptiness, so the operator got `recorded x (shutdown_method=serial)` for a
+    machine that will never shut down. The serial writer opens the device with mode
+    'wb', which TRUNCATES a regular file — which is why the loader has the rule.
+    """
+    before = cfg_path.read_text()
+    rc = cli.main(
+        [
+            "monitor", "add", "x", "--method", "serial", "--ups", "cyberpower",
+            "--serial-device", device, "--serial-baud", "9600",
+        ]
+    )
+    assert rc == 2
+    assert cfg_path.read_text() == before
+
+
+def test_add_serial_device_under_dev_is_still_accepted(cfg_path) -> None:
+    rc = cli.main(
+        [
+            "monitor", "add", "x", "--method", "serial", "--ups", "cyberpower",
+            "--serial-device", "/dev/serial/by-id/usb-console", "--serial-baud", "9600",
+        ]
+    )
+    assert rc == 0
+    # ...and the record it wrote survives the loader without a disarm — which is the
+    # property the CLI check exists to guarantee.
+    machine = cli._monitor_find(cli._load_config(), "x")
+    assert machine is not None and not machine.disarmed

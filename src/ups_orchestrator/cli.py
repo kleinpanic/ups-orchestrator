@@ -1435,8 +1435,27 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         )
         return 2
     if method == "serial":
-        if not args.serial_device.strip():
+        device = args.serial_device.strip()
+        if not device:
             LOG.error("monitor add: --method serial requires --serial-device (a path under /dev/)")
+            return 2
+        # ME-C3: the loader's own rule, applied at the argparse boundary. `--serial-baud`
+        # was strictly validated here and `--serial-device` was checked only for
+        # emptiness, so `--serial-device /etc/passwd` was accepted with a success
+        # message for a record `Config.load` disarms on the very next read. That is
+        # exactly the asymmetry the `_SSH_ALIAS_RE` comment at the top of this file
+        # forbids — a value the CLI accepts that the loader would disarm — one field
+        # over. Same predicate, same reason: the serial writer opens the device "wb".
+        if not device.startswith("/dev/") or device == "/dev/":
+            LOG.error(
+                "monitor add: --serial-device %r is not an absolute path under /dev/. "
+                "The serial writer opens it with mode 'wb', which TRUNCATES a regular "
+                "file — so a typo would destroy that file and still report success. "
+                "Config.load applies this same rule and would disarm the record, so "
+                "accepting it here would only report success for a machine that can "
+                "never shut down.",
+                args.serial_device,
+            )
             return 2
         baud = _strict_positive_baud(args.serial_baud)
         if baud is None:
