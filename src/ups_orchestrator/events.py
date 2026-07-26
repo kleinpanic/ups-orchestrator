@@ -37,7 +37,7 @@ from ups_orchestrator.config import (
     ShutdownGroupPolicy,
     ShutdownTarget,
     UpsConfig,
-    normalize_ups_name,
+    canonical_ups_key,
 )
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
@@ -573,8 +573,39 @@ def _fire_target(
     _notify_shutdown_result(ups, deps, target, rc, err, where)
 
 
+def _report_unprojectable(
+    ups: UpsConfig, machine: MonitoredMachine, deps: Deps | None, reason: str
+) -> None:
+    """Report a machine this UPS considered and then did NOT project.
+
+    NEW-3: the dropped machine never enters ``remotes``, so it would otherwise get
+    neither the ``shutdown_target_blocked`` event nor the notification every other
+    non-firing decision gets — leaving mid-outage syslog, the channel least likely to
+    be read, as the only trace of a machine that will not shut down. One reporting
+    path for every "projected nothing" decision, not one per reason.
+    """
+    LOG.error("Machine %r on UPS %s was not projected: %s", machine.name, ups.name, reason)
+    if deps is None:  # 02-02's two-argument call sites and tests
+        return
+    _log_event(
+        deps,
+        "shutdown_target_blocked",
+        ups,
+        None,
+        "Enrolled machine could not be projected onto a shutdown target.",
+        {"target": machine.name, "reason": reason},
+    )
+    deps.notifier.send(
+        Notification(
+            title=f"❗ {ups.label} — {machine.name} will NOT be shut down",
+            body=f"{machine.name} was not projected onto a shutdown target: {reason}",
+            level=Level.CRITICAL,
+        )
+    )
+
+
 def _machine_targets(
-    ups: UpsConfig, machines: Sequence[MonitoredMachine]
+    ups: UpsConfig, machines: Sequence[MonitoredMachine], deps: Deps | None = None
 ) -> Iterator[ShutdownTarget]:
     """Project this UPS's push-managed machines onto ephemeral shutdown targets.
 
@@ -591,24 +622,43 @@ def _machine_targets(
     ``stty -F <device> <baud>``, so a substituted baud writes garbage down the line
     and still returns rc=0 — a silent no-shutdown (P2-08).
 
+    The association is resolved through ``canonical_ups_key`` — the SAME
+    canonicalisation 02-06's detectors use — so a capitalisation cannot mean two
+    different things in two modules. A blank ``ups`` matches no UPS at all, including
+    one whose own name canonicalises to blank; ``Config.load`` disarms such a machine
+    with a notice rather than letting it look protected.
+
+    Projection reads EFFECTIVE state (``effective_method`` here,
+    ``effective_enabled`` for the legacy targets in ``seen``), so a machine or target
+    that ``Config.load`` disarmed is already excluded while its declaration on disk is
+    untouched. ``Config.load`` no longer rejects a machine that collides with an
+    enabled legacy target — it disarms one of them instead.
+
     The projected target is named after the machine, which is the
     ``state.shutdowns_sent`` dedupe key. A name already claimed on this UPS would
-    make the later target a no-op with no trace, so a collision is logged as an
-    error and dropped instead. ``Config.load`` already rejects a machine that
-    collides with an *enabled* legacy target, so in a loaded config this can only
-    trip on two machines sharing a name.
+    make the later target a no-op with no trace, so a collision is dropped and
+    reported through ``_report_unprojectable``.
     """
-    ups_name = normalize_ups_name(ups.name)
-    seen = {t.name.strip().lower() for t in ups.shutdown_targets if t.enabled}
+    ups_key = canonical_ups_key(ups.name)
+    seen = {t.name.strip().lower() for t in ups.shutdown_targets if t.effective_enabled}
     for m in machines:
-        if normalize_ups_name(m.ups) != ups_name:
+        if not m.ups.strip() or canonical_ups_key(m.ups) != ups_key:
             continue
-        method = m.shutdown_method.strip().lower()
+        method = m.effective_method.strip().lower()
         if method == "ssh":
             target = ShutdownTarget(
                 name=m.name, kind="remote", enabled=True, host=m.ssh, cmd=m.shutdown_cmd
             )
         elif method == "serial":
+            if m.serial_baud is None:
+                _report_unprojectable(
+                    ups,
+                    m,
+                    deps,
+                    "its declared serial_baud could not be parsed; declare a positive "
+                    "integer serial_baud (the live console here is 9600)",
+                )
+                continue
             target = ShutdownTarget(
                 name=m.name,
                 kind="serial",
@@ -621,11 +671,12 @@ def _machine_targets(
             continue
         key = m.name.strip().lower()
         if key in seen:
-            LOG.error(
-                "Machine %r on UPS %s has a duplicate shutdown target name; skipping its "
-                "push — rename it or that machine will never be shut down",
-                m.name,
-                ups.name,
+            _report_unprojectable(
+                ups,
+                m,
+                deps,
+                "it has a duplicate shutdown target name on this UPS; rename it or that "
+                "machine will never be shut down",
             )
             continue
         seen.add(key)
@@ -634,8 +685,8 @@ def _machine_targets(
 
 def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
     """Fire due targets — remotes first, locals only once all remotes are sent."""
-    projected = _machine_targets(ups, deps.monitored_machines)
-    enabled = [t for t in (*ups.shutdown_targets, *projected) if t.enabled]
+    projected = _machine_targets(ups, deps.monitored_machines, deps)
+    enabled = [t for t in (*ups.shutdown_targets, *projected) if t.effective_enabled]
     # Serial is network-independent; ssh dies with the switch. Fire serial first so a
     # collapsing network can't strand a shutdown. The sort is stable, so declared
     # order still holds within each transport.
