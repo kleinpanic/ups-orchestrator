@@ -799,6 +799,64 @@ def test_local_target_fires_even_when_the_remote_runner_raises() -> None:
     assert state.shutdowns_sent == ["srv", "pi"]
 
 
+class _RaisingNotifier(FakeNotifier):
+    """A notifier that dies the way a dead switch mid-outage makes it die."""
+
+    def send(self, note):  # noqa: ANN001, ANN201
+        super().send(note)
+        raise OSError("network is unreachable")
+
+
+def test_local_target_fires_even_when_the_shutdown_notifier_raises() -> None:
+    # HI-03. `_notify_shutdown_attempt` sat one line ABOVE `_fire_target`'s try, so a
+    # raising notifier propagated out of the firing path before the runner ran and
+    # before `shutdowns_sent` was appended — the exact T-02-24 starvation the backstop
+    # exists to prevent, one statement out of its reach. During an outage the switch is
+    # typically the first casualty, so this is the expected case, not an exotic one.
+    notifier = _RaisingNotifier()
+    deps, calls = make_deps(notifier, snap("OB LB", charge=8, runtime=90), countdown_every=0)
+    ups = make_ups(
+        "ups1",
+        targets=(_remote("srv"), _local("pi")),
+        shutdown_policy=shutdown_policy(
+            internal_enabled=True, internal_battery_below=10, internal_runtime_below=None
+        ),
+    )
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+
+    assert calls == ["srv", "local"]  # both transports still ran
+    assert state.shutdowns_sent == ["srv", "pi"]
+    assert notifier.sent  # ...and the attempt was genuinely tried, not skipped
+
+
+def test_a_raising_unprojectable_report_does_not_strand_the_other_targets() -> None:
+    # The `_report_unprojectable` half of HI-03: it is called from inside the
+    # `_machine_targets` generator, which is consumed by the `enabled = [...]`
+    # comprehension — so a raising notifier there escapes before ANY target has fired.
+    notifier = _RaisingNotifier()
+    machine = MonitoredMachine(
+        name="srv",  # collides with the legacy target's name -> unprojectable
+        ups="ups1",
+        ssh="srv",
+        shutdown_method="ssh",
+    )
+    deps, calls = make_deps(
+        notifier,
+        snap("OB LB", charge=8, runtime=90),
+        countdown_every=0,
+        monitored_machines=(machine,),
+    )
+    ups = make_ups("ups1", targets=(_remote("srv"),), shutdown_policy=shutdown_policy())
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+
+    assert calls == ["srv"]
+    assert state.shutdowns_sent == ["srv"]
+
+
 # --- Phase 2: projecting monitored machines into ephemeral shutdown targets ----
 #
 # Every test below drives the real firing path with *injected* runners (conftest

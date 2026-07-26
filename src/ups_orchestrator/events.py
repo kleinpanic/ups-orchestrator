@@ -303,6 +303,23 @@ def _log_event(
         LOG.exception("event log failed for %s/%s", ups.name, event)
 
 
+def _notify(deps: Deps, note: Notification) -> None:
+    """Send a notification on the SHUTDOWN path without ever raising out of it.
+
+    The mirror of ``_log_event``, and load-bearing for the same reason. The three
+    notify sites below sit on the path that powers machines off, and
+    ``state.shutdowns_sent`` is appended only after the transport returns — so a
+    notifier that raises (a dead switch mid-outage is the expected case) leaves the
+    target unmarked and the local hosts unreached, which is the T-02-24 starvation the
+    ``_fire_target`` backstop exists to prevent. ``_report_unprojectable`` raises out of
+    the ``_machine_targets`` generator instead, i.e. before anything has fired at all.
+    """
+    try:
+        deps.notifier.send(note)
+    except Exception:  # noqa: BLE001 - a notification must never break a shutdown
+        LOG.exception("shutdown notification failed")
+
+
 def _record_status_transition(
     ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot
 ) -> None:
@@ -508,13 +525,14 @@ def _notify_shutdown_attempt(
     fields = _snapshot_fields(snap)
     fields.insert(0, ("Target", f"{target.name} via {where}"))
     fields.insert(1, ("Trigger", reason))
-    deps.notifier.send(
+    _notify(
+        deps,
         Notification(
             title=f"🛑 {ups.label} — shutdown attempt for {target.name}",
             body="The orchestrator is issuing a configured shutdown command.",
             level=Level.CRITICAL,
             fields=fields,
-        )
+        ),
     )
 
 
@@ -524,20 +542,22 @@ def _notify_shutdown_result(
     if not ups.shutdown_policy.notify:
         return
     if rc == 0:
-        deps.notifier.send(
+        _notify(
+            deps,
             Notification(
                 title=f"🛑 {ups.label} — shutdown sent to {target.name}",
                 body=f"Graceful shutdown issued to {where}.",
                 level=Level.CRITICAL,
-            )
+            ),
         )
     else:
-        deps.notifier.send(
+        _notify(
+            deps,
             Notification(
                 title=f"❗ {ups.label} — shutdown FAILED for {target.name}",
                 body=f"rc={rc}; stderr={err or '(none)'}",
                 level=Level.CRITICAL,
-            )
+            ),
         )
 
 
@@ -567,13 +587,18 @@ def _fire_target(
         "Issuing configured shutdown target command.",
         {"target": target.name, "where": where, "reason": reason},
     )
-    _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
     # Backstop for the runner contract, and NOT redundant with the defaults' own
     # handlers: ``Deps`` carries injected runners (tests, any future transport) that
     # those handlers do not cover. Only the call site can guarantee the invariant that
     # matters — ``shutdowns_sent`` is always appended, so the local targets below are
     # always reached even when every remote blows up on a dead switch (T-02-24).
+    #
+    # HI-03: the attempt notification used to sit one line ABOVE this try, which put a
+    # blocking Discord POST — up to ~16.5 s of retries against a switch the outage just
+    # killed — outside the backstop's reach. It is inside now AND non-raising via
+    # ``_notify``, so no path can reach the runner without the append that follows it.
     try:
+        _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
         if target.is_local:
             rc, _out, err = deps.local_shutdown(target.cmd)
         elif target.is_serial:
@@ -616,12 +641,13 @@ def _report_unprojectable(
         "Enrolled machine could not be projected onto a shutdown target.",
         {"target": machine.name, "reason": reason},
     )
-    deps.notifier.send(
+    _notify(
+        deps,
         Notification(
             title=f"❗ {ups.label} — {machine.name} will NOT be shut down",
             body=f"{machine.name} was not projected onto a shutdown target: {reason}",
             level=Level.CRITICAL,
-        )
+        ),
     )
 
 
