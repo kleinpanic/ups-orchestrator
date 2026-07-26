@@ -24,15 +24,17 @@ import logging
 import shlex
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ups_orchestrator.config import (
     LoadStepPolicy,
+    MonitoredMachine,
     ShutdownGroupPolicy,
     ShutdownTarget,
     UpsConfig,
+    normalize_ups_name,
 )
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
@@ -121,6 +123,10 @@ class Deps:
     event_log: EventLogger = _noop_event_log
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
     sample_path: Path | None = None  # recorder JSONL, for draw-history sparklines
+    # Enrolled machines, projected onto ephemeral shutdown targets by
+    # ``_machine_targets``. Empty by default so a handler built without config
+    # (tests, one-off dispatch) pushes to nothing.
+    monitored_machines: tuple[MonitoredMachine, ...] = ()
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -479,10 +485,73 @@ def _fire_target(
     _notify_shutdown_result(ups, deps, target, rc, err, where)
 
 
+def _machine_targets(
+    ups: UpsConfig, machines: Sequence[MonitoredMachine]
+) -> Iterator[ShutdownTarget]:
+    """Project this UPS's push-managed machines onto ephemeral shutdown targets.
+
+    A machine's ``shutdown_method`` selects the *transport*; the existing
+    ``ShutdownPolicy`` gate still decides *whether and when*. The projected targets
+    are handed to the unchanged firing path, so no new shutdown or transport logic
+    exists anywhere.
+
+    ``native`` machines are deliberately never projected: their ``upsmon`` secondary
+    powers itself off on the primary's FSD, so a push as well would shut the box
+    down twice (P2-01/P2-06). ``none`` machines opted out of shutdown entirely.
+
+    ``serial_baud`` is carried verbatim. ``_default_serial_shutdown`` runs
+    ``stty -F <device> <baud>``, so a substituted baud writes garbage down the line
+    and still returns rc=0 — a silent no-shutdown (P2-08).
+
+    The projected target is named after the machine, which is the
+    ``state.shutdowns_sent`` dedupe key. A name already claimed on this UPS would
+    make the later target a no-op with no trace, so a collision is logged as an
+    error and dropped instead. ``Config.load`` already rejects a machine that
+    collides with an *enabled* legacy target, so in a loaded config this can only
+    trip on two machines sharing a name.
+    """
+    ups_name = normalize_ups_name(ups.name)
+    seen = {t.name.strip().lower() for t in ups.shutdown_targets if t.enabled}
+    for m in machines:
+        if normalize_ups_name(m.ups) != ups_name:
+            continue
+        method = m.shutdown_method.strip().lower()
+        if method == "ssh":
+            target = ShutdownTarget(
+                name=m.name, kind="remote", enabled=True, host=m.ssh, cmd=m.shutdown_cmd
+            )
+        elif method == "serial":
+            target = ShutdownTarget(
+                name=m.name,
+                kind="serial",
+                enabled=True,
+                device=m.serial_device,
+                baud=m.serial_baud,
+                cmd=m.shutdown_cmd,
+            )
+        else:
+            continue
+        key = m.name.strip().lower()
+        if key in seen:
+            LOG.error(
+                "Machine %r on UPS %s has a duplicate shutdown target name; skipping its "
+                "push — rename it or that machine will never be shut down",
+                m.name,
+                ups.name,
+            )
+            continue
+        seen.add(key)
+        yield target
+
+
 def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
     """Fire due targets — remotes first, locals only once all remotes are sent."""
-    enabled = [t for t in ups.shutdown_targets if t.enabled]
-    remotes = [t for t in enabled if not t.is_local]
+    projected = _machine_targets(ups, deps.monitored_machines)
+    enabled = [t for t in (*ups.shutdown_targets, *projected) if t.enabled]
+    # Serial is network-independent; ssh dies with the switch. Fire serial first so a
+    # collapsing network can't strand a shutdown. The sort is stable, so declared
+    # order still holds within each transport.
+    remotes = sorted((t for t in enabled if not t.is_local), key=lambda t: not t.is_serial)
     locals_ = [t for t in enabled if t.is_local]
 
     for t in remotes:

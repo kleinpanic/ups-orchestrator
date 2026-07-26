@@ -155,6 +155,7 @@ def _build_deps(cfg: Config) -> Deps:
         event_log=_event_log,
         load_step=cfg.load_step,
         sample_path=_sample_path(),
+        monitored_machines=cfg.monitored_machines,
     )
 
 
