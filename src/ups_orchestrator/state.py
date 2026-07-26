@@ -66,6 +66,9 @@ def _opt_int(value: object) -> int | None:
 
 
 _ACL_XATTR = "system.posix_acl_access"
+# Bound the ACL helpers so a wedged filesystem cannot hang the poll loop (MED-02).
+# Matches the timeout _default_serial_shutdown already puts on its stty.
+_ACL_TIMEOUT = 5
 
 
 def _has_posix_acl(path: Path) -> bool:
@@ -97,15 +100,30 @@ def _copy_acl(dest_path: Path, tmp_path: Path) -> bool:
     warning and return rather than raise — a persist that cannot copy an ACL
     must still complete, because refusing to write is worse than a narrower
     ACL.
+
+    MED-02: both calls are bounded by ``timeout``. This runs on ``StateStore.save``,
+    which the watch loop runs every poll, so on a stale NFS/CIFS mount or a wedged
+    FUSE filesystem an unbounded ``getfacl`` blocks in D state and takes
+    ``handle_tick`` with it — no traceback, no exit, and ``Restart=always`` never
+    fires because the process is still alive. That is the T-02-25 hang class this
+    phase graded CRITICAL. ``TimeoutExpired`` is NOT an ``OSError``, so it is caught
+    by name.
+
+    LO-08: the path is ``--``-terminated. No shell is involved, so there is no
+    injection, but a path beginning with ``-`` (operator-supplied via
+    ``--config``/``--state``) would otherwise be parsed as an option.
     """
     try:
         got = subprocess.run(
             ["getfacl", "--omit-header", "--", str(dest_path)],
             capture_output=True,
             text=True,
+            timeout=_ACL_TIMEOUT,
         )
-    except OSError as exc:
-        logger.warning("could not read ACL of %s (getfacl unavailable?): %s", dest_path, exc)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "could not read ACL of %s (getfacl unavailable or hung?): %s", dest_path, exc
+        )
         return False
     if got.returncode != 0:
         logger.warning("could not read ACL of %s: %s", dest_path, got.stderr.strip())
@@ -116,10 +134,11 @@ def _copy_acl(dest_path: Path, tmp_path: Path) -> bool:
             input=got.stdout,
             capture_output=True,
             text=True,
+            timeout=_ACL_TIMEOUT,
         )
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning(
-            "could not apply ACL preserving %s (setfacl unavailable?): %s", dest_path, exc
+            "could not apply ACL preserving %s (setfacl unavailable or hung?): %s", dest_path, exc
         )
         return False
     if applied.returncode != 0:

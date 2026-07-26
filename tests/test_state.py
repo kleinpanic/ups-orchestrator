@@ -236,3 +236,29 @@ def test_save_payload_roundtrips_through_reload(tmp_path) -> None:
     st = reloaded.get("ups1")
     assert st.onbatt_since == 42
     assert st.shutdowns_sent == ["low_battery"]
+
+
+def test_save_completes_when_the_acl_helpers_hang(monkeypatch, tmp_path, caplog) -> None:
+    # MED-02. _copy_acl is on StateStore.save, which the watch loop runs every poll.
+    # An unbounded getfacl on a stale NFS/CIFS mount or a wedged FUSE filesystem
+    # blocks in D state and takes handle_tick with it — no traceback, no exit, and
+    # Restart=always never fires because the process is still alive. That is the
+    # T-02-25 hang class, in code merged in the same phase. TimeoutExpired is not an
+    # OSError, so the old `except OSError` would not have caught it either.
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+
+    seen: list[float | None] = []
+
+    def _hung(argv, **kw):  # noqa: ANN001, ANN003
+        seen.append(kw.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd=argv[0], timeout=kw.get("timeout") or 0)
+
+    monkeypatch.setattr(state_mod.subprocess, "run", _hung)
+    with caplog.at_level("WARNING"):
+        store.save()  # must return, not hang and not raise
+
+    assert seen and all(t == 5 for t in seen)  # every ACL call is bounded
+    assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 1
