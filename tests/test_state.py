@@ -297,3 +297,30 @@ def test_state_store_save_through_a_symlink_keeps_the_link(tmp_path) -> None:
 
     assert link.is_symlink()
     assert json.loads(real.read_text())["ups1"]["onbatt_since"] == 7
+
+
+def test_chown_eperm_as_root_is_logged_and_as_a_user_is_not(monkeypatch, tmp_path, caplog) -> None:
+    # MED-08. "Expected for an unprivileged writer" is true; as ROOT an EPERM from
+    # chown means a restricted-capability container, an immutable attribute or an
+    # idmapped mount, and the file then silently keeps the writer's ownership. T-02-23
+    # exists because the live box lost its ACL and nobody noticed for weeks; silencing
+    # the one signal that would show a recurrence recreates the conditions.
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+
+    def _eperm(*_a, **_k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(state_mod.os, "chown", _eperm)
+
+    monkeypatch.setattr(state_mod.os, "geteuid", lambda: 1000)
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    with caplog.at_level("WARNING"):
+        store.save()
+    assert caplog.records == []  # an unprivileged writer stays quiet
+
+    monkeypatch.setattr(state_mod.os, "geteuid", lambda: 0)
+    with caplog.at_level("WARNING"):
+        store.save()
+    assert any("as root" in rec.message for rec in caplog.records)

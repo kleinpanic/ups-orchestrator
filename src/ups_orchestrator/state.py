@@ -216,8 +216,22 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
             logger.warning("could not preserve mode of %s: %s", dest_path, exc)
         try:
             os.chown(tmp_path, st.st_uid, st.st_gid)
-        except PermissionError:
-            pass  # expected for an unprivileged writer; not actionable
+        except PermissionError as exc:
+            # MED-08: the "expected, not actionable" rationale holds for an
+            # unprivileged writer and NOT otherwise. EPERM from chown as root means
+            # something genuinely unexpected — a restricted-capability container, an
+            # immutable attribute, an idmapped mount — and the file then silently
+            # keeps the writer's ownership, which is how T-02-23's live box lost its
+            # ACL unnoticed for weeks. Keep the quiet path narrow rather than
+            # silencing the one signal that would show a recurrence.
+            if os.geteuid() == 0:
+                logger.warning(
+                    "could not preserve owner/group of %s as root: %s", dest_path, exc
+                )
+            else:
+                logger.debug(
+                    "not preserving owner/group of %s (unprivileged writer): %s", dest_path, exc
+                )
         except OSError as exc:
             logger.warning("could not preserve owner/group of %s: %s", dest_path, exc)
     tmp_path.replace(dest_path)
