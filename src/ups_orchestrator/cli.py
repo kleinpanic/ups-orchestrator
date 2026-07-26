@@ -148,9 +148,19 @@ def _boot_audit_marker_path() -> Path:
 
 
 def _load_config() -> Config | None:
+    """Load the config, or ``None`` on a fatal problem. Never raises.
+
+    F4: ``ArithmeticError`` is a BACKSTOP, not the fix. `json.loads` maps
+    `Infinity` and `1e400` to `float('inf')` and `int(inf)` raises `OverflowError`,
+    which is an ArithmeticError and not a ValueError, so it walked past this clause
+    as an uncaught traceback. The real fix is that `_as_int`/`_opt_int` now fall
+    back instead of raising — a bad number in a monitoring knob must DEGRADE, not
+    be fatal (RA-01). This clause is here so the next numeric escape is a clean
+    error rather than a crash.
+    """
     try:
         return Config.load(_config_path())
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, ArithmeticError) as exc:
         LOG.error("Failed to load config: %s", exc)
         return None
 

@@ -34,11 +34,26 @@ def normalize_ups_name(name: str) -> str:
 
 
 def _as_int(value: object, default: int) -> int:
-    """Coerce an untyped JSON value to int, falling back to ``default``."""
+    """Coerce an untyped JSON value to int, falling back to ``default``.
+
+    F4: the float branch had no guard, and ``json.loads`` maps the bare tokens
+    ``Infinity``/``-Infinity`` and any overflowing literal (``1e400``) to
+    ``float('inf')``. ``int(inf)`` raises **OverflowError**, which is an
+    ``ArithmeticError`` and NOT a ``ValueError``, so it escaped both this function
+    and ``_load_config``'s ``(OSError, ValueError)``. It reaches six fields
+    including ``poll_seconds`` — a monitoring knob, not a shutdown authority — so
+    an unparseable number there killed the daemon, in breach of RA-01's rule that
+    only the seven structural classes may. ``NaN`` raises ``ValueError`` from the
+    same expression, which was equally uncaught here. Both fall back now, the way
+    every other malformed value in this loader does.
+    """
     if isinstance(value, bool):  # bool is an int subclass; treat as absent
         return default
     if isinstance(value, (int, float)):
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, OverflowError):  # NaN / ±inf
+            return default
     if isinstance(value, str):
         try:
             return int(value)
@@ -189,11 +204,18 @@ def is_disarming(notice: ConfigNotice) -> bool:
 
 
 def _opt_int(value: object) -> int | None:
-    """Coerce to int, or ``None`` if absent/blank/invalid."""
+    """Coerce to int, or ``None`` if absent/blank/invalid.
+
+    F4: same escape as ``_as_int`` — ``int(float('inf'))`` is an OverflowError and
+    ``int(float('nan'))`` a ValueError, and the float branch guarded neither.
+    """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, OverflowError):  # NaN / ±inf
+            return None
     if isinstance(value, str) and value.strip():
         try:
             return int(value)
