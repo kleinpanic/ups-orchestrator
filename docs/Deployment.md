@@ -176,6 +176,36 @@ administers that box, and Phase 2 ships **code only**: nothing here has been
 carried out against a live host as part of this phase, and `shutdown.enabled`
 stays `false` in production.
 
+### Primary-side prerequisite: device access (`dialout`)
+
+Before any of the far-end setup below matters, the **primary** must be able to
+open the serial device at all. `deploy/install.sh` adds the run user to
+`dialout`, which is the group Debian puts `/dev/ttyUSB*` and `/dev/ttyS*` in:
+
+```bash
+id -nG "$USER" | tr ' ' '\n' | grep -qx dialout || echo "NOT in dialout"
+# group membership only takes effect on a new login session:
+sudo usermod -aG dialout "$USER" && echo "log out and back in"
+```
+
+Without it every serial push and every `ups-orchestrator shutdown rehearse`
+fails with `PermissionError` on the device open — the watch loop runs as your
+user under `systemd --user`, not as root. Group changes do **not** apply to an
+already-running session or an already-started user service, so after a fresh
+install: re-login, then `systemctl --user restart ups-orchestrator-watch`.
+
+**The `nut` user is deliberately not in `dialout`, and does not need to be.**
+The upssched dispatcher runs as `nut`, but the shipped
+`deploy/nut/upssched.conf.snippet` only wires `ONBATT`, `ONLINE`, `LOWBATT`,
+`COMMBAD` and `COMMOK` — none of which reach the push gate (see
+[Shutdown-Mechanisms](Shutdown-Mechanisms.md)). **The serial push is not
+reachable from the NUT event path at all**; it fires from the poll loop, which
+runs as your user. If you add an `AT ... EXECUTE remote_shutdown` rule to
+`upssched.conf`, you must add `nut` to `dialout` too — otherwise that rule
+fails with `PermissionError` at the one moment it exists to work.
+
+### Far-end prerequisites
+
 A `serial` push writes a shutdown command into a passwordless/auto-login getty
 on the target's console tty. Three prerequisites, **scoped to that one serial
 tty only** — none of this should loosen SSH or the physical console login:
@@ -277,6 +307,12 @@ This installs:
   `sudo /opt/ups-orchestrator/venv/bin/pip install matplotlib` (or
   `pip install ups-orchestrator[dashboard]`). Without it the report still sends;
   the image is skipped with a logged warning.
+- `ups-orchestrator-selftest.timer` / `.service`: weekly NUT battery self-test
+  with a Discord alert on failure. **Installed but not enabled** — the test
+  discharges the pack, and it needs a NUT admin account (`instcmds` in
+  `/etc/nut/upsd.users`) exported as `UPS_NUT_ADMIN_USER` /
+  `UPS_NUT_ADMIN_PASSWORD` in `/etc/ups-orchestrator.env`. Arming it is your
+  call: `systemctl --user enable --now ups-orchestrator-selftest.timer`.
 
 You can test the report path immediately:
 
@@ -304,6 +340,7 @@ ups-orchestrator logs notifications
 | `~/.config/systemd/user/ups-orchestrator-watch.service` | the poll loop |
 | `~/.config/systemd/user/ups-orchestrator-recorder.service` | telemetry recorder |
 | `~/.config/systemd/user/ups-orchestrator-report.timer` | daily UPS load report |
+| `~/.config/systemd/user/ups-orchestrator-selftest.timer` | weekly battery self-test (installed, **not enabled**) |
 
 Your real device ids, IPs, and the webhook stay on the machine under `/etc`;
 none of that is in the repo.

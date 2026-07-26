@@ -133,6 +133,62 @@ def test_http_endpoints_round_trip(monkeypatch, tmp_path) -> None:
         thread.join(timeout=5)
 
 
+def test_handler_serves_the_live_config_not_the_one_captured_at_startup(
+    monkeypatch, tmp_path
+) -> None:
+    """IF-06: `serve()` captured `cfg` once, so both surfaces froze at process start.
+
+    LO-07 closed the "banner never updates" half by rendering `st.degraded`
+    client-side — but the payload it renders came from the startup config, so both
+    surfaces became equally stale rather than fresh. An operator who fixed a degraded
+    config and reloaded still saw the banner; a config that degraded afterwards
+    showed a healthy dashboard indefinitely.
+    """
+    monkeypatch.setattr(webui, "read_snapshot", lambda _n: _SNAP)
+    healthy = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    degraded = Config(
+        webhook_url="",
+        upses={"ups1": make_ups("ups1")},
+        degraded=(ConfigNotice(severity="error", subject="mt", message="no serial device"),),
+    )
+    live = {"cfg": healthy}
+    samples = tmp_path / "samples.jsonl"
+    samples.write_text("")
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        webui.make_handler(healthy, samples, reload_config=lambda: live["cfg"]),
+    )
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=5) as r:
+            assert json.loads(r.read())["degraded"] == []
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+            assert b'<div class="degraded"' not in r.read()
+
+        live["cfg"] = degraded  # the config degrades while the server keeps running
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=5) as r:
+            assert json.loads(r.read())["degraded"] == [
+                {"severity": "error", "subject": "mt", "message": "no serial device"}
+            ], "/api/status served the config captured at startup (IF-06)"
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+            assert b"no serial device" in r.read(), "the server-rendered banner froze (IF-06)"
+
+        live["cfg"] = healthy  # ...and the other direction, which matters more
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+            assert b'<div class="degraded"' not in r.read(), (
+                "the banner outlived the degrade it reported"
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_the_degraded_payload_is_actually_rendered_client_side() -> None:
     # LO-07: status_payload has carried `degraded` since 02-08 and the shipped
     # refresh() ignored it — the banner came only from the server-rendered `/`, so a

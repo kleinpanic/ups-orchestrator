@@ -12,6 +12,7 @@ from ups_orchestrator.config import Config
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
+from ups_orchestrator.state import write_json_preserving_metadata
 
 _POWER_LOSS_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -531,10 +532,13 @@ def _read_marker(path: Path) -> str | None:
 
 
 def _write_marker(path: Path, boot_id: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({"boot_id": boot_id}, sort_keys=True) + "\n")
-    tmp.replace(path)
+    # IF-08: this was a bare `tmp.replace(path)` — the same pattern state.py
+    # documents as destroying the destination inode's mode, owner and ACL (T-02-23).
+    # Lower blast radius than IF-02 because `install.sh` puts a DEFAULT ACL on
+    # /var/lib/ups-orchestrator so a new inode inherits it, but the same unmigrated
+    # class, and "lower blast radius" is not a property this file controls — an
+    # operator who moves the marker with $UPS_ORCH_STATE takes the default ACL away.
+    write_json_preserving_metadata(path, {"boot_id": boot_id}, indent=None)
 
 
 def send_boot_audit(

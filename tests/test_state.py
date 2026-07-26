@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -238,6 +239,196 @@ def test_save_payload_roundtrips_through_reload(tmp_path) -> None:
     st = reloaded.get("ups1")
     assert st.onbatt_since == 42
     assert st.shutdowns_sent == ["low_battery"]
+
+
+# --- IF-02: the shipped "turn shutdown off" script ----------------------------
+
+
+def _disable_script():  # noqa: ANN202 — a loaded module object
+    """Load ``deploy/disable-shutdown-targets.py`` without spawning anything."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "deploy" / "disable-shutdown-targets.py"
+    spec = importlib.util.spec_from_file_location("_disable_shutdown_targets", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_disable_script_keeps_the_live_configs_mode_owner_and_acl(tmp_path) -> None:
+    """IF-02: the documented way to turn shutdown off must not widen the config.
+
+    ``install.sh`` writes ``/etc/ups-orchestrator/config.json`` as ``0640 root:nut``
+    plus ``setfacl -m u:<run-user>:r``, and the file holds a Discord webhook URL. The
+    script's heredoc ended in a bare ``tmp.replace(path)``, so running it as root
+    handed the destination the temp file's metadata — the root umask default,
+    world-readable, ACL gone. Nothing breaks visibly, so the regression is invisible
+    until someone re-checks the mode.
+    """
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "webhook_url": "https://discord.example/webhooks/secret",
+                "shutdown": {"enabled": True},
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_scope": "remote",
+                        "shutdown_targets": [{"name": "mt", "kind": "remote", "enabled": True}],
+                    }
+                },
+            }
+        )
+    )
+    os.chmod(cfg, 0o640)
+    _acl_or_skip(cfg)
+
+    removed = _disable_script().disable_shutdown_targets(cfg)
+
+    assert removed == 1
+    after = json.loads(cfg.read_text())
+    assert after["shutdown"]["enabled"] is False
+    assert after["upses"]["ups1"]["shutdown_targets"] == []
+    assert "shutdown_scope" not in after["upses"]["ups1"]
+    assert after["webhook_url"] == "https://discord.example/webhooks/secret"  # untouched
+
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o640, "the config was left world-readable"
+    acl = subprocess.run(
+        ["getfacl", "-n", "--omit-header", str(cfg)], capture_output=True, text=True, check=True
+    ).stdout
+    assert "user:65534:r--" in acl, "the installer's ACL was stripped"
+
+
+def test_disable_script_leaves_monitored_machines_alone(tmp_path) -> None:
+    # INV-DECLARED: a declared `native` machine's authority lives in that box's own
+    # /etc and no config change here disarms it. A "disable shutdown" script that
+    # rewrote shutdown_method would be reporting a disarm it did not perform.
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "monitored_machines": [
+                    {"name": "spark", "ups": "cyberpower3", "shutdown_method": "native"}
+                ],
+                "upses": {"ups1": {"label": "U1"}},
+            }
+        )
+    )
+
+    _disable_script().disable_shutdown_targets(cfg)
+
+    after = json.loads(cfg.read_text())
+    assert after["monitored_machines"] == [
+        {"name": "spark", "ups": "cyberpower3", "shutdown_method": "native"}
+    ]
+
+
+# --- IF-08: the boot-audit marker ---------------------------------------------
+
+
+def test_boot_audit_marker_write_preserves_mode_and_acl(tmp_path) -> None:
+    # Same class as IF-02 at audit.py:535. install.sh puts a DEFAULT ACL on
+    # /var/lib/ups-orchestrator so a fresh inode usually inherits one anyway — but
+    # that is a property of a directory this code does not control, and
+    # $UPS_ORCH_STATE can move the marker out from under it.
+    from ups_orchestrator import audit
+
+    marker = tmp_path / "boot-audit.json"
+    marker.write_text("{}")
+    os.chmod(marker, 0o640)
+    _acl_or_skip(marker)
+
+    audit._write_marker(marker, "boot-id-1")
+
+    assert json.loads(marker.read_text())["boot_id"] == "boot-id-1"
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o640
+    acl = subprocess.run(
+        ["getfacl", "-n", "--omit-header", str(marker)], capture_output=True, text=True, check=True
+    ).stdout
+    assert "user:65534:r--" in acl
+
+
+# --- IF-01: two writers, one file ---------------------------------------------
+#
+# The shipped deployment has klein's long-lived `watch` process and the `nut` user's
+# upssched dispatcher both writing `state.json`. `shutdowns_sent` is the fire-once
+# dedupe for projected machines, so a lost entry is a SECOND shutdown command sent to
+# a box that is already going down.
+
+
+def test_reload_if_changed_picks_up_another_writers_state(tmp_path) -> None:
+    # The auditor's exact interleaving: the event path records two pushes, and the
+    # long-lived poll loop's next look must see them rather than its startup copy.
+    path = tmp_path / "state.json"
+    watch = StateStore(path)  # the long-lived `watch` process
+    watch.get("ups1").onbatt_since = 100
+    watch.save()
+
+    event = StateStore(path)  # a separate `remote-shutdown` / upssched invocation
+    event.get("ups1").shutdowns_sent = ["mt", "spark"]
+    event.save()
+
+    assert watch.reload_if_changed() is True
+    assert watch.get("ups1").shutdowns_sent == ["mt", "spark"]
+    # ...and an unchanged file is not re-read, so the poll loop does not pay for a
+    # parse every tick.
+    assert watch.reload_if_changed() is False
+
+
+def test_save_keeps_a_concurrent_writers_shutdowns_sent(tmp_path) -> None:
+    # The window `reload_if_changed` alone cannot close: the event path writes DURING
+    # a tick, after that tick's reload and before the save that ends it. Union, so the
+    # ledger only ever grows within an outage — erring toward "already sent", which is
+    # the direction that cannot produce a second shutdown.
+    path = tmp_path / "state.json"
+    watch = StateStore(path)
+    watch.get("ups1").onbatt_since = 100
+    watch.save()
+
+    event = StateStore(path)
+    event.get("ups1").shutdowns_sent = ["mt"]
+    event.save()
+
+    watch.get("ups1").last_tick_notified = 200  # the in-flight tick's own bookkeeping
+    watch.save()
+
+    on_disk = json.loads(path.read_text())["ups1"]
+    assert on_disk["shutdowns_sent"] == ["mt"]  # not discarded
+    assert on_disk["last_tick_notified"] == 200  # and this writer's work still landed
+
+
+def test_save_adopts_a_ups_only_the_other_writer_knows_about(tmp_path) -> None:
+    # The two writers can hold different config views (a UPS added while `watch` is
+    # up). Rewriting the whole file would delete the other's record outright.
+    path = tmp_path / "state.json"
+    watch = StateStore(path)
+    watch.get("ups1").onbatt_since = 100
+    watch.save()
+
+    event = StateStore(path)
+    event.get("ups2").shutdowns_sent = ["spark"]
+    event.save()
+
+    watch.save()
+
+    assert json.loads(path.read_text())["ups2"]["shutdowns_sent"] == ["spark"]
+
+
+def test_reload_is_inert_while_the_file_does_not_exist_yet(tmp_path) -> None:
+    # First-ever run: nothing on disk to reload from, and the poll loop's in-memory
+    # work must not be thrown away by a check that mistakes "absent" for "changed".
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.get("ups1").shutdowns_sent = ["mt"]
+
+    assert store.reload_if_changed() is False
+    assert store.get("ups1").shutdowns_sent == ["mt"]
+
+    store.save()
+    assert json.loads(path.read_text())["ups1"]["shutdowns_sent"] == ["mt"]
+    assert store.reload_if_changed() is False  # our own write is not "external"
 
 
 def test_save_completes_when_the_acl_helpers_hang(monkeypatch, tmp_path, caplog) -> None:

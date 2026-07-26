@@ -82,7 +82,12 @@ from ups_orchestrator.events import (
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
-from ups_orchestrator.state import StateStore, UpsState, replace_preserving_metadata
+from ups_orchestrator.state import (
+    StateStore,
+    UpsState,
+    file_identity,
+    write_json_preserving_metadata,
+)
 
 LOG = logging.getLogger("ups_orchestrator")
 
@@ -315,6 +320,22 @@ def _cmd_event(event: str, ups_name: str | None, *, manual: bool = False) -> int
         try:
             dispatch(event, ups, store.get(ups.name), deps)
         except Exception:  # noqa: BLE001 — never let a handler crash NUT
+            # IF-05: this is caught, logged, and the function still returns 0 —
+            # while an unloadable config a few lines above returns 1. The asymmetry
+            # is real and INTENDED, and is recorded here rather than left to be
+            # rediscovered: the ROADMAP invariant is that the event path always
+            # exits 0 so a broken handler can never wedge NUT's own shutdown logic,
+            # and it holds — `upssched` does not gate its pipe loop on CMDSCRIPT's
+            # status, and `SHUTDOWNCMD` is invoked by `upsmon` directly rather than
+            # through this path, so the rc 1 above is safe too.
+            #
+            # Worth stating plainly all the same: the LOUD failure is on the rare
+            # one (an unparseable config, already visible in `monitor list`,
+            # `status` and the webui), while a projector or transport exception at
+            # outage time — the failure that actually matters — is silent-with-rc-0.
+            # The traceback below is the only signal for that case, so
+            # `journalctl -t ups-orchestrator` is part of the shutdown-path check,
+            # not just a monitoring one.
             LOG.exception("Handler for event %r (UPS %s) raised", event, ups.name)
 
     try:
@@ -347,6 +368,13 @@ def _cmd_watch() -> int:
 
     LOG.info("watch: polling %d UPS(es) every %ds", len(cfg.upses), interval)
     while not stop:
+        # IF-01: `state.json` has two writers — this process and the `nut` user's
+        # upssched dispatcher (also an operator's `remote-shutdown`, which takes the
+        # same event path). Without this, the tick's `shutdowns_sent` dedupe was made
+        # against a map loaded when the process started, so a machine already pushed
+        # by the event path was pushed a SECOND time here. Re-read before the
+        # decision, not after.
+        store.reload_if_changed()
         for name, ups in cfg.upses.items():
             try:
                 dispatch("tick", ups, store.get(name), deps)
@@ -642,6 +670,41 @@ def _notify_control(
     _build_deps(cfg).notifier.send(note)
 
 
+def _config_reloader(initial: Config) -> Callable[[], Config]:
+    """A ``Config`` source for long-lived servers that re-reads on file change.
+
+    IF-06: ``webui.serve`` captured the config once at startup, so its degrade
+    banner — both the server-rendered one and the ``/api/status`` payload LO-07
+    renders client-side — reported the state as of process start forever. An
+    operator who fixed a degraded config and reloaded still saw the banner; a config
+    that degraded afterwards showed a healthy dashboard indefinitely.
+
+    Keyed on the file's identity rather than re-parsing per request, because
+    ``Config.load`` LOGS every degrade notice and the dashboard polls every five
+    seconds — an unconditional reload would put one copy of each notice in the
+    journal per refresh, turning a fix for a stale banner into a log flood.
+
+    A file that becomes unloadable keeps the last good config rather than taking the
+    dashboard down: ``_load_config`` already logs the failure, and the operator's
+    other surfaces (``status``, ``monitor list``) report it loudly.
+    """
+    path = _config_path()
+    stamp = file_identity(path)
+    current = initial
+
+    def _reload() -> Config:
+        nonlocal stamp, current
+        latest = file_identity(path)
+        if latest != stamp:
+            stamp = latest
+            fresh = _load_config()
+            if fresh is not None:
+                current = fresh
+        return current
+
+    return _reload
+
+
 def _cmd_webui(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator webui")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (localhost by default)")
@@ -654,7 +717,13 @@ def _cmd_webui(argv: list[str]) -> int:
     from ups_orchestrator import webui
 
     LOG.info("webui: serving http://%s:%d — no auth, do not expose publicly", args.host, args.port)
-    webui.serve(cfg, _sample_path(), host=args.host, port=args.port)
+    webui.serve(
+        cfg,
+        _sample_path(),
+        host=args.host,
+        port=args.port,
+        reload_config=_config_reloader(cfg),
+    )
     return 0
 
 
@@ -948,34 +1017,17 @@ def _monitor_persist(cfg_path: Path, machines: list[dict[str, object]]) -> None:
     """Write monitored_machines back by mutating the RAW config dict, atomically.
 
     Unknown keys (e.g. a ``_comment``) are preserved because we round-trip the
-    parsed JSON rather than a frozen Config. The write is
-    temp+fsync+replace_preserving_metadata (state.py) so a crash mid-write
-    can't corrupt the file the watch service reads, and the replace itself
-    can't strip the mode/owner/ACL the installer gave the file (T-02-23).
-    The secondary password is never among the written fields.
+    parsed JSON rather than a frozen Config. The write goes through
+    ``state.write_json_preserving_metadata`` (temp + fsync + metadata-preserving
+    rename) so a crash mid-write can't corrupt the file the watch service reads, and
+    the rename itself can't strip the mode/owner/ACL the installer gave the file
+    (T-02-23). That helper is now the project's only writer: IF-02 and IF-08 were
+    two sites that had grown their own copy of this dance and never got the T-02-23
+    migration. The secondary password is never among the written fields.
     """
-    import tempfile
-
     raw = json.loads(cfg_path.read_text())
     raw["monitored_machines"] = machines
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=cfg_path.parent,
-            prefix=f".{cfg_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            tmp_path = Path(tmp.name)
-            json.dump(raw, tmp, indent=2, sort_keys=True)
-            tmp.write("\n")
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        replace_preserving_metadata(tmp_path, cfg_path)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    write_json_preserving_metadata(cfg_path, raw, indent=2)
 
 
 def _monitor_find(cfg: Config, name: str) -> MonitoredMachine | None:
@@ -1245,8 +1297,10 @@ def _monitor_verify(
             timeout=args.timeout,
             deep=args.deep,
         )
-        _say(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
         if probe == "native":
+            # A declared `native` record is asking "is my secondary alive?", so the
+            # probe's own verdict IS the answer and the words match the code.
+            _say(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
             if machine.load_notices:
                 _say(
                     f"  the remote secondary remains the surviving authority — it lives in "
@@ -1254,12 +1308,30 @@ def _monitor_verify(
                     f"'monitor remove {machine.name}' is the only real disarm."
                 )
             return 0 if ok else 1
+
+        # IF-10: every other probe reason asks the INVERTED question — "is there an
+        # authority here that this record does not declare?" — so the probe's raw
+        # OK/FAIL is the opposite of the verdict. A `none`-with-`ups` record whose
+        # probe FAILED printed "FAIL" and returned 0: a script keying on the exit
+        # code read the opposite of the line it had just printed, which is worse than
+        # either being wrong alone. The rc semantics are the deliberate ones (1 means
+        # "an undeclared authority is still live"); the printed word is what moves.
         if ok:
-            _say(
-                f"  this record declares {declared!r}, and a live NUT secondary answers on "
-                f"that box. Run 'monitor remove {machine.name}' to actually disarm it."
-            )
             rc = 1
+            summary = (
+                f"a live NUT secondary answers on that box and this record declares "
+                f"{declared!r} ({detail}). Run 'monitor remove {machine.name}' to "
+                f"actually disarm it."
+            )
+        else:
+            summary = (
+                f"no live NUT secondary answered on that box, which matches the "
+                f"declared {declared!r} ({detail})"
+            )
+        # The word and the exit code are derived from the SAME value, so they cannot
+        # disagree again. `rc` may already be 1 from the disarm branch above, and
+        # FAIL is the right word for that too.
+        _say(f"{machine.name}: {'OK' if rc == 0 else 'FAIL'} — {summary}")
         return rc
 
     if machine.disarmed:

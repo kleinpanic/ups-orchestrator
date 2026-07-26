@@ -276,27 +276,177 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
     tmp_path.replace(dest_path)
 
 
+def write_text_preserving_metadata(dest_path: Path, text: str) -> tuple[int, int, int, int] | None:
+    """Replace ``dest_path``'s contents with ``text``: temp + fsync + atomic rename.
+
+    THE writer for every file this project owns. Four call sites had grown their own
+    copy of this six-line dance — ``StateStore.save``, ``_monitor_persist``,
+    ``audit._write_marker`` and ``deploy/disable-live-shutdown-targets.sh`` — and two
+    of them (IF-02, IF-08) never got the ``replace_preserving_metadata`` migration
+    that T-02-23 introduced, so they kept the bare ``Path.replace`` that hands the
+    destination the TEMP file's 0600-owned-by-the-writer metadata. The
+    ``disable-live-shutdown-targets`` case is the sharp one: it is the documented way
+    to turn shutdown off, it runs as root against
+    ``/etc/ups-orchestrator/config.json``, and it silently took that file from
+    ``0640 root:nut`` plus the installer's ACL to the root umask default — i.e. made
+    a file holding a Discord webhook world-readable, with no warning and nothing
+    visibly broken.
+
+    A helper that only some writers use is how that recurred, so there is now one
+    helper and no writer outside it. ``tests/test_state.py`` greps for a bare
+    ``.replace(`` on a destination path to keep it that way.
+
+    The parent directory is created if absent, the temp file is unlinked on any
+    failure, and the fsync happens before the rename so a power loss cannot leave the
+    destination pointing at a partial inode.
+
+    Returns the ``file_identity`` of the inode just written, read off the temp file
+    BEFORE the rename carries it into place. ``StateStore`` needs that identity to
+    tell its own write from another process's; callers that do not care ignore it.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=dest_path.parent,
+            prefix=f".{dest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(text)
+            # Durability: flush userspace + kernel buffers before the atomic rename,
+            # so a power loss right after it can't leave the destination pointing at
+            # a zero-length/partial inode. Matches recorder.py/jsonlog.py.
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        # Read the key off the TEMP inode, before the rename that carries it to the
+        # destination. Statting the destination afterwards would race a writer that
+        # got in first, and the caller would then adopt THEIR key as its own and
+        # never notice their content. `replace_preserving_metadata` may chmod and
+        # chown in between, and neither touches dev/ino/size/mtime_ns.
+        stamp = file_identity(tmp_path)
+        replace_preserving_metadata(tmp_path, dest_path)
+        return stamp
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def write_json_preserving_metadata(dest_path: Path, payload: object, *, indent: int | None) -> None:
+    """``write_text_preserving_metadata`` for a JSON document, newline-terminated."""
+    write_text_preserving_metadata(
+        dest_path, json.dumps(payload, indent=indent, sort_keys=True) + "\n"
+    )
+
+
+def file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    """Identity of the file's CURRENT contents, or ``None`` when it is absent.
+
+    ``(dev, ino, size, mtime_ns)``. The inode number is the load-bearing member:
+    every write here lands via ``replace_preserving_metadata``, i.e. a rename of a
+    fresh temp inode over the destination, so an external write always changes
+    ``st_ino`` even when size and mtime happen to match. A missing file compares
+    equal to itself, so a store that has never seen the file does not reload on
+    every check.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _read_states(path: Path) -> dict[str, UpsState]:
+    """Parse the state file, or ``{}`` for absent/unreadable/corrupt/wrong-shape."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {name: UpsState.from_dict(data) for name, data in raw.items() if isinstance(data, dict)}
+
+
 class StateStore:
-    """Loads/saves a ``{ups_name: UpsState}`` map from a JSON file."""
+    """Loads/saves a ``{ups_name: UpsState}`` map from a JSON file.
+
+    IF-01: this file has TWO writers in the shipped deployment — klein's long-lived
+    ``watch`` process and the ``nut`` user's ``upssched`` dispatcher (plus an
+    operator-run ``remote-shutdown``, which takes the same event path). The load
+    used to happen once, in ``__init__``, so the ``watch`` process kept an in-memory
+    copy for its whole lifetime and rewrote the entire file every poll. Anything the
+    event path wrote in between was discarded — including ``shutdowns_sent``, which
+    Phase 2 promoted to the fire-once dedupe for projected machines. A machine
+    already pushed by ``remote-shutdown`` was therefore pushed a SECOND time on the
+    poll loop's next tick.
+
+    Two seams close it, and both are needed because they cover different windows:
+
+    * ``reload_if_changed`` — called at the top of each poll cycle, so the dedupe
+      decision is made against what is actually on disk;
+    * ``save``'s union of ``shutdowns_sent`` — covers a write that lands DURING a
+      tick, between that reload and the save that ends it.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._states: dict[str, UpsState] = {}
+        # The file identity `self._states` was built from. Used to tell "nobody else
+        # has written since we last looked" from "someone has".
+        self._seen: tuple[int, int, int, int] | None = None
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
+        # Stat BEFORE reading, deliberately. A write landing between the two then
+        # records a stale key against fresh content, which costs one redundant
+        # reload; the other order would record a fresh key against stale content and
+        # the reload would never happen at all.
+        stamp = file_identity(self.path)
+        self._states = _read_states(self.path)
+        self._seen = stamp
+
+    def reload_if_changed(self) -> bool:
+        """Re-read the file if another process has written it. Returns whether it did.
+
+        Long-lived callers (the ``watch`` loop) must call this before making any
+        fire-once decision. Callers that construct a store per invocation (the NUT
+        event path) are already current and need not.
+        """
+        if file_identity(self.path) == self._seen:
+            return False
+        self._load()
+        return True
+
+    def _absorb_external_writes(self) -> None:
+        """Fold another writer's ``shutdowns_sent`` into ours before overwriting them.
+
+        Union rather than last-writer-wins, and ONLY for this field. ``shutdowns_sent``
+        is a fire-once ledger, so the two possible errors are not symmetric: dropping
+        an entry sends a second shutdown to a box that is already going down, while
+        keeping one that the other writer had just cleared at most defers a push by a
+        single poll — the next ONBATT/ONLINE transition clears it again on both sides.
+        The union therefore always errs toward "already sent".
+
+        Every other field stays last-writer-wins. They are monitoring bookkeeping
+        (notification cadence, load window, status) where a lost update costs a
+        duplicate Discord line, not a duplicate shutdown.
+
+        A UPS present on disk but absent here is adopted wholesale: it belongs to a
+        writer with a different config view, and rewriting the file would otherwise
+        delete its state outright.
+        """
+        if file_identity(self.path) == self._seen:
             return
-        try:
-            raw = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return
-        if isinstance(raw, dict):
-            self._states = {
-                name: UpsState.from_dict(data)
-                for name, data in raw.items()
-                if isinstance(data, dict)
-            }
+        for name, on_disk in _read_states(self.path).items():
+            mine = self._states.get(name)
+            if mine is None:
+                self._states[name] = on_disk
+                continue
+            for sent in on_disk.shutdowns_sent:
+                if sent not in mine.shutdowns_sent:
+                    mine.shutdowns_sent.append(sent)
 
     def get(self, ups_name: str) -> UpsState:
         """Return the state for ``ups_name``, creating a blank one on first use."""
@@ -304,27 +454,8 @@ class StateStore:
 
     def save(self) -> None:
         """Atomically persist all UPS states (write to temp, then replace)."""
+        self._absorb_external_writes()
         payload = {name: asdict(st) for name, st in self._states.items()}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                tmp_path = Path(tmp.name)
-                json.dump(payload, tmp, indent=2, sort_keys=True)
-                tmp.write("\n")
-                # Durability: flush userspace + kernel buffers before the atomic
-                # rename, so a power loss right after replace() can't leave the
-                # state file pointing at a zero-length/partial inode. Matches the
-                # fsync in recorder.py/jsonlog.py.
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            replace_preserving_metadata(tmp_path, self.path)
-        finally:
-            if tmp_path is not None and tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
+        self._seen = write_text_preserving_metadata(
+            self.path, json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        )

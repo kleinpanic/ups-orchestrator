@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1074,17 +1075,119 @@ def test_named_temporaryfile_confined_to_known_sites() -> None:
     # Source-level guard: the defect is a PATTERN (raw tempfile.NamedTemporaryFile
     # + bare .replace()), and the only durable defence against a third copy is a
     # test that notices the pattern re-appearing anywhere else under src/.
+    #
+    # IF-02/IF-08 narrowed this from two sites to one: `state.write_text_preserving_
+    # metadata` is now the whole project's writer, and `_monitor_persist` calls it
+    # rather than carrying its own copy.
     src_dir = Path(ups_orchestrator.__file__).parent
     hits = {
         str(path.relative_to(src_dir))
         for path in sorted(src_dir.rglob("*.py"))
         if "NamedTemporaryFile" in path.read_text()
     }
-    assert hits == {"cli.py", "state.py"}, (
-        "NamedTemporaryFile appeared outside cli.py/_monitor_persist and "
-        "state.py/StateStore.save (T-02-23, 02-09-PLAN.md) — a new temp-file "
-        "write must go through state.replace_preserving_metadata instead of "
-        "reimplementing the unprotected temp+replace idiom"
+    assert hits == {"state.py"}, (
+        "NamedTemporaryFile appeared outside state.write_text_preserving_metadata "
+        "(T-02-23, IF-02, IF-08) — a new temp-file write must go through that "
+        "helper instead of reimplementing the unprotected temp+replace idiom"
+    )
+
+
+def test_every_shipped_systemd_unit_is_installed_by_something() -> None:
+    """IF-09: two units shipped in deploy/systemd/ and were installed by nothing.
+
+    ``ups-orchestrator-selftest.service`` and ``.timer`` referenced
+    ``/usr/local/bin/ups-orchestrator selftest`` and looked like a supported
+    feature, but neither ``install.sh`` nor ``install-user-service.sh`` ever copied
+    them anywhere — so ``systemctl --user start ups-orchestrator-selftest`` failed
+    with "unit not found" on every deployment that ever existed. A shipped-but-
+    unreachable unit is the same class of drift as a documented-but-missing verb,
+    so guard the whole directory rather than those two names.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    units = {p.name for p in (repo / "deploy" / "systemd").iterdir() if p.is_file()}
+    assert units, "deploy/systemd/ is empty — the guard would pass vacuously"
+    installers = "\n".join(
+        (repo / "deploy" / name).read_text() for name in ("install.sh", "install-user-service.sh")
+    )
+    orphans = sorted(name for name in units if name not in installers)
+    assert orphans == [], (
+        "shipped systemd unit(s) that no installer references — they cannot be "
+        f"started on any deployment (IF-09): {orphans}"
+    )
+
+
+def test_installer_and_docs_grant_serial_device_access() -> None:
+    """IF-03: nothing shipped granted the serial transport's device access.
+
+    ``grep -rn dialout deploy/ docs/ Makefile README.md`` returned ZERO hits.
+    ``install.sh`` grants the ``nut`` group, ACLs on /etc and /var/lib, and a
+    poweroff sudoers entry — every privilege the daemon needs except the one the
+    serial transport needs, and the serial transport opens ``/dev/ttyUSB*`` ``"wb"``
+    from that same run-user-owned ``systemd --user`` unit. Fresh installs therefore
+    failed every serial push and every ``shutdown rehearse`` with PermissionError;
+    the development box masked it by already being in ``dialout``.
+
+    A source-level assertion is the honest oracle here: the fix IS a deployment
+    grant, and this suite must never add a user to a group or open a real device.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    install = (repo / "deploy" / "install.sh").read_text()
+    assert "usermod -aG dialout" in install, (
+        "deploy/install.sh does not grant the run user serial device access — every "
+        "serial push and 'shutdown rehearse' fails with PermissionError on a fresh "
+        "install (IF-03)"
+    )
+    assert '"$RUN_USER"' in install.split("usermod -aG dialout")[1][:20], (
+        "the dialout grant must target the run user that owns the systemd --user "
+        "watch unit, not root or a literal"
+    )
+
+    deployment = (repo / "docs" / "Deployment.md").read_text()
+    assert "dialout" in deployment, "docs/Deployment.md does not mention dialout (IF-03)"
+    # The second half of IF-03: the upssched dispatcher runs as `nut`, which is not
+    # in dialout, so the docs must answer whether the push is reachable from there
+    # rather than leaving it to fail during an outage.
+    # Whitespace-normalised: the claim must survive a markdown re-wrap.
+    assert "not reachable from the NUT event path" in " ".join(deployment.split()), (
+        "docs/Deployment.md must state plainly whether the serial push is reachable "
+        "from the `nut`-user upssched path (IF-03)"
+    )
+
+
+def test_no_bare_temp_rename_survives_anywhere_in_the_tree() -> None:
+    """The other half of the same guard, and the one IF-02/IF-08 slipped through.
+
+    Confining ``NamedTemporaryFile`` to one module says nothing about a writer that
+    builds its temp path by hand — which is exactly what ``audit._write_marker``
+    (``path.with_suffix(".tmp")``) and the ``disable-live-shutdown-targets`` heredoc
+    did, in Python and in shell respectively, for the whole of Phase 2. Both ended in
+    a bare ``tmp.replace(dest)``, which hands the destination the temp file's mode,
+    owner and ACL (T-02-23). Scan ``src/`` AND ``deploy/``: the second one is where
+    the higher-blast-radius copy lived, and a guard that only reads ``src/`` would
+    have found nothing.
+
+    Log ROTATION is a different operation and deliberately not matched: there the
+    source is the real file, already carrying the metadata that should survive.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    # Anchored at statement start, so the prose in this repo that NAMES the pattern
+    # (the comments and docstrings recording IF-02/IF-08) is not itself an offender.
+    bare_rename = re.compile(r"^\s*tmp\w*\s*\.replace\s*\(")
+    offenders = []
+    for directory in (repo / "src", repo / "deploy"):
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file() or path.suffix not in (".py", ".sh"):
+                continue
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if bare_rename.search(line):
+                    offenders.append(f"{path.relative_to(repo)}:{lineno}: {line.strip()}")
+    # The single legitimate site: the rename inside the metadata-preserving helper
+    # itself, which has already carried mode/owner/ACL onto the temp file.
+    assert offenders == ["src/ups_orchestrator/state.py:276: tmp_path.replace(dest_path)"], (
+        "a bare temp-file rename over a destination reappeared (IF-02, IF-08, "
+        "T-02-23) — it strips the destination's mode, owner and ACL. Use "
+        "state.write_text_preserving_metadata / write_json_preserving_metadata:\n"
+        + "\n".join(offenders)
     )
 
 
@@ -1779,11 +1882,63 @@ def test_verify_declared_none_with_ups_advisory_probes_and_is_rc1_when_answered(
 
 
 def test_verify_declared_none_with_ups_is_rc0_when_no_secondary_answers(
-    cfg_path, monkeypatch
+    cfg_path, monkeypatch, capsys
 ) -> None:
+    """IF-10: it printed FAIL and exited 0. A script keying on rc read the opposite.
+
+    The rc semantics are the deliberate ones — rc 1 means "an undeclared authority is
+    still live" — so a `none` record with nothing answering is genuinely rc 0. The
+    defect was the WORD: the probe's raw OK/FAIL answers "did a secondary reply?",
+    which for every non-native probe reason is the inverse of the verdict.
+    """
     _write_config(cfg_path, machines=[_machine_entry("spark", method="none", ups="cyberpower")])
     monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(1, "", "connection refused")]))
-    assert cli.main(["monitor", "verify", "spark"]) == 0
+
+    rc = cli.main(["monitor", "verify", "spark"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "spark: OK" in out
+    assert "spark: FAIL" not in out, "printed FAIL while exiting 0 (IF-10)"
+
+
+@pytest.mark.parametrize(
+    ("method", "extra_fields", "probe_rc"),
+    [
+        ("none", {"ups": "cyberpower"}, 0),  # undeclared authority IS live -> rc 1
+        ("none", {"ups": "cyberpower"}, 1),  # nothing answers -> rc 0
+        ("native", {"ssh": "mt", "ip": "192.168.1.114"}, 0),
+        ("native", {"ssh": "mt", "ip": "192.168.1.114"}, 1),
+        ("ssh", {"ssh": "mt", "ups": "cyberpower", "ip": "192.168.1.114"}, 0),
+        ("ssh", {"ssh": "mt", "ups": "cyberpower", "ip": "192.168.1.114"}, 1),
+    ],
+)
+def test_verify_summary_word_never_disagrees_with_the_exit_code(
+    cfg_path, monkeypatch, capsys, method, extra_fields, probe_rc
+) -> None:
+    # The invariant behind IF-10, over every probe reason and both probe outcomes:
+    # whatever `monitor verify` prints as its per-machine verdict must be the same
+    # answer the exit code gives, because scripts trust the rc and operators trust
+    # the line. Either alone being wrong is recoverable; disagreeing is not.
+    _write_config(cfg_path, machines=[_machine_entry("m1", method=method, **extra_fields)])
+    monkeypatch.setattr(
+        cli,
+        "_monitor_run_ssh",
+        FakeSSH([(probe_rc, "OL\n" if probe_rc == 0 else "", "" if probe_rc == 0 else "refused")]),
+    )
+
+    rc = cli.main(["monitor", "verify", "m1"])
+    out = capsys.readouterr().out
+
+    verdicts = [
+        line.split("m1: ", 1)[1].split(" ", 1)[0] for line in out.splitlines() if "m1: " in line
+    ]
+    verdicts = [v for v in verdicts if v in ("OK", "FAIL")]
+    assert verdicts, f"no verdict line printed for {method}/{probe_rc}: {out!r}"
+    expected = "OK" if rc == 0 else "FAIL"
+    assert set(verdicts) == {expected}, (
+        f"declared {method!r}, probe rc {probe_rc}: printed {verdicts} but exited {rc}"
+    )
 
 
 def test_verify_declared_ssh_with_a_stale_enrollment_ip_advisory_probes_rc1(

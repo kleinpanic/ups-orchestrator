@@ -30,6 +30,20 @@ echo ">> granting '$RUN_USER' perms so future redeploys need no sudo"
 chown -R "$RUN_USER":nut /opt/ups-orchestrator
 chmod -R g+rX /opt/ups-orchestrator
 id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx nut || { usermod -aG nut "$RUN_USER"; echo "   added $RUN_USER to nut (re-login for it to take effect)"; }
+# IF-03: the serial shutdown transport opens /dev/ttyUSB*//dev/ttyS* "wb" from the
+# same RUN_USER-owned `systemd --user` watch unit, and Debian puts those devices in
+# group `dialout`. Every other privilege the daemon needs is granted above or below
+# (nut group, /etc + /var/lib ACLs, poweroff sudoers); this one was not, so on a
+# fresh install every serial push and every `ups-orchestrator shutdown rehearse`
+# died with PermissionError on the device open. It works on the box this was
+# developed against only because that user already happened to be in dialout.
+#
+# The `nut` user is deliberately NOT added. The upssched dispatcher runs as `nut`,
+# but the shipped upssched.conf.snippet has no rule that reaches the push gate
+# (ONBATT/LOWBATT/COMMBAD/COMMOK only — see docs/Shutdown-Mechanisms.md), so the
+# serial push is unreachable from that path. An operator who adds an
+# `AT ... EXECUTE remote_shutdown` line must grant `nut` dialout as well.
+id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx dialout || { usermod -aG dialout "$RUN_USER"; echo "   added $RUN_USER to dialout (serial shutdown transport device access; re-login for it to take effect)"; }
 # Convenience symlink on the user's own PATH (does not replace the system one).
 RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 [ -n "$RUN_HOME" ] && install -d -o "$RUN_USER" -g "$RUN_USER" "$RUN_HOME/.local/bin" \

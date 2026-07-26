@@ -58,7 +58,7 @@ difference decides whether a push happens at all:
   `lowbatt` event and sends one notification, then returns. **It never reaches
   the shutdown path.**
 
-Two consequences follow, and neither is obvious from the requirement text:
+Three consequences follow, and none is obvious from the requirement text:
 
 1. **If the `watch` unit is not running, no push ever fires.** NUT will still
    deliver its LOWBATT notification and a `native` secondary will still halt
@@ -71,6 +71,17 @@ Two consequences follow, and neither is obvious from the requirement text:
    them. A UPS at 5% charge that still reports 20 minutes of runtime does not
    open the gate. Only when one of the two is left unset does the other decide
    alone.
+3. **A UPS that raises `LB` without reporting charge *or* runtime never opens
+   the gate at all.** With both readings unknown, `_close_to_empty` returns
+   `False` — deliberately, and pinned by
+   `test_an_undefined_close_to_empty_condition_never_fires`. This is the shape a
+   dying UPS actually produces (`upsc` stops reporting `battery.charge` and
+   `battery.runtime` while `ups.status` still says `OB`), and firing on it would
+   power off every box on that UPS on a bad read. The cost is the mirror image:
+   such a UPS is one where `native` still halts its secondaries on FSD while no
+   push ever fires, no matter how the thresholds are set. If you have a unit that
+   reports `LB` and nothing else, `native` is the only authority that works on
+   it.
 
 This split is deliberate — `native` at NUT's LB, push at operator-tunable
 thresholds crossed earlier — but it means the two authorities can fire minutes

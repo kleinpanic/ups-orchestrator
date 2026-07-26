@@ -37,7 +37,7 @@
   "upses": {
     "ups1": {
       "label": "Rack UPS",
-      "shutdown_targets__comment": "LEGACY, back-compat only. New enrollments use monitored_machines[].shutdown_method (none|native|serial|ssh) via `monitor add --method ...` instead. A machine cannot be both a monitored_machines entry with an active method AND an enabled shutdown_target on the same UPS — Config.load degrades (disarms) whichever side is disarmable rather than refusing to load. See docs/Configuration.md and docs/Shutdown-Targets.md.",
+      "shutdown_targets__comment": "LEGACY, back-compat only. New enrollments use monitored_machines[].shutdown_method (none|native|serial|ssh) via `monitor add --method ...` instead. A machine cannot be both a monitored_machines entry with an active method AND an enabled shutdown_target — for a declared 'native' machine that holds on ANY configured UPS, not just the one it names, because its authority is that box's own upsmon reacting to this primary's FSD and is keyed to no UPS in this file; for a 'serial'/'ssh' machine it is scoped to its own UPS. Config.load degrades (disarms) whichever side is disarmable rather than refusing to load. See docs/Configuration.md and docs/Shutdown-Targets.md.",
       "shutdown_targets": [
         {
           "name": "fileserver",

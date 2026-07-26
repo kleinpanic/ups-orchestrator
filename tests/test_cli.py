@@ -191,12 +191,61 @@ def test_baseline_command(env_config, tmp_path, capsys) -> None:
 def test_webui_command_invokes_serve(env_config, monkeypatch) -> None:
     seen: dict[str, object] = {}
 
-    def fake_serve(_cfg, _path, *, host, port):
+    def fake_serve(_cfg, _path, *, host, port, reload_config):
         seen["host"], seen["port"] = host, port
+        seen["reload_config"] = reload_config
 
     monkeypatch.setattr("ups_orchestrator.webui.serve", fake_serve)
     assert cli.main(["webui", "--host", "0.0.0.0", "--port", "9001"]) == 0
-    assert seen == {"host": "0.0.0.0", "port": 9001}
+    assert seen["host"] == "0.0.0.0" and seen["port"] == 9001
+    # IF-06: without a reloader the dashboard is frozen at process start forever.
+    assert callable(seen["reload_config"])
+
+
+def test_config_reloader_returns_the_live_config_after_the_file_changes(
+    env_config, monkeypatch
+) -> None:
+    """IF-06: the webui's degrade banner was captured once at serve() startup.
+
+    An operator who fixed a degraded config and reloaded the dashboard still saw the
+    banner; a config that degraded after startup showed a healthy dashboard
+    indefinitely. Only restarting the separate `webui` process cleared either.
+    """
+    cfg = cli._load_config()
+    assert cfg is not None
+    assert cfg.degraded == ()
+
+    reload_config = cli._config_reloader(cfg)
+    assert reload_config() is cfg  # unchanged file: no re-parse, same object
+
+    # The operator introduces a degrade (a serial record with no device).
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {"ups1": {"label": "U1"}},
+                "monitored_machines": [{"name": "mt", "ups": "ups1", "shutdown_method": "serial"}],
+            }
+        )
+    )
+
+    fresh = reload_config()
+    assert fresh is not cfg
+    assert fresh.degraded, "the reloader did not pick the live config's degrade up"
+
+
+def test_config_reloader_keeps_the_last_good_config_when_the_file_breaks(
+    env_config, monkeypatch
+) -> None:
+    # Taking the dashboard down because someone saved a half-edited file is worse
+    # than showing the last good view; `_load_config` already logs the failure and
+    # `status`/`monitor list` report it loudly.
+    cfg = cli._load_config()
+    assert cfg is not None
+    reload_config = cli._config_reloader(cfg)
+
+    env_config.write_text("{ not valid json ")
+
+    assert reload_config() is cfg
 
 
 def test_control_beeper_mute_all(env_config, monkeypatch, capsys) -> None:
@@ -1315,3 +1364,111 @@ def test_rehearse_still_works_for_a_known_remote_kind(env_config, monkeypatch, c
     assert [kind for kind, _t in seen] == ["ssh"]
     assert seen[0][1].cmd == _REHEARSAL
     assert "PHASE2_REHEARSAL" in capsys.readouterr().out
+
+
+# --- IF-01: the poll loop must not re-push what the event path already sent ----
+
+
+def test_watch_tick_does_not_re_push_a_target_the_event_path_already_fired(
+    monkeypatch, tmp_path
+) -> None:
+    """The auditor's exact interleaving, end to end through `main`.
+
+    `state.json` has two writers: this long-lived `watch` process, and a fresh
+    process per NUT event (or per operator-typed `remote-shutdown`). The store used
+    to load once in `__init__`, so the watch loop made its `shutdowns_sent` dedupe
+    decision against a map captured at startup and rewrote the whole file every tick
+    — discarding whatever the other writer had recorded in between. The machine then
+    got a SECOND shutdown command while it was already going down.
+
+    Timeline driven below:
+      tick 1        on battery, comfortably charged -> records the outage, fires nothing
+      (mid-sleep)   charge collapses; the operator runs `remote-shutdown ups1`, which
+                    fires `mt` in its OWN process and persists that
+      tick 2        same collapsed charge -> must NOT fire `mt` again
+    """
+    import dataclasses
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "poll_seconds": 1,
+                "shutdown": {
+                    "enabled": True,
+                    "require_power_outage": True,
+                    "min_on_battery_seconds": 0,
+                    "notify": False,
+                    "external": {"enabled": True, "battery_below": 15, "runtime_below": 300},
+                    "internal": {"enabled": False},
+                },
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "mt",
+                                "kind": "remote",
+                                "enabled": True,
+                                "host": "mt.lan",
+                                "user": "u",
+                                "cmd": "sudo /sbin/poweroff",
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(cfg))
+    monkeypatch.setenv("UPS_ORCH_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("UPS_ORCH_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(tmp_path / "notify.jsonl"))
+    monkeypatch.setenv("UPS_ORCH_SAMPLES", str(tmp_path / "samples.jsonl"))
+
+    healthy = UpsSnapshot("OB DISCHRG", 50, 900, 12, 120.0, realpower_nominal=900)
+    collapsed = UpsSnapshot("OB DISCHRG", 5, 60, 12, 120.0, realpower_nominal=900)
+    live = {"snap": healthy}
+    pushes: list[str] = []
+
+    real_build = cli._build_deps
+
+    def _build(config, **kw):  # noqa: ANN001, ANN003
+        return dataclasses.replace(
+            real_build(config, **kw),
+            read_snapshot=lambda _n: live["snap"],
+            ssh_shutdown=lambda t: (pushes.append(t.name), (0, "", ""))[1],
+            now=lambda: 1000,
+        )
+
+    monkeypatch.setattr(cli, "_build_deps", _build)
+
+    # Count TICKS rather than sleeps: the loop sleeps `poll_seconds` times per cycle,
+    # so a sleep counter silently makes the test vacuous the moment that knob moves.
+    real_dispatch = cli.dispatch
+    ticks = {"n": 0}
+
+    def _dispatch(event, ups, state, deps):  # noqa: ANN001, ANN202
+        if event == "tick":
+            ticks["n"] += 1
+        return real_dispatch(event, ups, state, deps)
+
+    monkeypatch.setattr(cli, "dispatch", _dispatch)
+
+    def _sleep(_secs: float) -> None:
+        if ticks["n"] >= 2:  # tick 2 has run; that is the whole experiment
+            raise KeyboardInterrupt
+        if live["snap"] is healthy:
+            # Between tick 1 and tick 2, in a DIFFERENT process: the battery
+            # collapses and the operator triggers the push by hand.
+            live["snap"] = collapsed
+            assert cli.main(["remote-shutdown", "ups1"]) == 0
+            assert pushes == ["mt"], "the event path itself must fire exactly once"
+
+    monkeypatch.setattr(cli.time, "sleep", _sleep)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+
+    assert pushes == ["mt"], f"mt was shut down more than once: {pushes}"
+    on_disk = json.loads((tmp_path / "state.json").read_text())["ups1"]["shutdowns_sent"]
+    assert on_disk == ["mt"], f"the dedupe ledger did not survive the tick: {on_disk}"
