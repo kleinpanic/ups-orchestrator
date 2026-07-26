@@ -1295,7 +1295,8 @@ def test_add_reenroll_of_live_native_record_persists_native_not_none(
     monkeypatch.setattr(cli, "_NFT_RELOAD_PATH", str(add_env["tmp"] / "u.nft"))
     _seed_nft(add_env["tmp"] / "u.nft")
     rc = cli.main(
-        ["monitor", "add", "spark", "--ssh", "spark", "--ups", "cyberpower", "--ip", "192.168.1.120"]
+        ["monitor", "add", "spark"]
+        + ["--ssh", "spark", "--ups", "cyberpower", "--ip", "192.168.1.120"]
     )
     assert rc == 0
     entry = _entry(cfg_path, "spark")
@@ -1399,7 +1400,9 @@ def test_add_transition_guard_not_opened_by_a_load_degrade(cfg_path, monkeypatch
     assert machine.load_notices, "fixture must carry a load notice for this test to mean anything"
     assert machine.shutdown_method == "native"
     with caplog.at_level("ERROR"):
-        rc = cli.main(["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"])
+        rc = cli.main(
+            ["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"]
+        )
     assert rc == 2
     assert "monitor remove mt" in caplog.text
     assert _entry(cfg_path, "mt")["shutdown_method"] == "native"
@@ -1458,7 +1461,9 @@ def test_force_alone_does_not_authorise_the_remote_config_overwrite(
     assert rc == 3  # the remote guard still refuses; --force is local-only now
 
 
-def test_force_remote_config_authorises_the_remote_overwrite(cfg_path, add_env, monkeypatch) -> None:
+def test_force_remote_config_authorises_the_remote_overwrite(
+    cfg_path, add_env, monkeypatch
+) -> None:
     monkeypatch.setattr(cli, "_monitor_run_ssh", _ssh_with_operator_monitor_line())
     _native_add_env(add_env, monkeypatch)
     rc = cli.main(
@@ -1485,10 +1490,13 @@ def test_force_remote_config_authorises_the_remote_overwrite(cfg_path, add_env, 
 def test_add_rejects_an_option_shaped_or_metachar_ssh_alias_rc2(
     cfg_path, monkeypatch, caplog, alias
 ) -> None:
+    # `--ssh=<value>` is the single-token spelling — the only one by which an
+    # option-shaped alias reaches our validator at all, since argparse rejects the
+    # two-token form itself. Both roads end at rc 2; this one exercises OUR guard.
     monkeypatch.setenv(cli._SECRET_ENV, _PW)
     ssh, _l, _n, _p = _no_privileged_seams(monkeypatch)
     with caplog.at_level("ERROR"):
-        rc = cli.main(["monitor", "add", "mt", "--ssh", alias, "--ups", "cyberpower"])
+        rc = cli.main(["monitor", "add", "mt", f"--ssh={alias}", "--ups", "cyberpower"])
     assert rc == 2
     assert alias in caplog.text
     assert ssh.calls == []
@@ -1497,10 +1505,8 @@ def test_add_rejects_an_option_shaped_or_metachar_ssh_alias_rc2(
 def test_add_accepts_a_plain_ssh_alias(cfg_path, monkeypatch) -> None:
     monkeypatch.delenv(cli._SECRET_ENV, raising=False)
     _no_privileged_seams(monkeypatch)
-    assert (
-        cli.main(["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt-01.lan", "--ups", "cyberpower"])
-        == 0
-    )
+    argv = ["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt-01.lan", "--ups", "cyberpower"]
+    assert cli.main(argv) == 0
     assert _entry(cfg_path, "mt")["ssh"] == "mt-01.lan"
 
 

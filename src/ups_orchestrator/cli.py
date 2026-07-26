@@ -41,7 +41,17 @@ from types import FrameType
 
 from ups_orchestrator import audit, nutclient, recorder, report
 from ups_orchestrator import status as status_view
-from ups_orchestrator.config import Config, MonitoredMachine, UpsConfig, dual_regime_conflicts
+
+# _SSH_ALIAS_RE is imported deliberately rather than re-spelled here: T-02-10's
+# CLI check and 02-06's load-time check must be the SAME rule, or a value the CLI
+# accepts could be disarmed at load (or worse, the reverse). One regex, two sinks.
+from ups_orchestrator.config import (
+    _SSH_ALIAS_RE,
+    Config,
+    MonitoredMachine,
+    UpsConfig,
+    dual_regime_conflicts,
+)
 from ups_orchestrator.events import Deps, dispatch
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
@@ -919,6 +929,24 @@ def _valid_ip(value: str) -> bool:
     return True
 
 
+def _strict_positive_baud(value: str | None) -> int | None:
+    """Parse a DECLARED baud, or ``None``. No silent fallback (P2-08, T-02-12).
+
+    ``argparse(type=int)`` would raise ``SystemExit(2)`` with argparse's own
+    message; the operator needs to be told that the baud is theirs to declare and
+    what the live console runs at, so the parse happens here instead. ``"9600.5"``
+    and ``"fast"`` are rejected rather than truncated, and ``0`` is rejected
+    because POSIX ``B0`` means *hang up the line*.
+    """
+    if value is None:
+        return None
+    try:
+        baud = int(value.strip())
+    except ValueError:
+        return None
+    return baud if baud > 0 else None
+
+
 def _parse_route_src(route_out: str) -> str | None:
     """Extract the ``src`` field from ``ip -o route get`` output. PURE.
 
@@ -965,71 +993,221 @@ def _resolve_remote_ip(alias: str, explicit: str | None, primary_ip: str) -> str
     return None
 
 
+_NATIVE_SHUTDOWN_CMD = "/sbin/shutdown -h now"
+# NEW-2. A push runs as the ssh user or the far end's auto-login user, not as root
+# — and over serial a permission failure is SILENT (the bytes land, the write
+# returns 0, and success is reported for a box that stayed up). Native keeps the
+# unescalated form because upsmon runs SHUTDOWNCMD as root.
+_PUSH_SHUTDOWN_CMD = "sudo /sbin/shutdown -h now"
+_PUSH_METHODS = ("serial", "ssh", "none")
+
+
+def _resolve_shutdown_cmd(method: str, explicit: str | None) -> str:
+    """The operator's ``--shutdown-cmd``, else the default for this METHOD (NEW-2)."""
+    if explicit is not None:
+        return explicit
+    return _NATIVE_SHUTDOWN_CMD if method == "native" else _PUSH_SHUTDOWN_CMD
+
+
+def _valid_ssh_alias(alias: str) -> bool:
+    """T-02-10: a plain host or ``ssh_config`` alias, not an option or a shell string.
+
+    Shares its regex with ``Config.load``'s check so the CLI cannot accept a value
+    the loader would disarm. The alias becomes an argv element in an unattended
+    ``ssh`` at outage time once the push projection is live, where a leading ``-``
+    is read as an option.
+    """
+    return bool(_SSH_ALIAS_RE.match(alias.strip()))
+
+
 def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator monitor add")
     parser.add_argument("name")
-    parser.add_argument("--ssh", required=True, help="ssh_config alias for the secondary")
-    parser.add_argument("--ups", required=True, help="NUT UPS name the secondary draws from")
+    parser.add_argument(
+        "--method",
+        default="native",
+        choices=("none", "native", "serial", "ssh"),
+        help="shutdown authority for this machine (default native, Phase-1 behaviour)",
+    )
+    parser.add_argument("--ssh", help="ssh_config alias (required for --method native/ssh)")
+    parser.add_argument("--ups", help="NUT UPS name the machine draws from")
     parser.add_argument("--ip", help="explicit source IP (skips SSH_CONNECTION probe)")
     parser.add_argument("--os", default="auto", choices=("auto", "arch", "ubuntu", "debian"))
     parser.add_argument("--powervalue", type=int, default=1, choices=(0, 1))
-    parser.add_argument("--shutdown-cmd", default="/sbin/shutdown -h now")
+    # Default resolved from --method, not fixed here: a push needs the escalated
+    # form and native needs the bare one (NEW-2).
+    parser.add_argument("--shutdown-cmd", default=None)
+    parser.add_argument("--serial-device", default="", help="--method serial: console under /dev/")
+    parser.add_argument(
+        "--serial-baud",
+        default=None,
+        help="--method serial: the console's DECLARED baud; never assumed (P2-08)",
+    )
     parser.add_argument("--primary-ip", help="override the LAN address in the MONITOR line")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, mutate nothing")
     parser.add_argument("--no-firewall", action="store_true", help="skip the nft open")
     parser.add_argument("--no-restart-bouncer", action="store_true", help="skip bouncer restart")
     parser.add_argument("--force", action="store_true", help="override refuse-on-existing guards")
+    # T-02-54: --force used to authorise BOTH the local guards above AND clobbering
+    # a third host's /etc/nut/upsmon.conf, so an operator following the dual-regime
+    # error message's own instruction also authorised the remote overwrite. Split.
+    parser.add_argument(
+        "--force-remote-config",
+        action="store_true",
+        help="overwrite an UNMARKED remote /etc/nut/upsmon.conf or demote its MODE",
+    )
     args = parser.parse_args(argv)
 
-    # 1. up-front arg validation (rc 2)
-    if '"' in args.shutdown_cmd:
+    method: str = args.method
+    shutdown_cmd = _resolve_shutdown_cmd(method, args.shutdown_cmd)
+
+    # 1. up-front arg validation (rc 2), method-independent first.
+    if '"' in shutdown_cmd:
         LOG.error("monitor add: --shutdown-cmd must not contain a double-quote")
         return 2
     if args.ip and not _valid_ip(args.ip):
         LOG.error("monitor add: --ip %r is not a valid IP literal", args.ip)
         return 2
-    if not nutclient.valid_nut_name(args.ups):
+    if args.ups is not None and not nutclient.valid_nut_name(args.ups):
         LOG.error("monitor add: --ups %r is not a valid NUT UPS name", args.ups)
         return 2
     if args.primary_ip and not _valid_ip(args.primary_ip):
         LOG.error("monitor add: --primary-ip %r is not a valid IP literal", args.primary_ip)
         return 2
+    if args.ssh is not None and not _valid_ssh_alias(args.ssh):
+        LOG.error(
+            "monitor add: --ssh %r is not a plain host or ssh_config alias. That value "
+            "becomes an argv element in an unattended ssh at outage time, where a leading "
+            "'-' is read as an option and shell metacharacters are carried verbatim.",
+            args.ssh,
+        )
+        return 2
 
-    # 2. password from env ONLY — never invent, never store (rc 2 if absent)
+    # 2. method-specific required args (rc 2). `none` needs nothing at all.
+    if method in ("native", "ssh") and not args.ssh:
+        LOG.error("monitor add: --method %s requires --ssh <alias>", method)
+        return 2
+    if method != "none" and not args.ups:
+        LOG.error(
+            "monitor add: --method %s requires --ups <name> — a push is projected per UPS on "
+            "that UPS's low-battery event, so a machine with no UPS can never fire",
+            method,
+        )
+        return 2
+    if method == "serial":
+        if not args.serial_device.strip():
+            LOG.error("monitor add: --method serial requires --serial-device (a path under /dev/)")
+            return 2
+        baud = _strict_positive_baud(args.serial_baud)
+        if baud is None:
+            LOG.error(
+                "monitor add: --method serial requires a positive integer --serial-baud "
+                "(got %r). The baud is the operator's to declare and is never assumed: a "
+                "mismatch writes garbage down the line and still returns rc 0, a silent "
+                "no-shutdown. The live console on this site is 9600.",
+                args.serial_baud,
+            )
+            return 2
+    else:
+        baud = None
+
+    ups_name: str = args.ups or ""
+    ssh_alias: str = args.ssh or ""
+    target = args.name.strip().lower()
+    others = tuple(m for m in cfg.monitored_machines if m.name.strip().lower() != target)
+    existing = _monitor_find(cfg, args.name)
+
+    # 3. Transition guard, on the DECLARED method (T-02-23). `monitor remove` is the
+    # ONLY thing that actually disarms a native authority — it runs the real remote
+    # NUT teardown. Refusing beats an implicit cross-host disarm. Reading the
+    # declaration is load-bearing: nothing rewrites that field, so a load-time
+    # degrade can never open this guard.
+    if existing is not None and existing.shutdown_method == "native" and method != "native":
+        LOG.error(
+            "monitor add: %s is already enrolled as a NATIVE secondary. Changing it to "
+            "%r here would leave that box's remote upsmon armed AND add a second "
+            "authority. Run 'monitor remove %s' first — that is what runs the real "
+            "remote NUT teardown — then re-add it with --method %s.",
+            args.name,
+            method,
+            args.name,
+            method,
+        )
+        return 2
+
+    # 4. dual-regime --force gate (rc 2 without --force). The candidate carries the
+    # RESOLVED method: the refusal text reports it, and a candidate defaulting to
+    # `none` would send the operator to fix the wrong thing (BL-02).
+    candidate = MonitoredMachine(
+        name=args.name,
+        ssh=ssh_alias,
+        ups=ups_name,
+        powervalue=args.powervalue,
+        os=args.os,
+        shutdown_cmd=shutdown_cmd,
+        shutdown_method=method,
+        serial_device=args.serial_device,
+        serial_baud=baud,
+    )
+    conflicts = dual_regime_conflicts((*others, candidate), cfg.upses)
+    if conflicts and not args.force:
+        LOG.error(
+            "monitor add: %s is both an enrolled machine (shutdown_method=%r) and an "
+            "enabled shutdown_target on its UPS (double-shutdown risk) — pass --force to "
+            "override",
+            args.name,
+            method,
+        )
+        return 2
+
+    # 5. serial/ssh/none are RECORD-ONLY. This branch is deliberately ABOVE the
+    # secondary-password lookup and the whole native bootstrap: a machine with no
+    # UPS enrollment of its own must not get upsd.users, a LISTEN, an nft opening or
+    # a remote upsmon (T-02-11, P2-02/P2-04).
+    if method != "native":
+        entry = MonitoredMachine(
+            name=args.name,
+            ssh=ssh_alias,
+            ups=ups_name,
+            powervalue=args.powervalue,
+            os=args.os,
+            shutdown_cmd=shutdown_cmd,
+            ip="",  # written ONLY by the native enrollment path
+            shutdown_method=method,
+            serial_device=args.serial_device,
+            serial_baud=baud,
+            raw=dict(existing.raw) if existing is not None else {},
+        )
+        if args.dry_run:
+            transport = {
+                "serial": f"serial {args.serial_device} @ {baud} baud",
+                "ssh": f"ssh {ssh_alias}",
+                "none": "no active shutdown authority",
+            }[method]
+            print(f"[dry-run] record-only add ({method}): {transport}")
+            print(f"[dry-run] shutdown_cmd: {shutdown_cmd}")
+            print("[dry-run] skipped: upsd.users, LISTEN, nft, remote upsmon (native-only)")
+            print(f"[dry-run] persist: {args.name} (config written LAST)")
+            return 0
+        _monitor_persist(cfg_path, [*(m.to_dict() for m in others), entry.to_dict()])
+        print(f"recorded {args.name} (shutdown_method={method})")
+        return 0
+
+    # 6. password from env ONLY — never invent, never store (rc 2 if absent)
     password = os.environ.get(_SECRET_ENV, "")
     if not password:
         LOG.error("monitor add: %s not set in the environment", _SECRET_ENV)
         return 2
 
-    # 3. dual-regime --force gate (rc 2 without --force)
-    candidate = MonitoredMachine(
-        name=args.name,
-        ssh=args.ssh,
-        ups=args.ups,
-        powervalue=args.powervalue,
-        os=args.os,
-        shutdown_cmd=args.shutdown_cmd,
-    )
-    target = args.name.strip().lower()
-    others = tuple(m for m in cfg.monitored_machines if m.name.strip().lower() != target)
-    conflicts = dual_regime_conflicts((*others, candidate), cfg.upses)
-    if conflicts and not args.force:
-        LOG.error(
-            "monitor add: %s is both an enrolled secondary and an enabled shutdown_target "
-            "on its UPS (double-shutdown risk) — pass --force to override",
-            args.name,
-        )
-        return 2
-
-    # 4. resolve the remote source IP (validated literal). When --primary-ip is
+    # 7. resolve the remote source IP (validated literal). When --primary-ip is
     # given, the remote `ip route get <primary>` learns the machine's real LAN
     # source; otherwise the resolver falls back to $SSH_CONNECTION field 1.
-    ip = _resolve_remote_ip(args.ssh, args.ip, args.primary_ip or "")
+    ip = _resolve_remote_ip(ssh_alias, args.ip, args.primary_ip or "")
     if not ip:
-        LOG.error("monitor add: could not resolve a valid source IP for %s", args.ssh)
+        LOG.error("monitor add: could not resolve a valid source IP for %s", ssh_alias)
         return 2
 
-    # 5. resolve the primary's LAN IP the secondary's MONITOR line points at.
+    # 8. resolve the primary's LAN IP the secondary's MONITOR line points at.
     # Without --primary-ip, auto-detect it locally by routing toward the machine
     # (the primary's src on that path) rather than silently defaulting to
     # localhost, which would leave upsd bound to 127.0.0.1 and enrollment failing
@@ -1045,15 +1223,20 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     ns = cfg.nut_server
     # Carry a pre-existing entry's raw dict so re-adding (idempotent replace)
     # preserves that machine's operator-authored keys (e.g. a _comment).
-    existing = _monitor_find(cfg, args.name)
+    # BL-02/IB-03: shutdown_method is passed EXPLICITLY. `to_dict` always emits the
+    # field, so an omission here persists the dataclass default `none` — which the
+    # explicit-value branch in `from_dict` then honours forever, burning the
+    # has-`ups`⇒`native` derivation. The re-enroll path is the live instance: it
+    # re-arms the remote upsmon in step 10 while declaring the box opted out.
     entry = MonitoredMachine(
         name=args.name,
-        ssh=args.ssh,
-        ups=args.ups,
+        ssh=ssh_alias,
+        ups=ups_name,
         powervalue=args.powervalue,
         os=args.os,
-        shutdown_cmd=args.shutdown_cmd,
+        shutdown_cmd=shutdown_cmd,
         ip=ip,
+        shutdown_method="native",
         raw=dict(existing.raw) if existing is not None else {},
     )
     saddrs = _survivor_saddrs((*others, entry))
@@ -1064,11 +1247,11 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             f"[dry-run] bootstrap primary: LISTEN {primary}, user {ns.secondary_user} "
             "(password <redacted>), nft " + ("skip" if args.no_firewall else str(saddrs))
         )
-        print(f"[dry-run] remote bootstrap: {args.ssh} detect/install/write/enable")
+        print(f"[dry-run] remote bootstrap: {ssh_alias} detect/install/write/enable")
         print("[dry-run] verify (deep) then persist entry (no password)")
         return 0
 
-    # 5. bootstrap primary WITH the real password (upsd.users + LISTEN + restart + nft)
+    # 9. bootstrap primary WITH the real password (upsd.users + LISTEN + restart + nft)
     is_root = os.geteuid() == 0
     restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
     try:
@@ -1101,50 +1284,52 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             LOG.error("monitor add: %s", line)
         return 4
 
-    # 6. remote bootstrap: detect → install → write config (password on stdin) → enable
-    os_kind = args.os if args.os != "auto" else nutclient.detect_os(args.ssh, _monitor_run_ssh)
-    rc, _o, _e = nutclient.install_nut_client(args.ssh, os_kind, _monitor_run_ssh)
+    # 10. remote bootstrap: detect → install → write config (password on stdin) → enable
+    os_kind = args.os if args.os != "auto" else nutclient.detect_os(ssh_alias, _monitor_run_ssh)
+    rc, _o, _e = nutclient.install_nut_client(ssh_alias, os_kind, _monitor_run_ssh)
     if rc != 0:
         LOG.error("monitor add: remote nut-client install failed")
         return 3
     upsmon_text = nutclient.render_upsmon_conf(
-        args.ups,
+        ups_name,
         primary,
         ns.secondary_user,
         password,
-        args.shutdown_cmd,
+        shutdown_cmd,
         powervalue=args.powervalue,
     )
     rc, reason = nutclient.write_remote_nut_config(
-        args.ssh,
+        ssh_alias,
         upsmon_text,
         nutclient.render_nut_conf(),
         _REMOTE_UPSMON_PATH,
         _REMOTE_NUT_CONF_PATH,
         _monitor_run_ssh,
-        force=args.force,
+        # T-02-54: the REMOTE overwrite takes its own authorisation. `--force`
+        # clears the local guards its own error message names, and nothing else.
+        force=args.force_remote_config,
     )
     if rc != 0:
         LOG.error("monitor add: remote config write refused/failed: %s", reason)
         return 3
-    rc, _o, _e = nutclient.enable_nut_monitor(args.ssh, _monitor_run_ssh)
+    rc, _o, _e = nutclient.enable_nut_monitor(ssh_alias, _monitor_run_ssh)
     if rc != 0:
         LOG.error("monitor add: remote nut-monitor enable failed")
         return 3
 
-    # 7. deep verify (catches a wrong/placeholder password — plain upsc is unauth)
+    # 11. deep verify (catches a wrong/placeholder password — plain upsc is unauth)
     ok, detail = nutclient.verify_secondary(
-        args.ssh, args.ups, primary, _monitor_run_ssh, timeout=10, deep=True
+        ssh_alias, ups_name, primary, _monitor_run_ssh, timeout=10, deep=True
     )
     if not ok:
         LOG.error("monitor add: verification failed: %s", detail)
         return 5
 
-    # 8. persist by name (idempotent), no password, unknown keys preserved
+    # 12. persist by name (idempotent), no password, unknown keys preserved
     kept = [m.to_dict() for m in others]
     kept.append(entry.to_dict())
     _monitor_persist(cfg_path, kept)
-    print(f"enrolled {args.name} ({ip}) on {args.ups}")
+    print(f"enrolled {args.name} ({ip}) on {ups_name}")
     return 0
 
 
