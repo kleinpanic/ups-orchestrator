@@ -1235,8 +1235,10 @@ def _monitor_verify(
             timeout=args.timeout,
             deep=args.deep,
         )
-        _say(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
         if probe == "native":
+            # A declared `native` record is asking "is my secondary alive?", so the
+            # probe's own verdict IS the answer and the words match the code.
+            _say(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
             if machine.load_notices:
                 _say(
                     f"  the remote secondary remains the surviving authority — it lives in "
@@ -1244,12 +1246,30 @@ def _monitor_verify(
                     f"'monitor remove {machine.name}' is the only real disarm."
                 )
             return 0 if ok else 1
+
+        # IF-10: every other probe reason asks the INVERTED question — "is there an
+        # authority here that this record does not declare?" — so the probe's raw
+        # OK/FAIL is the opposite of the verdict. A `none`-with-`ups` record whose
+        # probe FAILED printed "FAIL" and returned 0: a script keying on the exit
+        # code read the opposite of the line it had just printed, which is worse than
+        # either being wrong alone. The rc semantics are the deliberate ones (1 means
+        # "an undeclared authority is still live"); the printed word is what moves.
         if ok:
-            _say(
-                f"  this record declares {declared!r}, and a live NUT secondary answers on "
-                f"that box. Run 'monitor remove {machine.name}' to actually disarm it."
-            )
             rc = 1
+            summary = (
+                f"a live NUT secondary answers on that box and this record declares "
+                f"{declared!r} ({detail}). Run 'monitor remove {machine.name}' to "
+                f"actually disarm it."
+            )
+        else:
+            summary = (
+                f"no live NUT secondary answered on that box, which matches the "
+                f"declared {declared!r} ({detail})"
+            )
+        # The word and the exit code are derived from the SAME value, so they cannot
+        # disagree again. `rc` may already be 1 from the disarm branch above, and
+        # FAIL is the right word for that too.
+        _say(f"{machine.name}: {'OK' if rc == 0 else 'FAIL'} — {summary}")
         return rc
 
     if machine.disarmed:

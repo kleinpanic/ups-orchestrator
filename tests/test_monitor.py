@@ -1858,11 +1858,63 @@ def test_verify_declared_none_with_ups_advisory_probes_and_is_rc1_when_answered(
 
 
 def test_verify_declared_none_with_ups_is_rc0_when_no_secondary_answers(
-    cfg_path, monkeypatch
+    cfg_path, monkeypatch, capsys
 ) -> None:
+    """IF-10: it printed FAIL and exited 0. A script keying on rc read the opposite.
+
+    The rc semantics are the deliberate ones — rc 1 means "an undeclared authority is
+    still live" — so a `none` record with nothing answering is genuinely rc 0. The
+    defect was the WORD: the probe's raw OK/FAIL answers "did a secondary reply?",
+    which for every non-native probe reason is the inverse of the verdict.
+    """
     _write_config(cfg_path, machines=[_machine_entry("spark", method="none", ups="cyberpower")])
     monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(1, "", "connection refused")]))
-    assert cli.main(["monitor", "verify", "spark"]) == 0
+
+    rc = cli.main(["monitor", "verify", "spark"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "spark: OK" in out
+    assert "spark: FAIL" not in out, "printed FAIL while exiting 0 (IF-10)"
+
+
+@pytest.mark.parametrize(
+    ("method", "extra_fields", "probe_rc"),
+    [
+        ("none", {"ups": "cyberpower"}, 0),  # undeclared authority IS live -> rc 1
+        ("none", {"ups": "cyberpower"}, 1),  # nothing answers -> rc 0
+        ("native", {"ssh": "mt", "ip": "192.168.1.114"}, 0),
+        ("native", {"ssh": "mt", "ip": "192.168.1.114"}, 1),
+        ("ssh", {"ssh": "mt", "ups": "cyberpower", "ip": "192.168.1.114"}, 0),
+        ("ssh", {"ssh": "mt", "ups": "cyberpower", "ip": "192.168.1.114"}, 1),
+    ],
+)
+def test_verify_summary_word_never_disagrees_with_the_exit_code(
+    cfg_path, monkeypatch, capsys, method, extra_fields, probe_rc
+) -> None:
+    # The invariant behind IF-10, over every probe reason and both probe outcomes:
+    # whatever `monitor verify` prints as its per-machine verdict must be the same
+    # answer the exit code gives, because scripts trust the rc and operators trust
+    # the line. Either alone being wrong is recoverable; disagreeing is not.
+    _write_config(cfg_path, machines=[_machine_entry("m1", method=method, **extra_fields)])
+    monkeypatch.setattr(
+        cli,
+        "_monitor_run_ssh",
+        FakeSSH([(probe_rc, "OL\n" if probe_rc == 0 else "", "" if probe_rc == 0 else "refused")]),
+    )
+
+    rc = cli.main(["monitor", "verify", "m1"])
+    out = capsys.readouterr().out
+
+    verdicts = [
+        line.split("m1: ", 1)[1].split(" ", 1)[0] for line in out.splitlines() if "m1: " in line
+    ]
+    verdicts = [v for v in verdicts if v in ("OK", "FAIL")]
+    assert verdicts, f"no verdict line printed for {method}/{probe_rc}: {out!r}"
+    expected = "OK" if rc == 0 else "FAIL"
+    assert set(verdicts) == {expected}, (
+        f"declared {method!r}, probe rc {probe_rc}: printed {verdicts} but exited {rc}"
+    )
 
 
 def test_verify_declared_ssh_with_a_stale_enrollment_ip_advisory_probes_rc1(
