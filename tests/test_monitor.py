@@ -2022,3 +2022,48 @@ def test_verify_secondary_rejects_an_option_shaped_alias_at_the_shared_sink() ->
     assert ok is False
     assert "alias" in detail
     assert calls == []
+
+
+def test_add_refuses_an_ambiguous_name_rc2_and_deletes_nothing(cfg_path, monkeypatch) -> None:
+    # BL-C2. `_monitor_find` is first-wins so the transition guard inspected an
+    # arbitrary duplicate, while `others` filtered out EVERY match so the persist
+    # deleted all of them. The pair below is the dangerous ordering: the FIRST record
+    # is the harmless ssh one the guard would see, the SECOND is the live native
+    # secondary the persist would delete — with no remote teardown, no nft revoke, and
+    # the box then declared a push target while its own upsmon stays armed.
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("spark", method="ssh", ssh="spark", ups=""),
+            dict(
+                _machine_entry("Spark", method="native", ssh="spark", ip="192.168.1.120"),
+                _comment="the LIVE native secondary",
+            ),
+        ],
+    )
+    before = cfg_path.read_text()
+    ssh, local, nft, _bounce = _no_privileged_seams(monkeypatch)
+
+    rc = cli.main(
+        ["monitor", "add", "spark", "--method", "ssh", "--ssh", "spark", "--ups", "cyberpower"]
+    )
+
+    assert rc == 2
+    assert cfg_path.read_text() == before  # byte-identical: nothing deleted, nothing added
+    assert ssh.calls == [] and nft.calls == [] and local.calls == []
+
+
+def test_add_still_works_for_an_unambiguous_re_enrollment(cfg_path, monkeypatch) -> None:
+    # The guard must not fire on the ordinary single-record re-enrolment path.
+    _write_config(
+        cfg_path, machines=[_machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower")]
+    )
+    _no_privileged_seams(monkeypatch)
+
+    rc = cli.main(
+        ["monitor", "add", "mt", "--method", "serial", "--ups", "cyberpower",
+         "--serial-device", "/dev/ttyUSB0", "--serial-baud", "9600"]
+    )
+
+    assert rc == 0
+    assert _entry(cfg_path, "mt")["shutdown_method"] == "serial"

@@ -1403,6 +1403,29 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     others = tuple(m for m in cfg.monitored_machines if m.name.strip().lower() != target)
     existing = _monitor_find(cfg, args.name)
 
+    # BL-C2: the same ambiguity `monitor remove` refuses (T-02-48), for the same two
+    # reasons — `_monitor_find` is first-wins, so the transition guard below would
+    # inspect an ARBITRARY one of the duplicates, while `others` filters out EVERY
+    # match, so the persist deletes all of them and appends one. Together that lets
+    # `monitor add <name> --method ssh` silently delete a live NATIVE record whose
+    # name differs only in case: no remote NUT teardown, no nft revoke, and the box
+    # is then declared a push target while its own upsmon is still armed — the exact
+    # native->push double shutdown the transition guard exists to refuse, reached
+    # without the guard ever firing.
+    # Counted with the SAME comparison `others` partitions on, so the guard covers
+    # exactly the set the persist would delete — not a near-miss of it.
+    duplicates = [m for m in cfg.monitored_machines if m.name.strip().lower() == target]
+    if len(duplicates) > 1:
+        LOG.error(
+            "monitor add: %d records share the name %r (case-insensitively), so which one "
+            "this would re-enrol — and which the persist would delete — is a guess. All of "
+            "them are disarmed at load. De-duplicate monitored_machines by hand, then "
+            "re-run this command.",
+            len(duplicates),
+            args.name,
+        )
+        return 2
+
     # 3. Transition guard, on the DECLARED method (T-02-23). `monitor remove` is the
     # ONLY thing that actually disarms a native authority — it runs the real remote
     # NUT teardown. Refusing beats an implicit cross-host disarm. Reading the
