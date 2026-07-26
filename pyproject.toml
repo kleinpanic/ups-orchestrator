@@ -63,6 +63,19 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 python_version = "3.11"
 strict = true
 files = ["src"]
+# `make type` failed on an untouched tree: mypy PARSES the stubs of installed
+# packages before deciding to skip them, and a current numpy's `__init__.pyi`
+# uses PEP 695 `type` statements, which the 3.11 target rejects as a syntax
+# error — "errors prevented further checking", so nothing was checked at all.
+#
+# numpy is not a dependency of this project. Runtime deps are empty by design
+# (stdlib only), and numpy arrives solely as a transitive dep of the OPTIONAL
+# `dashboard` extra. So the fix is neither to pin numpy — which would constrain
+# every real install to placate a dev tool — nor to raise `python_version`, which
+# would silently drop the 3.11 support floor that `requires-python` claims and the
+# classifiers advertise. It is to stop mypy consulting site-packages for typing at
+# all, which for a stdlib-only package costs nothing.
+no_site_packages = true
 
 # matplotlib is an optional runtime dep (power-dashboard only) and ships no
 # typed stubs; skip it and its numpy backend rather than fail strict checking.
