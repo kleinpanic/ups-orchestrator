@@ -64,6 +64,7 @@ from ups_orchestrator.config import (
     ShutdownTarget,
     UpsConfig,
     dual_regime_conflicts,
+    is_disarming,
 )
 
 # The preview reuses the firing path's OWN gate and projection rather than
@@ -212,12 +213,12 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
     from ups_orchestrator.notify import Level, Notification
 
     for n in cfg.degraded:
-        if n.severity == "error":
+        if is_disarming(n):
             LOG.error("config degrade: %s", n)
         else:
             LOG.warning("config advisory: %s", n)
-    errors = [n for n in cfg.degraded if n.severity == "error"]
-    advisories = [n for n in cfg.degraded if n.severity != "error"]
+    errors = [n for n in cfg.degraded if is_disarming(n)]
+    advisories = [n for n in cfg.degraded if not is_disarming(n)]
     # Discord caps an embed at 25 fields; the overflow is still in the journal and
     # in `monitor list`, so truncating here loses nothing an operator cannot reach.
     shown = list(cfg.degraded)[:20]
@@ -913,7 +914,7 @@ def _print_degraded(cfg: Config) -> None:
     print("")
     print("⚠ DEGRADED CONFIG — a shutdown authority was disarmed or flagged at load:")
     for n in cfg.degraded:
-        label = "ERROR" if n.severity == "error" else "ADVISORY"
+        label = "ERROR" if is_disarming(n) else "ADVISORY"
         print(f"  {label} {n.subject}: {n.message}")
 
 
@@ -1050,7 +1051,7 @@ def _monitor_verify(
     rc = 0
     if machine.disarmed:
         for n in machine.load_notices:
-            if n.severity == "error":
+            if is_disarming(n):
                 print(f"  DISARMED (declared {declared}): {n.message}")
         rc = 1
     else:
@@ -1608,7 +1609,7 @@ def _preview_verdict(
     UPS's charge state and imply it was merely waiting for a low battery.
     """
     if not target.effective_enabled:
-        if any(n.severity == "error" for n in target.load_notices):
+        if any(is_disarming(n) for n in target.load_notices):
             return False, "disarmed at load — see 'monitor list'"
         return False, "target not enabled"
     return _target_should_fire(ups, state, deps, target, snap)

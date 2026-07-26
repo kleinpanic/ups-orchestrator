@@ -18,6 +18,8 @@ from ups_orchestrator.config import (
     derive_shutdown_method,
     dual_regime_conflicts,
     dual_regime_pairs,
+    is_disarming,
+    is_disarming_severity,
     legacy_only_targets,
     requires_root_escalation,
     unknown_ups_references,
@@ -978,6 +980,56 @@ def _err(msg: str = "boom") -> ConfigNotice:
 
 def _adv(msg: str = "look at this") -> ConfigNotice:
     return ConfigNotice(severity="advisory", subject="mt", message=msg)
+
+
+def test_config_notice_rejects_an_unknown_severity() -> None:
+    # MED-01. severity was an unvalidated str compared against a bare literal at nine
+    # sites, every one of which read "not error" as advisory — so a typo silently
+    # downgraded a disarm and the machine stayed ARMED while status labelled it
+    # ADVISORY. Rejecting the value at construction means it cannot reach a fold.
+    for bad in ("Error", "errror", "critical", "", "ERROR"):
+        with pytest.raises(ValueError, match="severity"):
+            ConfigNotice(severity=bad, subject="mt", message="boom")
+    # dataclasses.replace runs __post_init__ too, so the four INV-DEGRADE helpers
+    # cannot smuggle one in either.
+    with pytest.raises(ValueError, match="severity"):
+        dataclasses.replace(_err(), severity="critical")
+
+
+def test_the_severity_fold_fails_closed_on_an_unrecognised_value() -> None:
+    # The other half: _transport_notices produces severities as FREE strings that never
+    # pass the construction boundary, so the fold itself has to be oriented to disarm
+    # on anything it does not recognise.
+    assert is_disarming_severity("error") is True
+    assert is_disarming_severity("critical") is True
+    assert is_disarming_severity("Error") is True
+    assert is_disarming_severity("") is True
+    assert is_disarming_severity("advisory") is False
+    assert is_disarming(_err()) is True
+    assert is_disarming(_adv()) is False
+
+
+def test_an_unrecognised_transport_severity_disarms_rather_than_arms(monkeypatch) -> None:
+    # Reachability for the fold above, through the real degrade path: step 5 of
+    # _apply_degrades chooses disarm-vs-advise from a bare string. A future "critical"
+    # used to leave the machine ARMED and merely mention it.
+    import ups_orchestrator.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "validate_active_transports",
+        lambda machines: tuple((m.name, "critical", "a severity nobody added a branch for")
+                               for m in machines),
+    )
+    machines = _machines({"name": "mt", "ups": "cyberpower", "ssh": "mt", "shutdown_method": "ssh"})
+    upses = {"cyberpower": UpsConfig.from_dict("cyberpower", {})}
+
+    degraded_machines, _upses, notices = config_mod._apply_degrades(machines, upses)
+
+    assert degraded_machines[0].disarmed is True
+    assert degraded_machines[0].effective_method == "none"
+    assert degraded_machines[0].shutdown_method == "ssh"  # INV-DECLARED
+    assert any("nobody added a branch" in n.message for n in notices)
 
 
 def test_disarmed_is_structurally_false_for_native() -> None:

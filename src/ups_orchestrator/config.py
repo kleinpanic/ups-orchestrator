@@ -128,6 +128,26 @@ def requires_root_escalation(cmd: str) -> bool:
     return False
 
 
+# MED-01. The two severities a notice may carry, as data rather than as nine bare
+# string literals spread across four modules.
+SEVERITIES = frozenset({"error", "advisory"})
+
+
+def is_disarming_severity(severity: str) -> bool:
+    """Does this severity take a shutdown authority away? Unrecognised means YES.
+
+    The fold used to be ``severity == "error"``, which made every unrecognised value —
+    a ``"Error"`` typo, a future ``"critical"`` — silently downgrade a disarm to an
+    advisory: the machine stayed ARMED, ``status.render`` labelled it "ADVISORY", and
+    nothing failed. For a module whose whole job is deciding which machines get powered
+    off, the fold has to be oriented the other way. ``ConfigNotice.__post_init__``
+    keeps the value in ``SEVERITIES`` at the construction boundary; this keeps the
+    FOLD safe for the severities that arrive as free strings from
+    ``_transport_notices`` and never pass through that boundary.
+    """
+    return severity != "advisory"
+
+
 @dataclass(frozen=True)
 class ConfigNotice:
     """One load-time degrade report.
@@ -147,8 +167,25 @@ class ConfigNotice:
     subject: str
     message: str
 
+    def __post_init__(self) -> None:
+        # MED-01. The severity was an unvalidated str compared against a bare literal
+        # at nine sites, every one of which read "not error" as advisory. Rejecting the
+        # value here means a typo cannot reach a fold at all. Only the four INV-DEGRADE
+        # helpers construct notices, and all four pass a literal, so this can never
+        # fire from Config.load — it is a boundary for future call sites.
+        if self.severity not in SEVERITIES:
+            raise ValueError(
+                f"ConfigNotice severity must be one of {sorted(SEVERITIES)}, "
+                f"got {self.severity!r}"
+            )
+
     def __str__(self) -> str:
         return f"[{self.severity}] {self.subject}: {self.message}"
+
+
+def is_disarming(notice: ConfigNotice) -> bool:
+    """Does ``notice`` take a shutdown authority away? See ``is_disarming_severity``."""
+    return is_disarming_severity(notice.severity)
 
 
 def _opt_int(value: object) -> int | None:
@@ -425,7 +462,7 @@ class MonitoredMachine:
         the native carve-out unforgeable: nothing in this module rewrites that field.
         """
         return (
-            any(n.severity == "error" for n in self.load_notices)
+            any(is_disarming(n) for n in self.load_notices)
             and self.shutdown_method != "native"
         )
 
@@ -590,7 +627,7 @@ class ShutdownTarget:
         leaves the target armed. Unlike ``native``, a legacy target's authority is
         in-process, so an ERROR here genuinely disarms it.
         """
-        return self.enabled and not any(n.severity == "error" for n in self.load_notices)
+        return self.enabled and not any(is_disarming(n) for n in self.load_notices)
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> ShutdownTarget:
@@ -1135,7 +1172,7 @@ def _apply_degrades(
 
     def _record(notice: ConfigNotice) -> None:
         notices.append(notice)
-        if notice.severity == "error":
+        if is_disarming(notice):
             logger.error("config degrade: %s", notice)
         else:
             logger.warning("config advisory: %s", notice)
@@ -1153,7 +1190,7 @@ def _apply_degrades(
 
     def disarm_target(ups_key: str, target_name: str, message: str) -> None:
         for j, t in enumerate(target_lists[ups_key]):
-            if t.name == target_name and not any(n.severity == "error" for n in t.load_notices):
+            if t.name == target_name and not any(is_disarming(n) for n in t.load_notices):
                 target_lists[ups_key][j] = _disarm_target(ups_key, t, message)
                 _record(target_lists[ups_key][j].load_notices[-1])
                 return
@@ -1258,7 +1295,7 @@ def _apply_degrades(
     # 5. Transports. The severity is chosen at THIS call site, by name, per notice.
     for name, severity, message in validate_active_transports(tuple(working)):
         for i in indices(name):
-            if severity == "error":
+            if is_disarming_severity(severity):
                 disarm_at(i, message)
             else:
                 advise_at(i, message)

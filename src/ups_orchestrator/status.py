@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from ups_orchestrator.config import Config, ConfigNotice
+from ups_orchestrator.config import Config, ConfigNotice, is_disarming
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
@@ -168,8 +168,9 @@ def _degraded_block(degraded: tuple[ConfigNotice, ...], *, use_color: bool) -> l
     title = c("⚠ DEGRADED CONFIG", _RED)
     lines = []
     for n in degraded:
-        label = "ERROR" if n.severity == "error" else "ADVISORY"
-        color = _RED if n.severity == "error" else _YELLOW
+        disarming = is_disarming(n)
+        label = "ERROR" if disarming else "ADVISORY"
+        color = _RED if disarming else _YELLOW
         lines.append(f"{c(label, color)} {c(n.subject, _BOLD)}: {n.message}")
     return ["", *_panel(title, _vlen(title), lines, use_color=use_color)]
 
