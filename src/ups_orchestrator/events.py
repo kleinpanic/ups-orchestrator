@@ -631,8 +631,23 @@ def _fire_target(
     # blocking Discord POST — up to ~16.5 s of retries against a switch the outage just
     # killed — outside the backstop's reach. It is inside now AND non-raising via
     # ``_notify``, so no path can reach the runner without the append that follows it.
+    #
+    # F3: it also used to sit one line ABOVE the runner, INSIDE this try, which kept the
+    # backstop's guarantee but still spent the whole POST before the transport ran.
+    # Measured with a 0.30 s stand-in POST, every transport waited on a full POST;
+    # against a switch the outage has already killed that is ~16.5 s of dead time per
+    # target, serialised, inside a gate that opens at runtime_below: 300. It is not
+    # academic here: `cyberpower` powers BOTH this orchestrator and the Dell PowerEdge,
+    # so time spent telling Discord about the push to mt is time subtracted from the
+    # Pi's own remaining runtime, and locals fire only after every remote has been sent.
+    #
+    # The transport now runs FIRST. Nothing about the operator surface changes — both
+    # notifications are still sent, still in attempt-then-result order, still carrying
+    # the snapshot and trigger the result embed does not — they just no longer sit
+    # between the decision and the wire. The event log is unaffected: the
+    # `shutdown_attempt` line above is a local append and is written before the runner
+    # exactly as it was.
     try:
-        _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
         if target.is_local:
             rc, _out, err = deps.local_shutdown(target.cmd)
         elif target.is_serial:
@@ -641,6 +656,8 @@ def _fire_target(
             rc, _out, err = deps.ssh_shutdown(target)
     except Exception as exc:  # noqa: BLE001 - an escaping runner must not strand the rest
         rc, err = 1, f"shutdown transport for {target.name} ({where}) raised: {exc}"
+    # Unchanged and load-bearing: the append happens on EVERY outcome, including an rc!=0
+    # and an escaping runner, so a dead remote can never strand the local host (T-02-24).
     state.shutdowns_sent.append(target.name)
     _log_event(
         deps,
@@ -650,6 +667,7 @@ def _fire_target(
         "Configured shutdown target command completed.",
         {"target": target.name, "where": where, "returncode": rc, "stderr": err},
     )
+    _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
     _notify_shutdown_result(ups, deps, target, rc, err, where)
 
 

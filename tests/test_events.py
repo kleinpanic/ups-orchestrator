@@ -1601,3 +1601,105 @@ def test_cross_ups_PUSH_collision_still_fires_both_independently(tmp_path) -> No
     # One firing per UPS tick: the legacy target on cyberpower, the projected push
     # on cyberpower3. Two events, two authorities, never the same event twice.
     assert _fire_every_ups(cfg) == ["spark", "spark"]
+
+
+class _TimelineNotifier(FakeNotifier):
+    """A notifier that writes into a shared timeline, so ordering is observable.
+
+    The real notifier's cost is what F3 is about: max_attempts=3 x timeout=5.0 plus
+    backoff is ~16.5 s against a switch the outage has already killed. Cost is not
+    simulated here — ORDER is the invariant, and order is what decides whether the
+    transport waits on a POST or the POST waits on the transport.
+    """
+
+    def __init__(self, timeline: list[str]) -> None:
+        super().__init__()
+        self._timeline = timeline
+
+    def send(self, note):
+        kind = (
+            "attempt" if "attempt" in note.title else "result" if "sent" in note.title else "other"
+        )
+        self._timeline.append(f"NOTIFY:{kind}")
+        return super().send(note)
+
+
+def _fire_timeline(targets: tuple[ShutdownTarget, ...]) -> list[str]:
+    """Run one on-battery-and-low tick; return the interleaved POST/transport order."""
+    timeline: list[str] = []
+    notifier = _TimelineNotifier(timeline)
+    deps, _calls = make_deps(notifier, _low(), countdown_every=0)
+
+    def _ssh(target: ShutdownTarget) -> tuple[int, str, str]:
+        timeline.append(f"TRANSPORT:{target.name}")
+        return 0, "", ""
+
+    deps = replace(deps, ssh_shutdown=_ssh)
+    ups = make_ups("ups1", targets=targets, shutdown_policy=shutdown_policy())
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+    return [e for e in timeline if e != "NOTIFY:other"]
+
+
+def test_f3_transport_is_not_made_to_wait_on_a_notification() -> None:
+    """F3. The attempt POST used to precede the runner, so every transport waited.
+
+    Measured before this fix with a 0.30 s stand-in POST: three ssh targets took
+    2.40 s and every transport was preceded by a full blocking POST. Scaled to the
+    real notifier against a dead switch that is ~16.5 s per target, serialised,
+    inside a gate that opens at runtime_below: 300 — and `cyberpower` powers BOTH
+    this orchestrator and the Dell PowerEdge, so that time comes straight out of
+    the Pi's own remaining runtime.
+    """
+    order = _fire_timeline((_remote("box0"), _remote("box1"), _remote("box2")))
+
+    assert order == [
+        "TRANSPORT:box0",
+        "NOTIFY:attempt",
+        "NOTIFY:result",
+        "TRANSPORT:box1",
+        "NOTIFY:attempt",
+        "NOTIFY:result",
+        "TRANSPORT:box2",
+        "NOTIFY:attempt",
+        "NOTIFY:result",
+    ]
+    # The load-bearing property, stated independently of the exact embed set: no
+    # notification is ever emitted before the first transport, and each transport
+    # is reached having waited on strictly fewer POSTs than there are prior targets
+    # x 2. Before the fix the first entry was NOTIFY:attempt.
+    assert order[0].startswith("TRANSPORT:")
+    assert order.index("TRANSPORT:box2") == 6  # was 7 with the attempt POST in front
+
+
+def test_f3_reorder_preserves_the_shutdowns_sent_guarantee() -> None:
+    """T-02-24 must survive the reorder: a failing remote still lets the local fire.
+
+    The append moved to sit between the runner and both notifications; it must
+    still happen on EVERY outcome, including a non-zero rc and an escaping runner.
+    """
+    for runner, label in (
+        (lambda _t: (1, "", "boom"), "rc!=0"),
+        (_raise_switch_is_dead, "raised"),
+    ):
+        notifier = FakeNotifier()
+        deps, calls = make_deps(notifier, _low(), countdown_every=0, local_rc=0)
+        deps = replace(deps, ssh_shutdown=runner)
+        ups = make_ups(
+            "ups1",
+            targets=(_remote("srv"), _local("pi")),
+            shutdown_policy=shutdown_policy(internal_enabled=True),
+        )
+        state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+        dispatch("tick", ups, state, deps)
+
+        assert state.shutdowns_sent == ["srv", "pi"], label
+        assert calls == ["local"], label  # the local proceeded despite the dead remote
+        # ...and the operator still gets both embeds for the failed remote.
+        titles = [n.title for n in notifier.sent]
+        assert any("shutdown attempt for srv" in t for t in titles), label
+        assert any("shutdown FAILED for srv" in t for t in titles), label
+
+
+def _raise_switch_is_dead(_target: ShutdownTarget) -> tuple[int, str, str]:
+    raise RuntimeError("the switch is dead")
