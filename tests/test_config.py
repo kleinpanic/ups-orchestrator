@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from ups_orchestrator.config import Config, dual_regime_conflicts
+from ups_orchestrator.config import (
+    Config,
+    MonitoredMachine,
+    ShutdownTarget,
+    derive_shutdown_method,
+    dual_regime_conflicts,
+)
 
 
 def _write(tmp_path: Path, data: dict[str, object]) -> Path:
@@ -263,6 +269,194 @@ def test_dual_regime_no_conflict_when_target_disabled(tmp_path: Path) -> None:
     )
     cfg = Config.load(p, env={})
     assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ()
+
+
+# --- Phase 2 Task 1: shutdown_method + serial fields on MonitoredMachine ---
+
+
+def test_shutdown_method_parses_allow_set() -> None:
+    for method in ("none", "native", "serial", "ssh"):
+        m = MonitoredMachine.from_dict({"name": "x", "shutdown_method": method})
+        assert m.shutdown_method == method
+
+
+def test_shutdown_method_unknown_coerces_to_none(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        m = MonitoredMachine.from_dict({"name": "x", "shutdown_method": "telepathy"})
+    assert m.shutdown_method == "none"
+    assert any("telepathy" in rec.message for rec in caplog.records)
+
+
+def test_serial_baud_defaults_9600_never_115200() -> None:
+    # An explicit serial method with no baud must default to 9600, matching the
+    # live line — never the 115200 landmine (P2-08).
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "ups": "cyberpower", "shutdown_method": "serial", "serial_device": "/dev/ttyUSB0"}
+    )
+    assert m.serial_baud == 9600
+    assert m.serial_device == "/dev/ttyUSB0"
+
+
+def test_serial_fields_parse_explicit() -> None:
+    m = MonitoredMachine.from_dict(
+        {
+            "name": "mt",
+            "ups": "cyberpower",
+            "shutdown_method": "serial",
+            "serial_device": "/dev/serial/by-id/x",
+            "serial_baud": 19200,
+        }
+    )
+    assert m.serial_device == "/dev/serial/by-id/x"
+    assert m.serial_baud == 19200
+
+
+def test_derive_native_when_ups_present() -> None:
+    # has-ups => native, evaluated ahead of the backup branch.
+    from ups_orchestrator.config import BackupShutdown
+
+    method = derive_shutdown_method(
+        raw={}, ssh="spark", ups="cyberpower", backup=BackupShutdown(enabled=False, kind="remote")
+    )
+    assert method == "native"
+
+
+def test_derive_none_when_nothing() -> None:
+    from ups_orchestrator.config import BackupShutdown
+
+    method = derive_shutdown_method(
+        raw={}, ssh="", ups="", backup=BackupShutdown(enabled=False, kind="remote")
+    )
+    assert method == "none"
+
+
+def test_derive_backup_remote_to_ssh_only_when_enabled() -> None:
+    from ups_orchestrator.config import BackupShutdown
+
+    # No ups, backup enabled+remote => ssh
+    assert (
+        derive_shutdown_method(
+            raw={}, ssh="host", ups="", backup=BackupShutdown(enabled=True, kind="remote")
+        )
+        == "ssh"
+    )
+    # No ups, backup enabled+serial => serial requires migration (no serial fields to project)
+    # handled by from_dict; the raw derivation for serial maps to "serial".
+    assert (
+        derive_shutdown_method(
+            raw={}, ssh="", ups="", backup=BackupShutdown(enabled=True, kind="serial")
+        )
+        == "serial"
+    )
+    # backup disabled => never derives an active method
+    assert (
+        derive_shutdown_method(
+            raw={}, ssh="host", ups="", backup=BackupShutdown(enabled=False, kind="remote")
+        )
+        == "none"
+    )
+
+
+def test_from_dict_derives_native_for_spark_shape() -> None:
+    # spark's real Phase-1 shape: ups set, backup {enabled:false,kind:remote}, no shutdown_method.
+    m = MonitoredMachine.from_dict(
+        {
+            "name": "spark",
+            "ssh": "spark",
+            "ups": "cyberpower",
+            "backup": {"enabled": False, "kind": "remote"},
+        }
+    )
+    assert m.shutdown_method == "native"
+
+
+def test_from_dict_explicit_method_wins_over_derivation() -> None:
+    m = MonitoredMachine.from_dict(
+        {"name": "x", "ups": "cyberpower", "shutdown_method": "ssh", "ssh": "x"}
+    )
+    assert m.shutdown_method == "ssh"
+
+
+def test_legacy_serial_backup_without_serial_fields_rejected() -> None:
+    # A legacy backup {enabled:true, kind:serial} has no serial_device/baud to project;
+    # it must raise a clear migration error rather than derive an unfireable serial.
+    with pytest.raises(ValueError, match="serial"):
+        MonitoredMachine.from_dict(
+            {"name": "mt", "backup": {"enabled": True, "kind": "serial"}}
+        )
+
+
+def test_round_trip_preserves_new_fields() -> None:
+    m = MonitoredMachine.from_dict(
+        {
+            "name": "mt",
+            "ups": "cyberpower",
+            "shutdown_method": "serial",
+            "serial_device": "/dev/ttyUSB0",
+            "serial_baud": 9600,
+        }
+    )
+    out = m.to_dict()
+    assert out["shutdown_method"] == "serial"
+    assert out["serial_device"] == "/dev/ttyUSB0"
+    assert out["serial_baud"] == 9600
+    # backup still emitted (D-05 defers dropping it)
+    assert out["backup"] == {"enabled": False, "kind": "remote"}
+
+
+def test_transport_valid_serial_empty_device_rejected(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [
+                {"name": "mt", "ups": "cyberpower", "shutdown_method": "serial", "serial_baud": 9600}
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="serial"):
+        Config.load(p, env={})
+
+
+def test_transport_valid_serial_nonpositive_baud_rejected(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [
+                {
+                    "name": "mt",
+                    "ups": "cyberpower",
+                    "shutdown_method": "serial",
+                    "serial_device": "/dev/ttyUSB0",
+                    "serial_baud": 0,
+                }
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="baud"):
+        Config.load(p, env={})
+
+
+def test_transport_valid_ssh_empty_alias_rejected(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [
+                {"name": "mt", "ups": "cyberpower", "shutdown_method": "ssh", "ssh": ""}
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="ssh"):
+        Config.load(p, env={})
+
+
+def test_legacy_baud_default_now_9600() -> None:
+    # ShutdownTarget.baud landmine closed: default is 9600, not 115200.
+    t = ShutdownTarget.from_dict({"name": "s", "kind": "serial", "device": "/dev/ttyUSB0"})
+    assert t.baud == 9600
+    assert ShutdownTarget().baud == 9600
 
 
 def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> None:
