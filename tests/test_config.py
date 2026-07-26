@@ -1085,6 +1085,39 @@ def test_validate_legacy_targets_reports_unfireable_shapes() -> None:
     assert "kind" in one({"name": "e", "kind": "telepathy", "enabled": True, "host": "h"})
 
 
+def test_validate_legacy_targets_rejects_option_shaped_host_and_user() -> None:
+    # BL-01. `MonitoredMachine.ssh` was hardened by T-02-10 because it becomes an argv
+    # element in an unattended ssh at outage time. The legacy target reaches the
+    # IDENTICAL sink via `events.ssh_dest` and was checked only for blankness, so
+    # `-oProxyCommand=...` validated clean and stayed armed.
+    def messages(target: dict[str, object]) -> list[str]:
+        return [m for _ups, _name, m in validate_legacy_targets(_ups_with_targets(target))]
+
+    injected = "-oProxyCommand=touch /tmp/pwn"
+    host_problems = messages({"name": "h", "kind": "remote", "enabled": True, "host": injected})
+    assert len(host_problems) == 1
+    assert "host" in host_problems[0] and repr(injected) in host_problems[0]
+
+    # `ssh_dest` concatenates f"{user}@{host}", so a leading '-' can come from either.
+    user_problems = messages(
+        {"name": "u", "kind": "remote", "enabled": True, "host": "mt", "user": "-oProxyCommand=x"}
+    )
+    assert len(user_problems) == 1
+    assert "user" in user_problems[0]
+
+    # Shell metacharacters are carried verbatim into the argv too.
+    assert messages({"name": "s", "kind": "remote", "enabled": True, "host": "mt;reboot"})
+
+    # Legitimate operator spellings stay clean.
+    assert messages({"name": "a", "kind": "remote", "enabled": True, "host": "mt"}) == []
+    assert (
+        messages(
+            {"name": "b", "kind": "remote", "enabled": True, "host": "h.example:22", "user": "root"}
+        )
+        == []
+    )
+
+
 def test_validate_legacy_targets_silent_on_healthy_and_disabled() -> None:
     healthy = _ups_with_targets(
         {"name": "ok-remote", "kind": "remote", "enabled": True, "host": "h"},
@@ -1735,6 +1768,39 @@ def test_unfireable_legacy_targets_are_disarmed(tmp_path: Path) -> None:
     # Declarations are never rewritten.
     assert all(t.enabled for t in ups.shutdown_targets)
     assert {n.subject for n in cfg.degraded} >= {"cyberpower/no-host", "cyberpower/odd-kind"}
+
+
+def test_option_shaped_legacy_host_is_disarmed_through_config_load(tmp_path: Path) -> None:
+    # BL-01 end to end: the injected target must not survive the load ARMED. It fails
+    # closed like every other transport error, and the declaration on disk is untouched.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [
+                        {
+                            "name": "evil",
+                            "kind": "remote",
+                            "enabled": True,
+                            "host": "-oProxyCommand=touch /tmp/pwn",
+                        },
+                        {"name": "healthy", "kind": "remote", "enabled": True, "host": "mt"},
+                    ],
+                }
+            }
+        },
+    )
+    cfg = Config.load(p, env={})
+    ups = cfg.ups("cyberpower")
+    assert ups is not None
+    effective = {t.name: t.effective_enabled for t in ups.shutdown_targets}
+    assert effective == {"evil": False, "healthy": True}
+    assert all(t.enabled for t in ups.shutdown_targets)  # INV-DECLARED
+    assert any(
+        n.subject == "cyberpower/evil" and n.severity == "error" for n in cfg.degraded
+    )
 
 
 def test_advise_target_is_the_mirror_of_disarm_target() -> None:

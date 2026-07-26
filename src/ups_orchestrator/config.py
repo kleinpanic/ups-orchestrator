@@ -855,6 +855,8 @@ def validate_legacy_targets(
     * a serial target with a blank device;
     * a ``remote`` target with a blank host — ``from_dict`` accepts it and ``ssh`` can
       never connect to it;
+    * a ``remote`` target whose ``host`` or ``user`` is not a plain host/ssh_config
+      alias (BL-01);
     * a ``kind`` that is none of remote/serial/local, because dispatch treats anything
       not local and not serial as SSH, so an unknown kind becomes a silent ssh attempt
       against whatever ``host`` happens to hold.
@@ -905,15 +907,35 @@ def validate_legacy_targets(
                             f"was about to use. Declare the live console's baud (9600 here).",
                         )
                     )
-            elif kind == "remote" and not t.host.strip():
-                problems.append(
-                    (
-                        ups_key,
-                        t.name,
-                        "remote target with a blank host; ssh can never connect. Set host "
-                        "to the hostname or ssh_config alias of the box to shut down.",
+            elif kind == "remote":
+                if not t.host.strip():
+                    problems.append(
+                        (
+                            ups_key,
+                            t.name,
+                            "remote target with a blank host; ssh can never connect. Set host "
+                            "to the hostname or ssh_config alias of the box to shut down.",
+                        )
                     )
-                )
+                # BL-01. The SAME sink T-02-10 hardened for MonitoredMachine.ssh: both
+                # fields land in ``events.ssh_dest`` -> ``["ssh", ..., dest, cmd]``, so a
+                # leading '-' in EITHER is read by ssh as an option and an injected
+                # ProxyCommand runs unattended at outage time. Only the machine half was
+                # checked; the legacy half reaches the identical argv.
+                for field_name, value in (("host", t.host), ("user", t.user)):
+                    v = value.strip()
+                    if v and not _SSH_ALIAS_RE.match(v):
+                        problems.append(
+                            (
+                                ups_key,
+                                t.name,
+                                f"remote target declares {field_name} {value!r}, which is not "
+                                f"a plain host or ssh_config alias. It becomes an argv element "
+                                f"in an unattended ssh at outage time, where a leading '-' is "
+                                f"read as an option and shell metacharacters are carried "
+                                f"verbatim. Use a plain hostname or ssh_config alias.",
+                            )
+                        )
     return tuple(problems)
 
 

@@ -69,7 +69,11 @@ def ssh_dest(target: ShutdownTarget) -> str:
 # the contract, not laziness.
 def _default_ssh_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
     dest = ssh_dest(target)
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", dest, target.cmd]
+    # BL-01 belt-and-braces at the sink. `config.validate_legacy_targets` disarms an
+    # option-shaped host/user at load, but a hand-constructed target never passes
+    # through the validator. `--` terminates OpenSSH's option parsing, so a leading
+    # '-' in dest is read as a destination rather than as `-oProxyCommand=...`.
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", dest, target.cmd]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
     except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise

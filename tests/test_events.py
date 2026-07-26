@@ -372,6 +372,33 @@ def test_ssh_runner_returns_failure_when_it_times_out(monkeypatch) -> None:
     assert "u@h" in err
 
 
+def test_ssh_argv_terminates_option_parsing_before_the_destination(monkeypatch) -> None:
+    # BL-01 at the sink. `config.validate_legacy_targets` disarms an option-shaped
+    # host/user at load, but a hand-constructed target never passes through the
+    # validator — so an argv element that ssh would read as `-oProxyCommand=...` has to
+    # be un-readable as an option in the first place. `--` is what does that.
+    seen: list[list[str]] = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        events_mod.subprocess, "run", lambda argv, **_kw: (seen.append(list(argv)), _Done())[1]
+    )
+    target = ShutdownTarget(  # type: ignore[arg-type]
+        name="evil", kind="remote", enabled=True, host="-oProxyCommand=touch /tmp/pwn", cmd="halt"
+    )
+
+    _default_ssh_shutdown(target)
+
+    (argv,) = seen
+    assert "--" in argv
+    assert argv.index("--") < argv.index("-oProxyCommand=touch /tmp/pwn")
+    assert argv[-1] == "halt"
+
+
 def test_local_runner_returns_failure_when_it_times_out(monkeypatch) -> None:
     def boom(*_a, **_k):
         raise subprocess.TimeoutExpired(cmd="shutdown", timeout=20)
