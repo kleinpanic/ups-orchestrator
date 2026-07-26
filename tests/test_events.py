@@ -94,6 +94,7 @@ def _wire_serial(
     st_mode: int = _CHAR_DEVICE_MODE,
     stat_error: OSError | None = None,
     fcntl_error: OSError | None = None,
+    fdopen_error: OSError | None = None,
 ) -> _SerialWiring:
     """Drive ``_default_serial_shutdown`` against fakes only.
 
@@ -135,6 +136,8 @@ def _wire_serial(
     def fake_fdopen(fd, *a, **k):
         if fd != _SENTINEL_FD:
             return real_fdopen(fd, *a, **k)
+        if fdopen_error is not None:
+            raise fdopen_error
         return _FakePort(cmd_written or 0)
 
     def fake_close(fd):
@@ -354,6 +357,23 @@ def test_serial_stty_sets_clocal_and_disables_hardware_flow_control(monkeypatch)
     (argv,) = wiring.stty_argv
     assert "clocal" in argv
     assert "-crtscts" in argv
+
+
+def test_serial_closes_the_descriptor_when_fdopen_fails(monkeypatch) -> None:
+    # LO-01. The try/except/os.close covered the two fcntl calls but the fdopen sat
+    # BELOW it, so an OSError there leaked the descriptor — once per poll, for the
+    # whole outage, until the daemon's fd table was exhausted.
+    wiring = _wire_serial(
+        monkeypatch,
+        cmd_written=len(b"poweroff\n"),
+        fdopen_error=OSError(24, "Too many open files"),
+    )
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert SERIAL_DEVICE in err
+    assert wiring.closed == [_SENTINEL_FD]
 
 
 def test_serial_closes_the_descriptor_when_clearing_the_flag_fails(monkeypatch) -> None:
@@ -1382,3 +1402,57 @@ def test_build_deps_wires_monitored_machines() -> None:
     cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, monitored_machines=machines)
 
     assert _build_deps(cfg).monitored_machines == machines
+
+
+def test_unprojectable_report_pages_once_per_cooldown(monkeypatch) -> None:
+    # LO-02. `_machine_targets` is re-evaluated on every poll while on battery and
+    # `_report_unprojectable` had no rate limit at all, so one unprojectable machine
+    # would page every poll_seconds for the whole outage. `_check_load_step` solves the
+    # same problem with a cooldown; the event line still goes out every time, because
+    # that is the audit trail.
+    notifier = FakeNotifier()
+    machine = MonitoredMachine(name="srv", ups="ups1", ssh="srv", shutdown_method="ssh")
+    clock = {"now": 1000}
+    deps, _calls = make_deps(
+        notifier, snap("OB LB", charge=8, runtime=90), countdown_every=0,
+        monitored_machines=(machine,),
+    )
+    deps.now = lambda: clock["now"]
+    seen = _record_events(deps)
+    ups = make_ups("ups1", targets=(_remote("srv"),), shutdown_policy=shutdown_policy())
+
+    for _poll in range(3):
+        list(events_mod._machine_targets(ups, deps.monitored_machines, deps))
+
+    assert len(notifier.sent) == 1, "one page per cooldown, not one per poll"
+    assert len([ev for ev, _d in seen if ev == "shutdown_target_blocked"]) == 3
+
+    clock["now"] += deps.unprojectable_cooldown
+    list(events_mod._machine_targets(ups, deps.monitored_machines, deps))
+    assert len(notifier.sent) == 2  # ...and it does page again once the cooldown lapses
+
+
+def test_a_held_local_target_logs_why_it_is_waiting() -> None:
+    # LO-03. The locals-held path returned before the loop, so a held local produced
+    # neither a shutdown_target_blocked event nor any other trace — the only non-firing
+    # decision in the module that logged nothing.
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, snap("OB", charge=80, runtime=600), countdown_every=0)
+    seen = _record_events(deps)
+    ups = make_ups(
+        "ups1",
+        targets=(_remote("srv"), _local("pi")),
+        shutdown_policy=shutdown_policy(internal_enabled=True),
+    )
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+
+    assert calls == []  # nothing fired: the UPS is not close to empty yet
+    held = [
+        data
+        for ev, data in seen
+        if ev == "shutdown_target_blocked" and data.get("target") == "pi"
+    ]
+    assert held, "the held local target left no trace"
+    assert "srv" in str(held[-1]["reason"])

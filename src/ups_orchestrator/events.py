@@ -185,10 +185,15 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
         try:
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+            # LO-01: the fdopen belongs INSIDE this try. It sat below, so an OSError
+            # there leaked the descriptor — once per poll, for the whole outage, until
+            # the daemon's fd table was exhausted. Once fdopen returns, the file object
+            # owns the fd and the `with` closes it.
+            port = os.fdopen(fd, "wb", buffering=0)
         except Exception:
             os.close(fd)
             raise
-        with os.fdopen(fd, "wb", buffering=0) as port:
+        with port:
             port.write(b"\r")  # nudge the shell to a fresh prompt
             time.sleep(0.5)
             payload = (target.cmd + "\n").encode()
@@ -242,6 +247,14 @@ class Deps:
     # reports the gate without reaching the firing path at all, and this makes any
     # future path that does reach it under a dry run inert (T-02-13).
     dry_run: bool = False
+    # LO-02: ``_machine_targets`` is re-evaluated on EVERY poll while on battery, and
+    # ``_report_unprojectable`` had no rate limit at all, so one unprojectable machine
+    # would page every ``poll_seconds`` for the whole outage. ``_check_load_step``
+    # already solves this with a cooldown; this is the same pattern. Keyed
+    # ``<ups>/<machine>`` -> last notified, mutable because ``_build_deps`` constructs
+    # Deps ONCE for the life of the watch loop.
+    unprojectable_cooldown: int = 600
+    unprojectable_notified: dict[str, int] = field(default_factory=dict)
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -664,6 +677,15 @@ def _report_unprojectable(
         "Enrolled machine could not be projected onto a shutdown target.",
         {"target": machine.name, "reason": reason},
     )
+    # LO-02: the event line is written every time (it is the audit trail); the PAGE is
+    # rate-limited, exactly as `_check_load_step` does it. This path is re-reached on
+    # every poll for the whole outage.
+    key = f"{ups.name}/{machine.name}"
+    last = deps.unprojectable_notified.get(key)
+    now = deps.now()
+    if last is not None and now - last < deps.unprojectable_cooldown:
+        return
+    deps.unprojectable_notified[key] = now
     _notify(
         deps,
         Notification(
@@ -779,7 +801,22 @@ def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: Ups
 
     # Local hosts die last: hold until every enabled remote has been triggered.
     active_remotes = [t for t in remotes if _target_group(ups, t).enabled]
-    if any(t.name not in state.shutdowns_sent for t in active_remotes):
+    pending = [t.name for t in active_remotes if t.name not in state.shutdowns_sent]
+    if pending:
+        # LO-03: this returned silently, so a held local target produced no
+        # `shutdown_target_blocked` event and no other trace — the ONE non-firing
+        # decision in this module that logged nothing. An operator reading the event
+        # log saw the watcher host simply not appear.
+        for t in locals_:
+            if t.name not in state.shutdowns_sent:
+                _log_event(
+                    deps,
+                    "shutdown_target_blocked",
+                    ups,
+                    snap,
+                    "Local target held until every enabled remote has been sent.",
+                    {"target": t.name, "reason": f"waiting on remote(s): {', '.join(pending)}"},
+                )
         return
     for t in locals_:
         should_fire, reason = _target_should_fire(ups, state, deps, t, snap)
