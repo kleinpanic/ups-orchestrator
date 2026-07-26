@@ -2274,3 +2274,122 @@ def test_threshold_ordering_is_not_reported_when_a_group_is_disabled(tmp_path: P
         },
     )
     assert Config.load(p, env={}).degraded == ()
+
+
+# --- INV-DECLARED, on an ALREADY-DISARMED machine ----------------------------
+#
+# `_apply_degrades` runs its steps in order and each disarm mutates the working
+# record in place, so every step after the first sees machines whose
+# `effective_method` has already collapsed to "none". A detector that read the
+# EFFECT instead of the DECLARATION would therefore go silent on exactly the
+# records that most need it — and the existing INV-DECLARED tests all use a machine
+# that is still armed at the point the detector runs, where declaration and effect
+# are indistinguishable. These three pin the discriminating shape.
+
+
+def test_hand_edited_ip_is_still_reported_on_an_already_disarmed_push_machine(
+    tmp_path: Path,
+) -> None:
+    # Step 3 (unprojectable ups) disarms this record; step 4 (the IW-05 hand-edit
+    # hole) must still see shutdown_method='ssh' and report the stale nft address.
+    # Reading effective_method there yields "none", which is not in _PUSH_METHODS,
+    # and the likeliest two-live-authorities config in the codebase reports nothing.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [
+                {
+                    "name": "ghost",
+                    "ssh": "ghost",
+                    "ups": "nosuchups",
+                    "shutdown_method": "ssh",
+                    "ip": "10.0.0.5",
+                }
+            ],
+        },
+    )
+
+    (machine,) = Config.load(p, env={}).monitored_machines
+
+    assert machine.disarmed  # already disarmed by the time step 4 runs
+    assert machine.effective_method == "none"
+    ip_notices = [n for n in machine.load_notices if "carries a non-empty ip" in n.message]
+    assert len(ip_notices) == 1
+    assert ip_notices[0].severity == "error"
+    assert "shutdown_method='ssh'" in ip_notices[0].message
+    assert "'10.0.0.5'" in ip_notices[0].message
+
+
+def test_push_shutdown_cmd_advisory_survives_an_earlier_disarm(tmp_path: Path) -> None:
+    # Step 7's NEW-2 advisory is keyed on the DECLARED method too. It is the operator's
+    # only warning that a serial push will report rc 0 for a box that stayed up, and it
+    # must not vanish because an unrelated step already disarmed the record.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [
+                {
+                    "name": "r630",
+                    "ups": "cyberpower",
+                    "shutdown_method": "serial",
+                    "serial_device": "/dev/ttyUSB0",
+                    "serial_baud": 9600,
+                    "ip": "10.0.0.9",
+                }
+            ],
+        },
+    )
+
+    (machine,) = Config.load(p, env={}).monitored_machines
+
+    assert machine.disarmed and machine.effective_method == "none"
+    advisories = [n for n in machine.load_notices if n.severity == "advisory"]
+    assert len(advisories) == 1
+    assert "shutdown_method='serial'" in advisories[0].message
+    assert "root-only halt binary" in advisories[0].message
+
+
+def test_dual_regime_message_names_the_declared_method_after_a_duplicate_disarm(
+    tmp_path: Path,
+) -> None:
+    # Step 1 (duplicate name) disarms both records; step 2 then builds the collision
+    # message. Reading the effect there would print "shutdown_method='none'" on both
+    # the machine notice and the legacy target's disarm reason, telling the operator
+    # the machine declares nothing — the remedy sentence ("set this machine's
+    # shutdown_method to 'none'") then reads as already done.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [
+                        {
+                            "name": "mt",
+                            "kind": "remote",
+                            "enabled": True,
+                            "host": "mt",
+                            "cmd": "poweroff",
+                        }
+                    ],
+                }
+            },
+            "monitored_machines": [
+                {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+                {"name": "mt", "ssh": "mt2", "ups": "cyberpower", "shutdown_method": "ssh"},
+            ],
+        },
+    )
+
+    cfg = Config.load(p, env={})
+
+    for machine in cfg.monitored_machines:
+        assert machine.effective_method == "none"  # already collapsed by step 1
+        (dual,) = [n for n in machine.load_notices if "governed by BOTH" in n.message]
+        assert "declared shutdown_method='ssh'" in dual.message
+        assert "shutdown_method='none'" not in dual.message
+    (target,) = cfg.upses["cyberpower"].shutdown_targets
+    (collision,) = [n for n in target.load_notices if "collides with" in n.message]
+    assert "shutdown_method='ssh'" in collision.message

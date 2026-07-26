@@ -239,6 +239,23 @@ def test_serial_declared_baud_reaches_stty_argv_and_the_failure_message(monkeypa
     assert "19200" in err
 
 
+def test_serial_declared_9600_reaches_stty_argv_on_the_SUCCESS_path(monkeypatch) -> None:
+    # The argv assertion above only runs on the stty-FAILURE path and only for a rate
+    # that is not the live console's. Both halves matter: the r630's console really is
+    # 9600, and a substitution on the success path is the silent no-shutdown P2-08
+    # exists for — `stty -F <dev> 115200` returns 0, the write returns 0, and the box
+    # stays up while the orchestrator reports success. Pin the whole argv where the
+    # shutdown actually happens.
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"))
+
+    rc, _out, err = _default_serial_shutdown(_serial_target(baud=9600))
+
+    assert (rc, err) == (0, "")
+    assert wiring.stty_argv == [
+        ["stty", "-F", SERIAL_DEVICE, "9600", "raw", "-echo", "clocal", "-crtscts"]
+    ]
+
+
 def test_serial_zero_return_still_reaches_the_success_path(monkeypatch) -> None:
     wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"), stty=_Proc(0))
 
@@ -755,6 +772,38 @@ def test_remote_shutdown_does_not_bypass_close_to_empty_gate() -> None:
     )
     dispatch("remote_shutdown", ups, UpsState(onbatt_since=1), deps)
     assert calls == []
+
+
+def test_an_undefined_close_to_empty_condition_never_fires() -> None:
+    # 02-02's "the fire decision requires a DEFINED close-to-empty condition". Every
+    # other gate test supplies at least one comparable reading, so `_close_to_empty`'s
+    # no-known-readings branch was reached but never discriminated: flipping its
+    # `return False` to `return True` left the whole suite green.
+    #
+    # This is the shape a dying UPS actually produces — upsc stops reporting
+    # battery.charge and battery.runtime while ups.status still says OB — and firing
+    # on it powers off every box on that UPS on a bad read, with the reason string
+    # "UPS is not close to empty" nowhere in sight.
+    notifier = FakeNotifier()
+    blind = replace(snap("OB"), charge=None, runtime_seconds=None)
+    deps, calls = make_deps(notifier, blind, countdown_every=0)
+    seen: list[tuple[str, dict]] = []
+    deps.event_log = lambda ev, _u, _s, _m, data: seen.append((ev, dict(data or {})))
+    ups = make_ups(
+        targets=(_remote("srv"), _local("pi")),
+        shutdown_policy=shutdown_policy(internal_enabled=True),
+    )
+
+    dispatch("tick", ups, UpsState(onbatt_since=1), deps)
+
+    assert calls == []
+    blocked = {
+        str(e[1].get("target")): str(e[1].get("reason", ""))
+        for e in seen
+        if e[0] == "shutdown_target_blocked"
+    }
+    assert "not close to empty" in blocked["srv"]  # the gate said so, and said why
+    assert "waiting on remote(s)" in blocked["pi"]  # the local is held, not fired
 
 
 def test_unknown_event_returns_false() -> None:
