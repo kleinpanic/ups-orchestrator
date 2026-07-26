@@ -210,14 +210,16 @@ def test_save_completes_and_warns_when_metadata_read_fails(monkeypatch, tmp_path
     store = StateStore(path)  # constructed before the patch, so _load()'s own
     store.get("ups1").onbatt_since = 1  # stat-based exists() check is unaffected
 
-    real_stat = state_mod.Path.stat
+    # F7 moved the destination stat from `Path.stat` to `os.stat`, so that it and
+    # the temp file's stat go through one seam; patch the seam the code uses.
+    real_stat = state_mod.os.stat
 
-    def _flaky_stat(self, *a, **k):  # noqa: ANN001, ANN002, ANN003
-        if self == path:
+    def _flaky_stat(target, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        if str(target) == str(path):
             raise OSError("stat blew up")
-        return real_stat(self, *a, **k)
+        return real_stat(target, *a, **k)
 
-    monkeypatch.setattr(state_mod.Path, "stat", _flaky_stat)
+    monkeypatch.setattr(state_mod.os, "stat", _flaky_stat)
     with caplog.at_level("WARNING"):
         store.save()  # must complete, not raise, despite the stat failure
 
@@ -318,9 +320,56 @@ def test_chown_eperm_as_root_is_logged_and_as_a_user_is_not(monkeypatch, tmp_pat
     store.get("ups1").onbatt_since = 1
     with caplog.at_level("WARNING"):
         store.save()
-    assert caplog.records == []  # an unprivileged writer stays quiet
+    # An unprivileged writer whose ownership does NOT change stays quiet: nothing
+    # was lost, so there is nothing to report.
+    assert caplog.records == []
 
     monkeypatch.setattr(state_mod.os, "geteuid", lambda: 0)
     with caplog.at_level("WARNING"):
         store.save()
-    assert any("as root" in rec.message for rec in caplog.records)
+    assert any("could not preserve owner/group" in rec.message for rec in caplog.records)
+
+
+def test_chown_eperm_warns_when_ownership_actually_flips_even_unprivileged(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """F7: the MED-08 warning was gated on `geteuid() == 0`.
+
+    The daemon runs as `klein`, so production ALWAYS took the DEBUG branch — and
+    `state.json` has two writers (klein's `watch`, nut's `upssched` via the
+    dispatcher), which is precisely the configuration where a failed chown flips
+    ownership silently. The one signal for a T-02-23 recurrence was aimed at an
+    identity that never fires it.
+
+    The question that matters is not "am I root" but "does this change the file's
+    owner", so that is what is asked now.
+    """
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+
+    def _eperm(*_a, **_k):
+        raise PermissionError(1, "Operation not permitted")
+
+    real_stat = state_mod.os.stat
+
+    def _dest_owned_by_someone_else(target, *a, **k):
+        st = real_stat(target, *a, **k)
+        if str(target) == str(path):
+            # The destination belongs to `nut`; the writer is `klein`.
+            return os.stat_result(
+                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 991, 991)
+                + tuple(st)[6:]
+            )
+        return st
+
+    monkeypatch.setattr(state_mod.os, "chown", _eperm)
+    monkeypatch.setattr(state_mod.os, "stat", _dest_owned_by_someone_else)
+    monkeypatch.setattr(state_mod.os, "geteuid", lambda: 1000)  # NOT root
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    with caplog.at_level("WARNING"):
+        store.save()
+
+    assert any("could not preserve owner/group" in rec.message for rec in caplog.records)
+    assert any("T-02-23" in rec.message for rec in caplog.records)

@@ -198,7 +198,10 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
     if os.path.islink(dest_path):
         dest_path = Path(os.path.realpath(dest_path))
     try:
-        st: os.stat_result | None = dest_path.stat()
+        # `os.stat` rather than `Path.stat` so the destination and the temp file are
+        # read through the SAME seam (see the ownership-flip check below), and so a
+        # test can drive a two-writer destination without needing root to create one.
+        st: os.stat_result | None = os.stat(dest_path)
     except FileNotFoundError:
         st = None
     except OSError as exc:
@@ -224,13 +227,49 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
             # keeps the writer's ownership, which is how T-02-23's live box lost its
             # ACL unnoticed for weeks. Keep the quiet path narrow rather than
             # silencing the one signal that would show a recurrence.
-            if os.geteuid() == 0:
+            #
+            # F7: gating that WARNING on `geteuid() == 0` aimed it at an identity
+            # that never fires it. The daemon runs as `klein`, so production always
+            # took the DEBUG branch — and `state.json` has TWO writers (klein's
+            # `watch` and nut's `upssched` via the dispatcher), which is exactly the
+            # configuration where a failed chown silently flips ownership. The one
+            # signal for a T-02-23 recurrence was pointed away from the only case
+            # that produces one.
+            #
+            # The question that matters is not "am I root" but "does this change the
+            # file's owner". Ask that instead: the temp file is owned by whoever is
+            # writing, so a mismatch against the destination IS the flip. The root
+            # case is kept as well — EPERM from chown as root means something
+            # genuinely unexpected (a restricted-capability container, an immutable
+            # attribute, an idmapped mount) and is worth a line either way.
+            # `os.stat` rather than `Path.stat` on purpose: the temp file's OWN
+            # owner is the writer's, and reading it (instead of assuming
+            # euid/egid) keeps this correct under a setgid parent directory, where
+            # the group is inherited from the directory and only the uid flips.
+            try:
+                tmp_st = os.stat(tmp_path)
+                ownership_flips = (tmp_st.st_uid, tmp_st.st_gid) != (st.st_uid, st.st_gid)
+            except OSError:
+                ownership_flips = True  # cannot tell: report rather than swallow
+            if ownership_flips or os.geteuid() == 0:
                 logger.warning(
-                    "could not preserve owner/group of %s as root: %s", dest_path, exc
+                    "could not preserve owner/group of %s: %s — it will now be owned by "
+                    "uid %d gid %d instead of uid %d gid %d. This file has more than one "
+                    "writer, and a silent ownership flip is how the live box lost its ACL "
+                    "unnoticed (T-02-23).",
+                    dest_path,
+                    exc,
+                    os.geteuid(),
+                    os.getegid(),
+                    st.st_uid,
+                    st.st_gid,
                 )
             else:
                 logger.debug(
-                    "not preserving owner/group of %s (unprivileged writer): %s", dest_path, exc
+                    "not preserving owner/group of %s (unprivileged writer, ownership "
+                    "unchanged): %s",
+                    dest_path,
+                    exc,
                 )
         except OSError as exc:
             logger.warning("could not preserve owner/group of %s: %s", dest_path, exc)
