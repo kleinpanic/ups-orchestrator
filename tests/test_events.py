@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import logging
+import os
+import stat
 import subprocess
 
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
@@ -44,12 +47,36 @@ class _FakePort:
         return len(data) if data == b"\r" else self._cmd_written
 
 
+_SENTINEL_FD = 987654  # never a real descriptor; the fdopen fake keys on it
+_CHAR_DEVICE_MODE = stat.S_IFCHR | 0o660
+
+
 class _SerialWiring:
     """What the serial runner actually did — no real device is ever involved."""
 
     def __init__(self) -> None:
         self.stty_argv: list[list[str]] = []
-        self.opened: list[str] = []
+        self.opened: list[tuple[str, int]] = []  # os.open(path, flags)
+        self.blocking_opened: list[str] = []  # builtins.open — must stay empty (T-02-25)
+        self.flags_set: list[int] = []  # fcntl F_SETFL history
+
+
+class _FakeFcntl:
+    """Stand-in for the ``fcntl`` module, tracking the descriptor's flag word."""
+
+    F_GETFL = fcntl.F_GETFL
+    F_SETFL = fcntl.F_SETFL
+
+    def __init__(self, wiring: _SerialWiring, initial: int) -> None:
+        self._wiring = wiring
+        self._flags = initial
+
+    def fcntl(self, _fd: int, op: int, arg: int = 0) -> int:
+        if op == self.F_GETFL:
+            return self._flags
+        self._flags = arg
+        self._wiring.flags_set.append(arg)
+        return 0
 
 
 def _wire_serial(
@@ -59,16 +86,32 @@ def _wire_serial(
     cmd_written: int | None = None,
     stty: _Proc | None = None,
     run_raises: BaseException | None = None,
+    st_mode: int = _CHAR_DEVICE_MODE,
+    stat_error: OSError | None = None,
 ) -> _SerialWiring:
     """Drive ``_default_serial_shutdown`` against fakes only.
 
+    ``os.stat``/``os.open``/``os.fdopen`` pass through untouched for any path or
+    descriptor that is not this fake device, so patching them cannot disturb the rest
+    of the test session. ``builtins.open`` stays wired as a TRIPWIRE: the runner must
+    reach the device through the non-blocking ``os.open``, never through a blocking
+    ``open`` that would wait forever on a console cable with no DCD.
+
     ``cmd_written=None`` means the port is expected never to be opened. The attempt is
-    RECORDED rather than raised: the runner now converts every exception into a failure
+    RECORDED rather than raised: the runner converts every exception into a failure
     tuple, so a probe that raised would be swallowed and read as an ordinary failure.
     Assert on ``wiring.opened`` instead.
     """
     wiring = _SerialWiring()
     completed = _Proc(0) if stty is None else stty
+    real_stat, real_open, real_fdopen = os.stat, os.open, os.fdopen
+
+    def fake_stat(path, *a, **k):
+        if path != device:
+            return real_stat(path, *a, **k)
+        if stat_error is not None:
+            raise stat_error
+        return os.stat_result((st_mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
 
     def fake_run(argv, **_kw):
         wiring.stty_argv.append(list(argv))
@@ -76,13 +119,28 @@ def _wire_serial(
             raise run_raises
         return completed
 
-    def fake_open(path, *_a, **_k):
-        wiring.opened.append(path)
+    def fake_os_open(path, flags, *a):
+        if path != device:
+            return real_open(path, flags, *a)
+        wiring.opened.append((path, flags))
+        return _SENTINEL_FD
+
+    def fake_fdopen(fd, *a, **k):
+        if fd != _SENTINEL_FD:
+            return real_fdopen(fd, *a, **k)
+        return _FakePort(cmd_written or 0)
+
+    def fake_blocking_open(path, *_a, **_k):
+        wiring.blocking_opened.append(path)
         return _FakePort(cmd_written or 0)
 
     monkeypatch.setattr(events_mod.subprocess, "run", fake_run)
     monkeypatch.setattr(events_mod.time, "sleep", lambda _s: None)
-    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(events_mod.os, "stat", fake_stat)
+    monkeypatch.setattr(events_mod.os, "open", fake_os_open)
+    monkeypatch.setattr(events_mod.os, "fdopen", fake_fdopen)
+    monkeypatch.setattr(events_mod, "fcntl", _FakeFcntl(wiring, os.O_WRONLY | os.O_NONBLOCK))
+    monkeypatch.setattr("builtins.open", fake_blocking_open)
     return wiring
 
 
@@ -162,7 +220,87 @@ def test_serial_zero_return_still_reaches_the_success_path(monkeypatch) -> None:
     rc, _out, err = _default_serial_shutdown(_serial_target())
 
     assert (rc, err) == (0, "")
-    assert wiring.opened == [SERIAL_DEVICE]
+    assert [path for path, _flags in wiring.opened] == [SERIAL_DEVICE]
+
+
+# --- MED-10 transport half + T-02-25: what is opened, and how ------------------
+
+
+def test_serial_refuses_a_path_that_is_not_a_character_device(monkeypatch) -> None:
+    # A serial_device typo landing on a regular file would be TRUNCATED by the "wb"
+    # open, have the shutdown command written into it, and report success. 02-06's
+    # config-side /dev/ prefix check does not cover this: a path under /dev/ can still
+    # be a regular file, and a hand-constructed target never passes through it at all.
+    wiring = _wire_serial(monkeypatch, st_mode=stat.S_IFREG | 0o644)
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert SERIAL_DEVICE in err
+    assert "character device" in err
+    assert wiring.stty_argv == []  # no stty against a regular file either
+    assert wiring.opened == []
+    assert wiring.blocking_opened == []
+
+
+def test_serial_character_device_is_unaffected_by_the_guard(monkeypatch) -> None:
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"), st_mode=_CHAR_DEVICE_MODE)
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert (rc, err) == (0, "")
+    assert wiring.stty_argv and [p for p, _f in wiring.opened] == [SERIAL_DEVICE]
+
+
+def test_serial_refuses_an_unparseable_declared_baud(monkeypatch) -> None:
+    # 02-06's strict parser yields None for a declared-but-unparseable baud. Rendering
+    # that into the argv would run `stty -F <dev> None`.
+    wiring = _wire_serial(monkeypatch)
+
+    rc, _out, err = _default_serial_shutdown(_serial_target(baud=None))
+
+    assert rc == 1
+    assert "baud" in err
+    assert "None" not in "".join(a for argv in wiring.stty_argv for a in argv)
+    assert wiring.stty_argv == []
+    assert wiring.opened == []
+
+
+def test_serial_missing_device_keeps_its_existing_failure_shape(monkeypatch) -> None:
+    wiring = _wire_serial(
+        monkeypatch,
+        stat_error=FileNotFoundError(2, "No such file or directory"),
+    )
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert SERIAL_DEVICE in err
+    assert wiring.stty_argv == []
+    assert wiring.opened == []
+
+
+def test_serial_opens_non_blocking_and_then_clears_the_flag(monkeypatch) -> None:
+    # T-02-25. `stty raw` does not set clocal and the kernel's default termios leaves
+    # CLOCAL clear, so a BLOCKING open on a tty waits for DCD — which the 3-wire
+    # TX/RX/GND console cable that is mt's topology never asserts. handle_tick would
+    # never return, the poll loop would wedge, all three UPSes would stop being polled,
+    # and Restart=always would never fire because the process is still alive. A
+    # regression to a plain blocking open cannot be caught by a test that would simply
+    # hang, so the flags are asserted directly.
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"))
+
+    rc, _out, _err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 0
+    assert len(wiring.opened) == 1
+    _path, flags = wiring.opened[0]
+    assert flags & os.O_NONBLOCK  # the DCD wait is bypassed
+    assert flags & os.O_WRONLY == os.O_WRONLY
+    # ...and the flag is cleared straight afterwards, so the blocking write semantics
+    # the short-write guard depends on are preserved.
+    assert wiring.flags_set and not (wiring.flags_set[-1] & os.O_NONBLOCK)
+    assert wiring.blocking_opened == []  # never through a blocking builtins.open
 
 
 # --- T-02-24: a transport runner returns a failure tuple, it never raises ------
