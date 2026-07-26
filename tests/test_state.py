@@ -240,6 +240,87 @@ def test_save_payload_roundtrips_through_reload(tmp_path) -> None:
     assert st.shutdowns_sent == ["low_battery"]
 
 
+# --- IF-01: two writers, one file ---------------------------------------------
+#
+# The shipped deployment has klein's long-lived `watch` process and the `nut` user's
+# upssched dispatcher both writing `state.json`. `shutdowns_sent` is the fire-once
+# dedupe for projected machines, so a lost entry is a SECOND shutdown command sent to
+# a box that is already going down.
+
+
+def test_reload_if_changed_picks_up_another_writers_state(tmp_path) -> None:
+    # The auditor's exact interleaving: the event path records two pushes, and the
+    # long-lived poll loop's next look must see them rather than its startup copy.
+    path = tmp_path / "state.json"
+    watch = StateStore(path)  # the long-lived `watch` process
+    watch.get("ups1").onbatt_since = 100
+    watch.save()
+
+    event = StateStore(path)  # a separate `remote-shutdown` / upssched invocation
+    event.get("ups1").shutdowns_sent = ["mt", "spark"]
+    event.save()
+
+    assert watch.reload_if_changed() is True
+    assert watch.get("ups1").shutdowns_sent == ["mt", "spark"]
+    # ...and an unchanged file is not re-read, so the poll loop does not pay for a
+    # parse every tick.
+    assert watch.reload_if_changed() is False
+
+
+def test_save_keeps_a_concurrent_writers_shutdowns_sent(tmp_path) -> None:
+    # The window `reload_if_changed` alone cannot close: the event path writes DURING
+    # a tick, after that tick's reload and before the save that ends it. Union, so the
+    # ledger only ever grows within an outage — erring toward "already sent", which is
+    # the direction that cannot produce a second shutdown.
+    path = tmp_path / "state.json"
+    watch = StateStore(path)
+    watch.get("ups1").onbatt_since = 100
+    watch.save()
+
+    event = StateStore(path)
+    event.get("ups1").shutdowns_sent = ["mt"]
+    event.save()
+
+    watch.get("ups1").last_tick_notified = 200  # the in-flight tick's own bookkeeping
+    watch.save()
+
+    on_disk = json.loads(path.read_text())["ups1"]
+    assert on_disk["shutdowns_sent"] == ["mt"]  # not discarded
+    assert on_disk["last_tick_notified"] == 200  # and this writer's work still landed
+
+
+def test_save_adopts_a_ups_only_the_other_writer_knows_about(tmp_path) -> None:
+    # The two writers can hold different config views (a UPS added while `watch` is
+    # up). Rewriting the whole file would delete the other's record outright.
+    path = tmp_path / "state.json"
+    watch = StateStore(path)
+    watch.get("ups1").onbatt_since = 100
+    watch.save()
+
+    event = StateStore(path)
+    event.get("ups2").shutdowns_sent = ["spark"]
+    event.save()
+
+    watch.save()
+
+    assert json.loads(path.read_text())["ups2"]["shutdowns_sent"] == ["spark"]
+
+
+def test_reload_is_inert_while_the_file_does_not_exist_yet(tmp_path) -> None:
+    # First-ever run: nothing on disk to reload from, and the poll loop's in-memory
+    # work must not be thrown away by a check that mistakes "absent" for "changed".
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.get("ups1").shutdowns_sent = ["mt"]
+
+    assert store.reload_if_changed() is False
+    assert store.get("ups1").shutdowns_sent == ["mt"]
+
+    store.save()
+    assert json.loads(path.read_text())["ups1"]["shutdowns_sent"] == ["mt"]
+    assert store.reload_if_changed() is False  # our own write is not "external"
+
+
 def test_save_completes_when_the_acl_helpers_hang(monkeypatch, tmp_path, caplog) -> None:
     # MED-02. _copy_acl is on StateStore.save, which the watch loop runs every poll.
     # An unbounded getfacl on a stale NFS/CIFS mount or a wedged FUSE filesystem

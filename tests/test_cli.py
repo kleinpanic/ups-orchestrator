@@ -1315,3 +1315,111 @@ def test_rehearse_still_works_for_a_known_remote_kind(env_config, monkeypatch, c
     assert [kind for kind, _t in seen] == ["ssh"]
     assert seen[0][1].cmd == _REHEARSAL
     assert "PHASE2_REHEARSAL" in capsys.readouterr().out
+
+
+# --- IF-01: the poll loop must not re-push what the event path already sent ----
+
+
+def test_watch_tick_does_not_re_push_a_target_the_event_path_already_fired(
+    monkeypatch, tmp_path
+) -> None:
+    """The auditor's exact interleaving, end to end through `main`.
+
+    `state.json` has two writers: this long-lived `watch` process, and a fresh
+    process per NUT event (or per operator-typed `remote-shutdown`). The store used
+    to load once in `__init__`, so the watch loop made its `shutdowns_sent` dedupe
+    decision against a map captured at startup and rewrote the whole file every tick
+    — discarding whatever the other writer had recorded in between. The machine then
+    got a SECOND shutdown command while it was already going down.
+
+    Timeline driven below:
+      tick 1        on battery, comfortably charged -> records the outage, fires nothing
+      (mid-sleep)   charge collapses; the operator runs `remote-shutdown ups1`, which
+                    fires `mt` in its OWN process and persists that
+      tick 2        same collapsed charge -> must NOT fire `mt` again
+    """
+    import dataclasses
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "poll_seconds": 1,
+                "shutdown": {
+                    "enabled": True,
+                    "require_power_outage": True,
+                    "min_on_battery_seconds": 0,
+                    "notify": False,
+                    "external": {"enabled": True, "battery_below": 15, "runtime_below": 300},
+                    "internal": {"enabled": False},
+                },
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "mt",
+                                "kind": "remote",
+                                "enabled": True,
+                                "host": "mt.lan",
+                                "user": "u",
+                                "cmd": "sudo /sbin/poweroff",
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(cfg))
+    monkeypatch.setenv("UPS_ORCH_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("UPS_ORCH_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(tmp_path / "notify.jsonl"))
+    monkeypatch.setenv("UPS_ORCH_SAMPLES", str(tmp_path / "samples.jsonl"))
+
+    healthy = UpsSnapshot("OB DISCHRG", 50, 900, 12, 120.0, realpower_nominal=900)
+    collapsed = UpsSnapshot("OB DISCHRG", 5, 60, 12, 120.0, realpower_nominal=900)
+    live = {"snap": healthy}
+    pushes: list[str] = []
+
+    real_build = cli._build_deps
+
+    def _build(config, **kw):  # noqa: ANN001, ANN003
+        return dataclasses.replace(
+            real_build(config, **kw),
+            read_snapshot=lambda _n: live["snap"],
+            ssh_shutdown=lambda t: (pushes.append(t.name), (0, "", ""))[1],
+            now=lambda: 1000,
+        )
+
+    monkeypatch.setattr(cli, "_build_deps", _build)
+
+    # Count TICKS rather than sleeps: the loop sleeps `poll_seconds` times per cycle,
+    # so a sleep counter silently makes the test vacuous the moment that knob moves.
+    real_dispatch = cli.dispatch
+    ticks = {"n": 0}
+
+    def _dispatch(event, ups, state, deps):  # noqa: ANN001, ANN202
+        if event == "tick":
+            ticks["n"] += 1
+        return real_dispatch(event, ups, state, deps)
+
+    monkeypatch.setattr(cli, "dispatch", _dispatch)
+
+    def _sleep(_secs: float) -> None:
+        if ticks["n"] >= 2:  # tick 2 has run; that is the whole experiment
+            raise KeyboardInterrupt
+        if live["snap"] is healthy:
+            # Between tick 1 and tick 2, in a DIFFERENT process: the battery
+            # collapses and the operator triggers the push by hand.
+            live["snap"] = collapsed
+            assert cli.main(["remote-shutdown", "ups1"]) == 0
+            assert pushes == ["mt"], "the event path itself must fire exactly once"
+
+    monkeypatch.setattr(cli.time, "sleep", _sleep)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+
+    assert pushes == ["mt"], f"mt was shut down more than once: {pushes}"
+    on_disk = json.loads((tmp_path / "state.json").read_text())["ups1"]["shutdowns_sent"]
+    assert on_disk == ["mt"], f"the dedupe ledger did not survive the tick: {on_disk}"

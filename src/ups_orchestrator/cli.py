@@ -347,6 +347,13 @@ def _cmd_watch() -> int:
 
     LOG.info("watch: polling %d UPS(es) every %ds", len(cfg.upses), interval)
     while not stop:
+        # IF-01: `state.json` has two writers — this process and the `nut` user's
+        # upssched dispatcher (also an operator's `remote-shutdown`, which takes the
+        # same event path). Without this, the tick's `shutdowns_sent` dedupe was made
+        # against a map loaded when the process started, so a machine already pushed
+        # by the event path was pushed a SECOND time here. Re-read before the
+        # decision, not after.
+        store.reload_if_changed()
         for name, ups in cfg.upses.items():
             try:
                 dispatch("tick", ups, store.get(name), deps)
