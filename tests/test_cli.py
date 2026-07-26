@@ -1263,3 +1263,59 @@ def test_shutdown_rehearse_output_is_sanitised(env_config, monkeypatch, capsys) 
     out = capsys.readouterr().out
 
     assert "\x1b" not in out and "\x07" not in out and "\x00" not in out
+
+
+# --- F6: rehearse must not dispatch an unknown target kind --------------------
+
+
+def test_rehearse_refuses_a_target_with_an_unknown_kind(env_config, monkeypatch, caplog) -> None:
+    """`validate_legacy_targets` disarms an unknown kind for a specific reason.
+
+    Its own docstring: "dispatch treats anything not local and not serial as SSH,
+    so an unknown kind becomes a silent ssh attempt against whatever `host`
+    happens to hold." `_rehearsal_target` force-enables the target, so this verb
+    reached exactly the dispatch that rule exists to prevent.
+
+    The rehearsal command cannot halt a box — but it can still open a connection
+    to whatever is in `host`, and a rule that holds everywhere except from one
+    verb is not a rule.
+    """
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "weird",
+                                "kind": "smtp",  # none of remote/serial/local
+                                "enabled": False,
+                                "host": "attacker.example",
+                                "cmd": "sudo /sbin/shutdown -h now",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        rc = cli.main(["shutdown", "rehearse", "weird"])
+
+    assert rc == 2
+    assert seen == [], "an unknown kind must not be dispatched as ssh"
+    assert "none of remote/serial/local" in caplog.text
+
+
+def test_rehearse_still_works_for_a_known_remote_kind(env_config, monkeypatch, capsys) -> None:
+    """Guard on the F6 fix: the legitimate legacy path is untouched."""
+    _dry_run_config(env_config)
+    seen = _capture_runners(monkeypatch)
+
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 0
+    assert [kind for kind, _t in seen] == ["ssh"]
+    assert seen[0][1].cmd == _REHEARSAL
+    assert "PHASE2_REHEARSAL" in capsys.readouterr().out

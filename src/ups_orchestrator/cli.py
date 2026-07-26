@@ -2145,6 +2145,25 @@ def _cmd_shutdown(argv: list[str]) -> int:
             args.name,
         )
         return 2
+    # F6: an UNKNOWN kind must not be dispatched. `_cmd_shutdown` below falls
+    # through to `ssh_shutdown` for anything not local and not serial — which is
+    # exactly WHY `validate_legacy_targets` disarms an unknown kind ("dispatch
+    # treats anything not local and not serial as SSH, so an unknown kind becomes a
+    # silent ssh attempt against whatever `host` happens to hold"). Rehearse then
+    # force-enables the target, so this verb reached the dispatch that rule exists
+    # to prevent. The rehearsal command cannot halt a box, but it can still open a
+    # connection to whatever is in `host`, and "a rule that holds everywhere except
+    # from this one verb" is not a rule.
+    if not target.is_local and not target.is_serial and target.kind.strip().lower() != "remote":
+        LOG.error(
+            "shutdown rehearse: %r declares kind %r, which is none of remote/serial/"
+            "local. Config disarms that shape precisely because dispatch treats "
+            "anything not local and not serial as SSH — so rehearsing it would ssh to "
+            "whatever 'host' happens to hold. Fix 'kind' first.",
+            args.name,
+            target.kind,
+        )
+        return 2
     if target.is_local:
         LOG.error(
             "shutdown rehearse: %r is a LOCAL target — this host. There is no cable to "
