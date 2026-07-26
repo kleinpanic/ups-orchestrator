@@ -1228,9 +1228,7 @@ def test_add_serial_dry_run_prints_record_only_plan_and_persists_nothing(
 def test_add_ssh_records_alias_only(cfg_path, monkeypatch) -> None:
     monkeypatch.delenv(cli._SECRET_ENV, raising=False)
     ssh, local, nft, _p = _no_privileged_seams(monkeypatch)
-    rc = cli.main(
-        ["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"]
-    )
+    rc = cli.main(["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"])
     assert rc == 0
     assert ssh.calls == [] and local.calls == [] and nft.calls == []
     entry = _entry(cfg_path, "mt")
@@ -2021,9 +2019,7 @@ _INJECTED_ALIAS = "-oProxyCommand=touch /tmp/pwn"
 def test_verify_refuses_an_option_shaped_config_alias_rc2(cfg_path, monkeypatch) -> None:
     _write_config(
         cfg_path,
-        machines=[
-            _machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")
-        ],
+        machines=[_machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")],
     )
     ssh = FakeSSH([(0, "OL\n", "")])
     monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
@@ -2037,9 +2033,7 @@ def test_remove_refuses_to_run_the_remote_disarm_with_an_option_shaped_alias(
 ) -> None:
     _write_config(
         cfg_path,
-        machines=[
-            _machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")
-        ],
+        machines=[_machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")],
     )
     ssh, nft = FakeSSH(), FakeNft()
     monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
@@ -2057,9 +2051,7 @@ def test_remove_with_keep_remote_still_completes_for_a_bad_alias(cfg_path, monke
     # the remedy for a bad alias, so the verb must not become unusable.
     _write_config(
         cfg_path,
-        machines=[
-            _machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")
-        ],
+        machines=[_machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")],
     )
     ssh, nft = FakeSSH(), FakeNft()
     monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
@@ -2126,8 +2118,19 @@ def test_add_still_works_for_an_unambiguous_re_enrollment(cfg_path, monkeypatch)
     _no_privileged_seams(monkeypatch)
 
     rc = cli.main(
-        ["monitor", "add", "mt", "--method", "serial", "--ups", "cyberpower",
-         "--serial-device", "/dev/ttyUSB0", "--serial-baud", "9600"]
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/ttyUSB0",
+            "--serial-baud",
+            "9600",
+        ]
     )
 
     assert rc == 0
@@ -2342,9 +2345,17 @@ def test_add_refuses_a_newline_in_shutdown_cmd(cfg_path, monkeypatch, caplog) ->
     with caplog.at_level("ERROR"):
         rc = cli.main(
             [
-                "monitor", "add", "mt",
-                "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower",
-                "--shutdown-cmd", "sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x",
+                "monitor",
+                "add",
+                "mt",
+                "--method",
+                "ssh",
+                "--ssh",
+                "mt",
+                "--ups",
+                "cyberpower",
+                "--shutdown-cmd",
+                "sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x",
             ]
         )
 
@@ -2358,9 +2369,17 @@ def test_add_still_refuses_a_double_quote_in_shutdown_cmd(cfg_path, monkeypatch)
     monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
     rc = cli.main(
         [
-            "monitor", "add", "mt",
-            "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower",
-            "--shutdown-cmd", '/sbin/shutdown -h now"; rm -rf /',
+            "monitor",
+            "add",
+            "mt",
+            "--method",
+            "ssh",
+            "--ssh",
+            "mt",
+            "--ups",
+            "cyberpower",
+            "--shutdown-cmd",
+            '/sbin/shutdown -h now"; rm -rf /',
         ]
     )
     assert rc == 2
@@ -2413,8 +2432,18 @@ def test_add_dry_run_still_shows_operator_supplied_values(cfg_path, monkeypatch,
 
     rc = cli.main(
         [
-            "monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower",
-            "--ip", "192.168.1.114", "--primary-ip", "192.168.1.125", "--dry-run",
+            "monitor",
+            "add",
+            "mt",
+            "--ssh",
+            "mt",
+            "--ups",
+            "cyberpower",
+            "--ip",
+            "192.168.1.114",
+            "--primary-ip",
+            "192.168.1.125",
+            "--dry-run",
         ]
     )
 
@@ -2440,8 +2469,17 @@ def test_add_refuses_a_serial_device_the_loader_would_disarm(cfg_path, device) -
     before = cfg_path.read_text()
     rc = cli.main(
         [
-            "monitor", "add", "x", "--method", "serial", "--ups", "cyberpower",
-            "--serial-device", device, "--serial-baud", "9600",
+            "monitor",
+            "add",
+            "x",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            device,
+            "--serial-baud",
+            "9600",
         ]
     )
     assert rc == 2
@@ -2451,8 +2489,17 @@ def test_add_refuses_a_serial_device_the_loader_would_disarm(cfg_path, device) -
 def test_add_serial_device_under_dev_is_still_accepted(cfg_path) -> None:
     rc = cli.main(
         [
-            "monitor", "add", "x", "--method", "serial", "--ups", "cyberpower",
-            "--serial-device", "/dev/serial/by-id/usb-console", "--serial-baud", "9600",
+            "monitor",
+            "add",
+            "x",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/serial/by-id/usb-console",
+            "--serial-baud",
+            "9600",
         ]
     )
     assert rc == 0
@@ -2708,8 +2755,17 @@ def test_add_record_only_opens_nothing_for_the_machine_it_records(cfg_path, monk
 
     rc = cli.main(
         [
-            "monitor", "add", "box", "--method", "ssh", "--ssh", "box", "--ups", "cyberpower",
-            "--ip", "192.168.1.130",
+            "monitor",
+            "add",
+            "box",
+            "--method",
+            "ssh",
+            "--ssh",
+            "box",
+            "--ups",
+            "cyberpower",
+            "--ip",
+            "192.168.1.130",
         ]
     )
 

@@ -98,9 +98,7 @@ def test_status_shows_error_and_advisory_notices(monkeypatch) -> None:
         ConfigNotice(severity="error", subject="mt", message="no serial device — disarmed"),
         ConfigNotice(severity="advisory", subject="spark", message="shutdown_cmd needs sudo"),
     )
-    cfg = Config(
-        webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded
-    )
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)
     monkeypatch.setattr(
         status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
     )
@@ -150,6 +148,7 @@ def _force_80_columns(monkeypatch) -> None:
     monkeypatch.setattr(
         status.shutil, "get_terminal_size", lambda fallback=(80, 24): os.terminal_size((80, 24))
     )
+
 
 _LONG = (
     "governed by BOTH shutdown regimes: declared shutdown_method='native' and also an "
@@ -206,9 +205,7 @@ def test_control_characters_in_a_notice_are_neutralised() -> None:
     cfg = Config(
         webhook_url="",
         upses={},
-        degraded=(
-            ConfigNotice(severity="error", subject="mt\x1b[2J\x1b[H", message="pwned\x07"),
-        ),
+        degraded=(ConfigNotice(severity="error", subject="mt\x1b[2J\x1b[H", message="pwned\x07"),),
     )
 
     rendered = status.render(cfg, color=False, now=0)

@@ -920,9 +920,7 @@ def test_apply_nft_restores_the_file_when_the_reload_is_rejected(tmp_path):
         calls.append(path)
         return 1, "", "Error: syntax error, unexpected junk"
 
-    rc, _out, err = nutclient.apply_nft(
-        str(conf), ["192.168.1.114"], _rejecting_nft, lambda: None
-    )
+    rc, _out, err = nutclient.apply_nft(str(conf), ["192.168.1.114"], _rejecting_nft, lambda: None)
 
     assert rc == 1
     assert calls, "the reload was attempted"

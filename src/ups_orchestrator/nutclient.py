@@ -218,9 +218,7 @@ def render_upsmon_conf(
     onto the secondary, so it is rejected rather than escaped (LO-C4).
     """
     if not valid_shutdown_cmd(shutdown_cmd):
-        raise ValueError(
-            "shutdown_cmd must not contain a double-quote or any control character"
-        )
+        raise ValueError("shutdown_cmd must not contain a double-quote or any control character")
     lines = [
         _UPSMON_BEGIN,
         f"MONITOR {ups}@{primary} {powervalue} {user} {pw} secondary",
@@ -615,13 +613,21 @@ def apply_nft(
         try:
             conf.write_text(text)
         except OSError as exc:  # pragma: no cover — the read above already succeeded
-            return rc, out, (
-                f"{err}\nCRITICAL: could not restore {path} after a failed nft reload "
-                f"({exc}); that file will not load at boot — restore it by hand"
+            return (
+                rc,
+                out,
+                (
+                    f"{err}\nCRITICAL: could not restore {path} after a failed nft reload "
+                    f"({exc}); that file will not load at boot — restore it by hand"
+                ),
             )
-        return rc, out, (
-            f"{err}\n{path} was restored to its previous contents; the running "
-            f"ruleset is unchanged (nft -f is atomic)"
+        return (
+            rc,
+            out,
+            (
+                f"{err}\n{path} was restored to its previous contents; the running "
+                f"ruleset is unchanged (nft -f is atomic)"
+            ),
         )
     restart_bouncer()
     return 0, out, err

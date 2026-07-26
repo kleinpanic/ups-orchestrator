@@ -1556,7 +1556,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     if not nutclient.valid_shutdown_cmd(shutdown_cmd):
         LOG.error(
             "monitor add: --shutdown-cmd %r must not contain a double-quote or any "
-            "control character. It is emitted as a single SHUTDOWNCMD \"<cmd>\" line in "
+            'control character. It is emitted as a single SHUTDOWNCMD "<cmd>" line in '
             "the secondary's /etc/nut/upsmon.conf, so a newline ends that directive and "
             "everything after it becomes a further upsmon directive on that machine.",
             shutdown_cmd,
@@ -2204,14 +2204,11 @@ def _cmd_shutdown(argv: list[str]) -> int:
     _say(f"  command: {_REHEARSAL_CMD}   (hard-coded; the recorded shutdown_cmd is not read)")
     if target.is_serial:
         _say(f"  device:  {target.device} @ {target.baud} baud")
-    rc, _out, err = (
-        deps.serial_shutdown(target) if target.is_serial else deps.ssh_shutdown(target)
-    )
+    rc, _out, err = deps.serial_shutdown(target) if target.is_serial else deps.ssh_shutdown(target)
     if rc != 0:
         _say(f"  FAIL — rc={rc} {err.strip() or '(no stderr)'}")
         return 1
-    _say(f"  OK — look for PHASE2_REHEARSAL on {target.name} "
-          f"(journalctl -t ups-orchestrator)")
+    _say(f"  OK — look for PHASE2_REHEARSAL on {target.name} (journalctl -t ups-orchestrator)")
     return 0
 
 

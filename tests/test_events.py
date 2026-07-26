@@ -421,9 +421,7 @@ def test_serial_closes_the_descriptor_when_clearing_the_flag_fails(monkeypatch) 
 
 def test_serial_runner_returns_failure_when_stty_times_out(monkeypatch) -> None:
     # TimeoutExpired is NOT an OSError, so it escaped the old `except OSError`.
-    wiring = _wire_serial(
-        monkeypatch, run_raises=subprocess.TimeoutExpired(cmd="stty", timeout=5)
-    )
+    wiring = _wire_serial(monkeypatch, run_raises=subprocess.TimeoutExpired(cmd="stty", timeout=5))
 
     rc, _out, err = _default_serial_shutdown(_serial_target())
 
@@ -1078,9 +1076,7 @@ def test_projection_fires_serial_before_ssh() -> None:
     # on the order the operator happened to declare the machines in.
     for machines in ((_mt(), _spark()), (_spark(), _mt())):
         notifier = FakeNotifier()
-        deps, calls = make_deps(
-            notifier, _low(), countdown_every=0, monitored_machines=machines
-        )
+        deps, calls = make_deps(notifier, _low(), countdown_every=0, monitored_machines=machines)
         ups = make_ups("ups1", shutdown_policy=shutdown_policy())
         dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
         assert calls == ["mt", "spark"]
@@ -1468,7 +1464,9 @@ def test_unprojectable_report_pages_once_per_cooldown(monkeypatch) -> None:
     machine = MonitoredMachine(name="srv", ups="ups1", ssh="srv", shutdown_method="ssh")
     clock = {"now": 1000}
     deps, _calls = make_deps(
-        notifier, snap("OB LB", charge=8, runtime=90), countdown_every=0,
+        notifier,
+        snap("OB LB", charge=8, runtime=90),
+        countdown_every=0,
         monitored_machines=(machine,),
     )
     deps.now = lambda: clock["now"]
@@ -1504,9 +1502,7 @@ def test_a_held_local_target_logs_why_it_is_waiting() -> None:
 
     assert calls == []  # nothing fired: the UPS is not close to empty yet
     held = [
-        data
-        for ev, data in seen
-        if ev == "shutdown_target_blocked" and data.get("target") == "pi"
+        data for ev, data in seen if ev == "shutdown_target_blocked" and data.get("target") == "pi"
     ]
     assert held, "the held local target left no trace"
     assert "srv" in str(held[-1]["reason"])

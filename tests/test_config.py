@@ -720,9 +720,7 @@ def test_pure_legacy_target_warns_only_and_still_loads(caplog, tmp_path: Path) -
             "upses": {
                 "u1": {
                     "label": "U1",
-                    "shutdown_targets": [
-                        {"name": "fileserver", "enabled": True, "host": "fs.lan"}
-                    ],
+                    "shutdown_targets": [{"name": "fileserver", "enabled": True, "host": "fs.lan"}],
                 }
             }
         },
@@ -952,9 +950,7 @@ def test_to_dict_preserves_an_unparseable_nested_baud(tmp_path: Path) -> None:
 def test_to_dict_flat_serial_baud_still_wins_over_a_nested_one() -> None:
     # The lift must never resurrect a nested value the flat field already answers for,
     # or the nested block becomes a second source of truth again (LO-14).
-    m = MonitoredMachine.from_dict(
-        {"name": "mt", "serial_baud": 19200, "serial": {"baud": "fast"}}
-    )
+    m = MonitoredMachine.from_dict({"name": "mt", "serial_baud": 19200, "serial": {"baud": "fast"}})
     assert m.to_dict()["serial_baud"] == 19200
 
 
@@ -1018,8 +1014,9 @@ def test_an_unrecognised_transport_severity_disarms_rather_than_arms(monkeypatch
     monkeypatch.setattr(
         config_mod,
         "validate_active_transports",
-        lambda machines: tuple((m.name, "critical", "a severity nobody added a branch for")
-                               for m in machines),
+        lambda machines: tuple(
+            (m.name, "critical", "a severity nobody added a branch for") for m in machines
+        ),
     )
     machines = _machines({"name": "mt", "ups": "cyberpower", "ssh": "mt", "shutdown_method": "ssh"})
     upses = {"cyberpower": UpsConfig.from_dict("cyberpower", {})}
@@ -1299,9 +1296,7 @@ def test_dual_regime_pairs_canonicalises_the_ups_name_on_both_sides() -> None:
     # (02-07) the projector, so a capitalisation cannot mean two things in two modules.
     for declared in ("CyberPower2", "  cyberpower2  ", "cyberpower2@localhost"):
         pairs = dual_regime_pairs(
-            _machines(
-                {"name": "mt", "ssh": "mt", "ups": declared, "shutdown_method": "ssh"}
-            ),
+            _machines({"name": "mt", "ssh": "mt", "ups": declared, "shutdown_method": "ssh"}),
             _upses(cyberpower2=_enabled_mt_target()),
         )
         assert pairs == (("mt", "cyberpower2", "mt"),), declared
@@ -1327,9 +1322,7 @@ def test_dual_regime_pairs_ignores_a_target_on_a_different_ups() -> None:
 def test_dual_regime_pairs_ignores_a_disabled_target() -> None:
     pairs = dual_regime_pairs(
         _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}),
-        _upses(
-            cyberpower={"shutdown_targets": [{"name": "mt", "enabled": False, "host": "mt"}]}
-        ),
+        _upses(cyberpower={"shutdown_targets": [{"name": "mt", "enabled": False, "host": "mt"}]}),
     )
     assert pairs == ()
 
@@ -1889,9 +1882,7 @@ def test_option_shaped_legacy_host_is_disarmed_through_config_load(tmp_path: Pat
     effective = {t.name: t.effective_enabled for t in ups.shutdown_targets}
     assert effective == {"evil": False, "healthy": True}
     assert all(t.enabled for t in ups.shutdown_targets)  # INV-DECLARED
-    assert any(
-        n.subject == "cyberpower/evil" and n.severity == "error" for n in cfg.degraded
-    )
+    assert any(n.subject == "cyberpower/evil" and n.severity == "error" for n in cfg.degraded)
 
 
 def test_advise_target_is_the_mirror_of_disarm_target() -> None:
@@ -2335,6 +2326,8 @@ def test_non_finite_numbers_degrade_across_every_int_field(tmp_path: Path) -> No
     assert cfg.shutdown_policy.min_on_battery_seconds == 120
     assert cfg.shutdown_policy.external.battery_below is None
     assert cfg.shutdown_policy.external.runtime_below is None
+
+
 # --- INV-DECLARED, on an ALREADY-DISARMED machine ----------------------------
 #
 # `_apply_degrades` runs its steps in order and each disarm mutates the working

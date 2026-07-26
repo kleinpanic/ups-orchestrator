@@ -357,8 +357,7 @@ def test_chown_eperm_warns_when_ownership_actually_flips_even_unprivileged(
         if str(target) == str(path):
             # The destination belongs to `nut`; the writer is `klein`.
             return os.stat_result(
-                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 991, 991)
-                + tuple(st)[6:]
+                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 991, 991) + tuple(st)[6:]
             )
         return st
 

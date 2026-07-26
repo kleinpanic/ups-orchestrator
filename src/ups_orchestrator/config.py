@@ -214,8 +214,7 @@ class ConfigNotice:
         # fire from Config.load — it is a boundary for future call sites.
         if self.severity not in SEVERITIES:
             raise ValueError(
-                f"ConfigNotice severity must be one of {sorted(SEVERITIES)}, "
-                f"got {self.severity!r}"
+                f"ConfigNotice severity must be one of {sorted(SEVERITIES)}, got {self.severity!r}"
             )
 
     def __str__(self) -> str:
@@ -524,10 +523,7 @@ class MonitoredMachine:
         It reads the DECLARED ``shutdown_method`` (INV-DECLARED), which is what makes
         the native carve-out unforgeable: nothing in this module rewrites that field.
         """
-        return (
-            any(is_disarming(n) for n in self.load_notices)
-            and self.shutdown_method != "native"
-        )
+        return any(is_disarming(n) for n in self.load_notices) and self.shutdown_method != "native"
 
     @property
     def effective_method(self) -> str:
@@ -559,8 +555,7 @@ class MonitoredMachine:
                 method = raw_method
             else:
                 logger.warning(
-                    "monitored machine %r has unknown shutdown_method %r; "
-                    "coercing to 'none'",
+                    "monitored machine %r has unknown shutdown_method %r; coercing to 'none'",
                     name,
                     data.get("shutdown_method"),
                 )
@@ -1321,9 +1316,7 @@ def _apply_degrades(
         is idempotent — a second identical error changes no gate — so the second
         attachment is pure noise.
         """
-        return any(
-            n.severity == severity and n.message == message for n in working[i].load_notices
-        )
+        return any(n.severity == severity and n.message == message for n in working[i].load_notices)
 
     def disarm_at(i: int, message: str) -> None:
         if _already_said(i, "error", message):

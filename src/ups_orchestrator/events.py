@@ -611,9 +611,7 @@ def _fire_target(
     # behave as though one did. Returning here rather than skipping the runner alone
     # is what keeps a dry run from poisoning `shutdowns_sent`.
     if deps.dry_run:
-        LOG.info(
-            "[dry-run] would fire %s via %s: %s (%s)", target.name, where, target.cmd, reason
-        )
+        LOG.info("[dry-run] would fire %s via %s: %s (%s)", target.name, where, target.cmd, reason)
         return
     _log_event(
         deps,

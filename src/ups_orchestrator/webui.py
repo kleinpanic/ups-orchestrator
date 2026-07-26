@@ -51,8 +51,7 @@ def status_payload(cfg: Config, *, now: float | None = None) -> dict[str, object
             }
         )
     degraded = [
-        {"severity": n.severity, "subject": n.subject, "message": n.message}
-        for n in cfg.degraded
+        {"severity": n.severity, "subject": n.subject, "message": n.message} for n in cfg.degraded
     ]
     return {"time": now, "upses": upses, "degraded": degraded}
 

@@ -465,9 +465,7 @@ def test_remote_shutdown_dry_run_reports_a_disabled_global_policy(
     assert "would fire: no" in out and "shutdown policy disabled" in out
 
 
-def test_remote_shutdown_dry_run_lists_projected_machines(
-    env_config, monkeypatch, capsys
-) -> None:
+def test_remote_shutdown_dry_run_lists_projected_machines(env_config, monkeypatch, capsys) -> None:
     _dry_run_config(
         env_config,
         machines=[
@@ -1255,9 +1253,7 @@ def test_shutdown_rehearse_output_is_sanitised(env_config, monkeypatch, capsys) 
             }
         ],
     )
-    monkeypatch.setattr(
-        "ups_orchestrator.events._default_serial_shutdown", lambda _t: (0, "", "")
-    )
+    monkeypatch.setattr("ups_orchestrator.events._default_serial_shutdown", lambda _t: (0, "", ""))
 
     cli.main(["shutdown", "rehearse", _HOSTILE])
     out = capsys.readouterr().out
