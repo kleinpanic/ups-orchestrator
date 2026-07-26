@@ -9,10 +9,15 @@ never clobber each other.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import stat
+import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,6 +63,81 @@ class UpsState:
 
 def _opt_int(value: object) -> int | None:
     return int(value) if isinstance(value, (int, float)) else None
+
+
+def _copy_acl(dest_path: Path, tmp_path: Path) -> None:
+    """Best-effort copy of ``dest_path``'s POSIX ACL onto ``tmp_path``.
+
+    `shutil.copymode`/`copystat` do not carry a POSIX ACL, and the ACL is
+    exactly what the live box lost (T-02-23). No pylibacl dependency is added
+    (T-02-SC): this shells out to the platform's own getfacl/setfacl. Their
+    absence, an unreadable ACL, or a filesystem without ACL support all log a
+    warning and return rather than raise — a persist that cannot copy an ACL
+    must still complete, because refusing to write is worse than a narrower
+    ACL.
+    """
+    try:
+        got = subprocess.run(
+            ["getfacl", "--omit-header", str(dest_path)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        logger.warning("could not read ACL of %s (getfacl unavailable?): %s", dest_path, exc)
+        return
+    if got.returncode != 0:
+        logger.warning("could not read ACL of %s: %s", dest_path, got.stderr.strip())
+        return
+    try:
+        applied = subprocess.run(
+            ["setfacl", "--set-file=-", str(tmp_path)],
+            input=got.stdout,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        logger.warning(
+            "could not apply ACL preserving %s (setfacl unavailable?): %s", dest_path, exc
+        )
+        return
+    if applied.returncode != 0:
+        logger.warning("could not apply ACL preserving %s: %s", dest_path, applied.stderr.strip())
+
+
+def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
+    """Atomically replace ``dest_path`` with ``tmp_path``, preserving the
+    destination's mode, owner/group and POSIX ACL when it already exists.
+
+    `tempfile.NamedTemporaryFile` creates at 0600 owned by the writer, and a
+    bare `Path.replace` makes the destination inherit the TEMP file's mode,
+    owner and ACL wholesale — the destination inode does not survive, so
+    neither does its ACL (T-02-23). Each metadata kind is preserved
+    independently; a failure logs a warning naming the destination and
+    continues rather than raising, because the caller (``monitor
+    add``/``remove`` or the poll loop's state save) has no recovery path. A
+    destination that does not exist yet has nothing to inherit and is not an
+    error.
+    """
+    try:
+        st: os.stat_result | None = dest_path.stat()
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
+        logger.warning("could not stat %s to preserve its metadata: %s", dest_path, exc)
+        st = None
+    if st is not None:
+        try:
+            os.chmod(tmp_path, stat.S_IMODE(st.st_mode))
+        except OSError as exc:
+            logger.warning("could not preserve mode of %s: %s", dest_path, exc)
+        try:
+            os.chown(tmp_path, st.st_uid, st.st_gid)
+        except PermissionError:
+            pass  # expected for an unprivileged writer; not actionable
+        except OSError as exc:
+            logger.warning("could not preserve owner/group of %s: %s", dest_path, exc)
+        _copy_acl(dest_path, tmp_path)
+    tmp_path.replace(dest_path)
 
 
 class StateStore:
@@ -108,7 +188,7 @@ class StateStore:
                 # fsync in recorder.py/jsonlog.py.
                 tmp.flush()
                 os.fsync(tmp.fileno())
-            tmp_path.replace(self.path)
+            replace_preserving_metadata(tmp_path, self.path)
         finally:
             if tmp_path is not None and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
