@@ -58,14 +58,31 @@ def ssh_dest(target: ShutdownTarget) -> str:
     return f"{target.user}@{target.host}" if target.user else target.host
 
 
+# A transport runner's contract is *return a failure tuple, never raise*. The caller
+# appends to ``state.shutdowns_sent`` AFTER the runner returns and holds the local
+# targets until every remote has been sent, so a runner that escapes leaves the target
+# unmarked and the local hosts unreached — the watcher Pi's own poweroff starves on the
+# battery it shares with the machine that hung (T-02-24). Hence the broad catch: it is
+# the contract, not laziness.
 def _default_ssh_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_dest(target), target.cmd]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+    dest = ssh_dest(target)
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", dest, target.cmd]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+    except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
+        return 1, "", f"ssh transport to {dest} failed: {exc}"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
 def _default_local_shutdown(cmd: str) -> tuple[int, str, str]:
-    proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=20, check=False)
+    try:
+        # shlex.split raises ValueError on an unbalanced quote and subprocess.run
+        # raises IndexError on an empty argv, both before any process exists.
+        proc = subprocess.run(
+            shlex.split(cmd), capture_output=True, text=True, timeout=20, check=False
+        )
+    except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
+        return 1, "", f"local transport ({cmd!r}) failed: {exc}"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -73,15 +90,33 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
     """Send ``cmd`` to a serial console (assumes a passwordless/auto-login getty).
 
     Network-independent: works during an outage when SSH can't reach the box.
-    Fire-and-forget — we can't easily read the far end back, so success means the
-    bytes were written.
+
+    Success means two things and no more: the LOCAL tty was configured at the declared
+    baud, and the bytes were written. The far end is never read back, so a far-end speed
+    MISMATCH is **not** detectable here — ``stty -F <dev> <rate>`` returns 0 for 9600,
+    19200, 115200 and 0 alike, and the payload write completes at any of them. What the
+    captured return code catches is a MALFORMED rate or a line that could not be
+    configured locally. Bidirectional readback is deferred as OQ-02.
     """
     try:
-        subprocess.run(
+        stty = subprocess.run(
             ["stty", "-F", target.device, str(target.baud), "raw", "-echo"],
+            capture_output=True,
+            text=True,
             timeout=5,
             check=False,
         )
+        if stty.returncode != 0:
+            # check=False keeps this the single decision point; raising
+            # CalledProcessError instead would just escape into the handler below.
+            return (
+                1,
+                "",
+                f"could not configure the local serial line {target.device} at "
+                f"{target.baud} baud (stty rc={stty.returncode}: "
+                f"{stty.stderr.strip() or '(no stderr)'}); the shutdown command was "
+                f"NOT sent. This says nothing about the far end's line speed.",
+            )
         with open(target.device, "wb", buffering=0) as port:
             port.write(b"\r")  # nudge the shell to a fresh prompt
             time.sleep(0.5)
@@ -92,8 +127,9 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
             # (device unplugged / no getty). Report failure, not false success.
             return 1, "", f"short serial write: {written}/{len(payload)} bytes to {target.device}"
         return 0, "", ""
-    except OSError as exc:
-        return 1, "", str(exc)
+    except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
+        # OSError alone let subprocess.TimeoutExpired escape straight past this.
+        return 1, "", f"serial transport to {target.device} failed: {exc}"
 
 
 def _noop_event_log(
@@ -467,12 +503,20 @@ def _fire_target(
         {"target": target.name, "where": where, "reason": reason},
     )
     _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
-    if target.is_local:
-        rc, _out, err = deps.local_shutdown(target.cmd)
-    elif target.is_serial:
-        rc, _out, err = deps.serial_shutdown(target)
-    else:
-        rc, _out, err = deps.ssh_shutdown(target)
+    # Backstop for the runner contract, and NOT redundant with the defaults' own
+    # handlers: ``Deps`` carries injected runners (tests, any future transport) that
+    # those handlers do not cover. Only the call site can guarantee the invariant that
+    # matters — ``shutdowns_sent`` is always appended, so the local targets below are
+    # always reached even when every remote blows up on a dead switch (T-02-24).
+    try:
+        if target.is_local:
+            rc, _out, err = deps.local_shutdown(target.cmd)
+        elif target.is_serial:
+            rc, _out, err = deps.serial_shutdown(target)
+        else:
+            rc, _out, err = deps.ssh_shutdown(target)
+    except Exception as exc:  # noqa: BLE001 - an escaping runner must not strand the rest
+        rc, err = 1, f"shutdown transport for {target.name} ({where}) raised: {exc}"
     state.shutdowns_sent.append(target.name)
     _log_event(
         deps,
