@@ -319,6 +319,116 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "            if os.geteuid() == 0:",
         "state: ownership-flip warning re-gated on root only (F7)",
     ),
+    # --- P2-02 / P2-06 / P2-08 core -------------------------------------------
+    # The final verification found the harness covered nut/state/jsonlog/report/
+    # audit/status/baseline/selftest/webui/nutclient/cli/notify/config-numeric and
+    # NOT the per-machine shutdown model: derive_shutdown_method, dual_regime_pairs,
+    # disarmed/effective_method or _machine_targets. Nine verifier-authored mutants
+    # against those all died, so the behaviour WAS pinned — the harness just did not
+    # claim it. These make the claim.
+    (
+        "src/ups_orchestrator/config.py",
+        "    if ups.strip():\n"
+        '        return "native"\n'
+        "    if backup.enabled:\n"
+        "        kind = backup.kind.strip().lower()\n"
+        '        if kind == "serial":\n'
+        '            return "serial"\n'
+        '        return "ssh"  # kind == "remote" (or unknown) maps to the ssh transport\n'
+        '    return "none"',
+        "    if backup.enabled:  # mutated — ORDER SWAPPED\n"
+        "        kind = backup.kind.strip().lower()\n"
+        '        if kind == "serial":\n'
+        '            return "serial"\n'
+        '        return "ssh"\n'
+        "    if ups.strip():\n"
+        '        return "native"\n'
+        '    return "none"',
+        "config: derive ORDERING swapped — an enabled backup would beat has-ups (P2-01)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        '    if ups.strip():\n        return "native"',
+        '    if ups.strip():\n        return "ssh"  # mutated',
+        "config: derive maps a Phase-1 native secondary to a push (P2-01)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        "return any(is_disarming(n) for n in self.load_notices) and "
+        'self.shutdown_method != "native"',
+        "return any(is_disarming(n) for n in self.load_notices)",
+        "config: disarmed drops the native carve-out (INV-DECLARED)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        'return "none" if self.disarmed else self.shutdown_method',
+        "return self.shutdown_method  # mutated",
+        "config: effective_method ignores the degrade (INV-DEGRADE)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        '        native = m.shutdown_method.strip().lower() == "native"',
+        "        native = False  # mutated",
+        "config: dual_regime_pairs narrows a native machine to its own UPS again "
+        "(cross-UPS double shutdown)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        "            for t in ups.shutdown_targets:\n"
+        "                if t.enabled and t.name.strip().casefold() == name_key:",
+        "            for t in ups.shutdown_targets:\n"
+        "                if False and t.name.strip().casefold() == name_key:",
+        "config: dual_regime_pairs detects nothing at all (P2-06)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        "        if not isinstance(machines_raw, list):",
+        "        if False:  # mutated",
+        "config: a non-list monitored_machines silently unprotects everything again",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        "        non_dicts = [i for i, m in enumerate(machines_raw) if not isinstance(m, dict)]",
+        "        non_dicts = []  # mutated",
+        "config: a non-object monitored_machines entry is silently dropped again",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "        if not m.ups.strip() or canonical_ups_key(m.ups) != ups_key:",
+        "        if not m.ups.strip():  # mutated — UPS association guard dropped",
+        "events: _machine_targets projects a machine onto the WRONG UPS (P2-06)",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "        method = m.effective_method.strip().lower()",
+        "        method = m.shutdown_method.strip().lower()  # mutated",
+        "events: projection reads DECLARED not EFFECTIVE — a disarmed machine fires",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "            if m.serial_baud is None:",
+        "            if False:  # mutated",
+        "events: a serial machine projects with an unparseable baud (P2-08 silent no-op)",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "        else:\n            continue\n        key = m.name.strip().lower()",
+        "        else:\n"
+        "            target = ShutdownTarget(\n"
+        '                name=m.name, kind="remote", enabled=True, host=m.ssh, cmd=m.shutdown_cmd\n'
+        "            )\n"
+        "        key = m.name.strip().lower()",
+        "events: a native/none machine IS projected onto a push (P2-01 double shutdown)",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "    state.shutdowns_sent.append(target.name)\n    _log_event(\n"
+        '        deps,\n        "shutdown_result",',
+        "    if rc == 0:  # mutated — a failed remote now strands the local host\n"
+        "        state.shutdowns_sent.append(target.name)\n    _log_event(\n"
+        '        deps,\n        "shutdown_result",',
+        "events: shutdowns_sent append gated on success (T-02-24 local starvation)",
+    ),
 ]
 
 
