@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import json
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -74,8 +75,34 @@ def history_payload(
     return {"hours": hours, "series": out}
 
 
-def make_handler(cfg: Config, sample_path: Path) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    cfg: Config,
+    sample_path: Path,
+    *,
+    reload_config: Callable[[], Config] | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    """Build the request handler.
+
+    ``reload_config``, when given, is consulted once per request and supplies the
+    CURRENT config. Without it the handler serves ``cfg`` for the process's whole
+    life (IF-06): ``serve`` captured the config once at startup, so both the
+    server-rendered banner and the ``/api/status`` payload that LO-07 renders
+    client-side reported the degrade state as of process start. An operator who
+    fixed a degraded config and reloaded still saw the banner; a config that
+    degraded afterwards showed a healthy dashboard indefinitely, and only a restart
+    of the separate ``webui`` process cleared either.
+
+    Change detection belongs to the supplier, not here — ``Config.load`` logs every
+    degrade notice, and the dashboard polls ``/api/status`` every five seconds, so a
+    reloader that re-parses unconditionally would fill the journal with one copy of
+    each notice per refresh. ``cli._config_reloader`` re-reads only when the file
+    itself changes.
+    """
+
     class Handler(BaseHTTPRequestHandler):
+        def _cfg(self) -> Config:
+            return cfg if reload_config is None else reload_config()
+
         def _json(self, payload: object, code: int = 200) -> None:
             body = json.dumps(payload).encode()
             self.send_response(code)
@@ -86,22 +113,23 @@ def make_handler(cfg: Config, sample_path: Path) -> type[BaseHTTPRequestHandler]
 
         def do_GET(self) -> None:  # noqa: N802 — stdlib naming
             route = urlparse(self.path)
+            current = self._cfg()
             if route.path in ("/", "/index.html"):
-                body = _render_page(cfg).encode()
+                body = _render_page(current).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
             elif route.path == "/api/status":
-                self._json(status_payload(cfg))
+                self._json(status_payload(current))
             elif route.path == "/api/history":
                 hours = 24
                 q = parse_qs(route.query)
                 if "hours" in q:
                     with suppress(ValueError):
                         hours = max(1, min(720, int(q["hours"][0])))
-                self._json(history_payload(cfg, sample_path, hours=hours))
+                self._json(history_payload(current, sample_path, hours=hours))
             else:
                 self._json({"error": "not found"}, code=404)
 
@@ -112,9 +140,16 @@ def make_handler(cfg: Config, sample_path: Path) -> type[BaseHTTPRequestHandler]
 
 
 def serve(
-    cfg: Config, sample_path: Path, *, host: str = "127.0.0.1", port: int = 8765
+    cfg: Config,
+    sample_path: Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    reload_config: Callable[[], Config] | None = None,
 ) -> None:  # pragma: no cover — the blocking server loop
-    server = ThreadingHTTPServer((host, port), make_handler(cfg, sample_path))
+    server = ThreadingHTTPServer(
+        (host, port), make_handler(cfg, sample_path, reload_config=reload_config)
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -126,9 +161,11 @@ def serve(
 def _degraded_banner_html(cfg: Config) -> str:
     """Server-rendered degrade banner, empty when ``cfg.degraded`` is empty.
 
-    ``Config`` is frozen and set once at ``serve()`` startup, so this is not a live
-    view — it reflects the same load-time notices ``status.render`` shows, rendered
-    once per page fetch so the operator sees it without opening a terminal.
+    ``Config`` is frozen, but the handler now re-reads it per request when given a
+    reloader (IF-06), so this reflects the live file's load-time notices rather than
+    whatever they were when the ``webui`` process started. Same notices
+    ``status.render`` shows, rendered once per page fetch so the operator sees them
+    without opening a terminal.
     """
     if not cfg.degraded:
         return ""

@@ -191,12 +191,61 @@ def test_baseline_command(env_config, tmp_path, capsys) -> None:
 def test_webui_command_invokes_serve(env_config, monkeypatch) -> None:
     seen: dict[str, object] = {}
 
-    def fake_serve(_cfg, _path, *, host, port):
+    def fake_serve(_cfg, _path, *, host, port, reload_config):
         seen["host"], seen["port"] = host, port
+        seen["reload_config"] = reload_config
 
     monkeypatch.setattr("ups_orchestrator.webui.serve", fake_serve)
     assert cli.main(["webui", "--host", "0.0.0.0", "--port", "9001"]) == 0
-    assert seen == {"host": "0.0.0.0", "port": 9001}
+    assert seen["host"] == "0.0.0.0" and seen["port"] == 9001
+    # IF-06: without a reloader the dashboard is frozen at process start forever.
+    assert callable(seen["reload_config"])
+
+
+def test_config_reloader_returns_the_live_config_after_the_file_changes(
+    env_config, monkeypatch
+) -> None:
+    """IF-06: the webui's degrade banner was captured once at serve() startup.
+
+    An operator who fixed a degraded config and reloaded the dashboard still saw the
+    banner; a config that degraded after startup showed a healthy dashboard
+    indefinitely. Only restarting the separate `webui` process cleared either.
+    """
+    cfg = cli._load_config()
+    assert cfg is not None
+    assert cfg.degraded == ()
+
+    reload_config = cli._config_reloader(cfg)
+    assert reload_config() is cfg  # unchanged file: no re-parse, same object
+
+    # The operator introduces a degrade (a serial record with no device).
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {"ups1": {"label": "U1"}},
+                "monitored_machines": [{"name": "mt", "ups": "ups1", "shutdown_method": "serial"}],
+            }
+        )
+    )
+
+    fresh = reload_config()
+    assert fresh is not cfg
+    assert fresh.degraded, "the reloader did not pick the live config's degrade up"
+
+
+def test_config_reloader_keeps_the_last_good_config_when_the_file_breaks(
+    env_config, monkeypatch
+) -> None:
+    # Taking the dashboard down because someone saved a half-edited file is worse
+    # than showing the last good view; `_load_config` already logs the failure and
+    # `status`/`monitor list` report it loudly.
+    cfg = cli._load_config()
+    assert cfg is not None
+    reload_config = cli._config_reloader(cfg)
+
+    env_config.write_text("{ not valid json ")
+
+    assert reload_config() is cfg
 
 
 def test_control_beeper_mute_all(env_config, monkeypatch, capsys) -> None:

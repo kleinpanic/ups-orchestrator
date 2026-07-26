@@ -82,7 +82,12 @@ from ups_orchestrator.events import (
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
-from ups_orchestrator.state import StateStore, UpsState, write_json_preserving_metadata
+from ups_orchestrator.state import (
+    StateStore,
+    UpsState,
+    file_identity,
+    write_json_preserving_metadata,
+)
 
 LOG = logging.getLogger("ups_orchestrator")
 
@@ -649,6 +654,41 @@ def _notify_control(
     _build_deps(cfg).notifier.send(note)
 
 
+def _config_reloader(initial: Config) -> Callable[[], Config]:
+    """A ``Config`` source for long-lived servers that re-reads on file change.
+
+    IF-06: ``webui.serve`` captured the config once at startup, so its degrade
+    banner — both the server-rendered one and the ``/api/status`` payload LO-07
+    renders client-side — reported the state as of process start forever. An
+    operator who fixed a degraded config and reloaded still saw the banner; a config
+    that degraded afterwards showed a healthy dashboard indefinitely.
+
+    Keyed on the file's identity rather than re-parsing per request, because
+    ``Config.load`` LOGS every degrade notice and the dashboard polls every five
+    seconds — an unconditional reload would put one copy of each notice in the
+    journal per refresh, turning a fix for a stale banner into a log flood.
+
+    A file that becomes unloadable keeps the last good config rather than taking the
+    dashboard down: ``_load_config`` already logs the failure, and the operator's
+    other surfaces (``status``, ``monitor list``) report it loudly.
+    """
+    path = _config_path()
+    stamp = file_identity(path)
+    current = initial
+
+    def _reload() -> Config:
+        nonlocal stamp, current
+        latest = file_identity(path)
+        if latest != stamp:
+            stamp = latest
+            fresh = _load_config()
+            if fresh is not None:
+                current = fresh
+        return current
+
+    return _reload
+
+
 def _cmd_webui(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ups-orchestrator webui")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (localhost by default)")
@@ -661,7 +701,13 @@ def _cmd_webui(argv: list[str]) -> int:
     from ups_orchestrator import webui
 
     LOG.info("webui: serving http://%s:%d — no auth, do not expose publicly", args.host, args.port)
-    webui.serve(cfg, _sample_path(), host=args.host, port=args.port)
+    webui.serve(
+        cfg,
+        _sample_path(),
+        host=args.host,
+        port=args.port,
+        reload_config=_config_reloader(cfg),
+    )
     return 0
 
 

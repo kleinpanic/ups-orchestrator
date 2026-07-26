@@ -300,7 +300,7 @@ def write_text_preserving_metadata(dest_path: Path, text: str) -> tuple[int, int
     failure, and the fsync happens before the rename so a power loss cannot leave the
     destination pointing at a partial inode.
 
-    Returns the ``_stat_key`` of the inode just written, read off the temp file
+    Returns the ``file_identity`` of the inode just written, read off the temp file
     BEFORE the rename carries it into place. ``StateStore`` needs that identity to
     tell its own write from another process's; callers that do not care ignore it.
     """
@@ -326,7 +326,7 @@ def write_text_preserving_metadata(dest_path: Path, text: str) -> tuple[int, int
         # got in first, and the caller would then adopt THEIR key as its own and
         # never notice their content. `replace_preserving_metadata` may chmod and
         # chown in between, and neither touches dev/ino/size/mtime_ns.
-        stamp = _stat_key(tmp_path)
+        stamp = file_identity(tmp_path)
         replace_preserving_metadata(tmp_path, dest_path)
         return stamp
     finally:
@@ -341,7 +341,7 @@ def write_json_preserving_metadata(dest_path: Path, payload: object, *, indent: 
     )
 
 
-def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
+def file_identity(path: Path) -> tuple[int, int, int, int] | None:
     """Identity of the file's CURRENT contents, or ``None`` when it is absent.
 
     ``(dev, ino, size, mtime_ns)``. The inode number is the load-bearing member:
@@ -403,7 +403,7 @@ class StateStore:
         # records a stale key against fresh content, which costs one redundant
         # reload; the other order would record a fresh key against stale content and
         # the reload would never happen at all.
-        stamp = _stat_key(self.path)
+        stamp = file_identity(self.path)
         self._states = _read_states(self.path)
         self._seen = stamp
 
@@ -414,7 +414,7 @@ class StateStore:
         fire-once decision. Callers that construct a store per invocation (the NUT
         event path) are already current and need not.
         """
-        if _stat_key(self.path) == self._seen:
+        if file_identity(self.path) == self._seen:
             return False
         self._load()
         return True
@@ -437,7 +437,7 @@ class StateStore:
         writer with a different config view, and rewriting the file would otherwise
         delete its state outright.
         """
-        if _stat_key(self.path) == self._seen:
+        if file_identity(self.path) == self._seen:
             return
         for name, on_disk in _read_states(self.path).items():
             mine = self._states.get(name)
