@@ -937,6 +937,12 @@ def _print_degraded(cfg: Config) -> None:
     surface, so ``Config.degraded`` has to reach the operator wherever the
     operator already looks. This is the ``monitor`` half; ``status`` and the web
     UI carry the same tuple.
+
+    LO-C5: ``subject`` and ``message`` carry machine names, device paths and ssh
+    aliases straight out of the config, so they are the same value-injection
+    boundary MED-06 closed in ``status.py`` — a machine named ``mt\\x1b[2J\\x1b[H``
+    erases the very banner reporting on it. Routed through that fix's own
+    ``_safe`` rather than a second copy of the regex: one predicate, every sink.
     """
     if not cfg.degraded:
         return
@@ -944,7 +950,7 @@ def _print_degraded(cfg: Config) -> None:
     print("⚠ DEGRADED CONFIG — a shutdown authority was disarmed or flagged at load:")
     for n in cfg.degraded:
         label = "ERROR" if is_disarming(n) else "ADVISORY"
-        print(f"  {label} {n.subject}: {n.message}")
+        print(f"  {label} {status_view._safe(n.subject)}: {status_view._safe(n.message)}")
 
 
 def _method_field(m: MonitoredMachine) -> str:

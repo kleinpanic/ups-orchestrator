@@ -2165,3 +2165,31 @@ def test_process_tripwire_allows_only_the_named_acl_binaries() -> None:
     assert not _allowed((["upsc", "cyberpower@192.168.1.125"],))
     assert not _allowed(([],))
     assert not _allowed(())
+
+
+# --- LO-C5: the degrade banner is not a terminal control channel ---------------
+
+
+def test_list_degrade_banner_neutralises_control_characters_in_a_machine_name(
+    cfg_path, capsys
+) -> None:
+    """A config-authored name must not be able to erase the banner reporting on it.
+
+    Same class as w34 MED-06 (`status.py`): `subject`/`message` carry machine
+    names, device paths and ssh aliases verbatim out of the config, and
+    `\x1b[2J\x1b[H` clears the screen and homes the cursor. Routed through the same
+    `_safe` helper MED-06 introduced, so there is one predicate and not two.
+    """
+    hostile = "mt\x1b[2J\x1b[H"
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(hostile, method="serial", ups="", device="/dev/ttyUSB0", baud=9600)
+        ],
+    )
+    assert cli.main(["monitor", "list"]) == 0
+    out = capsys.readouterr().out
+
+    banner = out[out.index("DEGRADED CONFIG") :]
+    assert "\x1b" not in banner  # the escape never reaches the terminal
+    assert "mt?[2J?[H" in banner  # ...and the name is still identifiable
