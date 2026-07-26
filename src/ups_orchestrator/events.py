@@ -19,9 +19,12 @@ so the handlers unit-test without a real UPS or network.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import shlex
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -99,6 +102,31 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
     configured locally. Bidirectional readback is deferred as OQ-02.
     """
     try:
+        # Cheapest and most destructive-to-get-wrong checks first.
+        if target.baud is None:
+            # 02-06's strict parser yields None for a declared-but-unparseable baud.
+            # Reachable here because a hand-constructed target never passes through
+            # ``validate_active_transports``. Rendering it would run `stty -F <dev> None`.
+            return (
+                1,
+                "",
+                f"serial target {target.name} has no usable baud rate; declare a "
+                f"positive integer serial_baud (the live console here is 9600). "
+                f"Nothing was sent to {target.device}.",
+            )
+        mode = os.stat(target.device).st_mode
+        if not stat.S_ISCHR(mode):
+            # Defence in depth over 02-06's config-side /dev/ prefix check, and
+            # deliberately not redundant with it: a path under /dev/ can still be a
+            # regular file, which the "wb" open below would TRUNCATE and then report
+            # success for.
+            return (
+                1,
+                "",
+                f"serial device {target.device} is not a character device "
+                f"(mode {stat.filemode(mode)}); refusing to write to it. Check the "
+                f"serial_device path for a typo.",
+            )
         stty = subprocess.run(
             ["stty", "-F", target.device, str(target.baud), "raw", "-echo"],
             capture_output=True,
@@ -117,7 +145,23 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
                 f"{stty.stderr.strip() or '(no stderr)'}); the shutdown command was "
                 f"NOT sent. This says nothing about the far end's line speed.",
             )
-        with open(target.device, "wb", buffering=0) as port:
+        # T-02-25: open NON-BLOCKING, then clear the flag. `stty raw` does not set
+        # clocal and the kernel's default termios leaves CLOCAL clear, so a blocking
+        # open on a tty waits for DCD — which a 3-wire TX/RX/GND console cable never
+        # asserts. The open would then never return: handle_tick never returns, the
+        # poll loop wedges, every UPS stops being polled, and Restart=always never
+        # fires because the process is still alive. Clearing the flag immediately
+        # restores the blocking write semantics the short-write guard depends on.
+        # (A manual `stty -F` smoke test never reproduces the hang: GNU stty already
+        # opens O_RDONLY|O_NONBLOCK.)
+        fd = os.open(target.device, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+        except Exception:
+            os.close(fd)
+            raise
+        with os.fdopen(fd, "wb", buffering=0) as port:
             port.write(b"\r")  # nudge the shell to a fresh prompt
             time.sleep(0.5)
             payload = (target.cmd + "\n").encode()
