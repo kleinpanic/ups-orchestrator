@@ -147,6 +147,63 @@ def test_save_preserves_acl_when_supported(tmp_path) -> None:
     assert "user:65534:r--" in acl
 
 
+def _acl_or_skip(path) -> None:
+    """Put a named-user ACL on ``path``, or skip if this box/filesystem cannot."""
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("setfacl/getfacl not available on this system")
+    done = subprocess.run(["setfacl", "-m", "u:65534:r", str(path)], capture_output=True, text=True)
+    if done.returncode != 0:
+        pytest.skip(f"filesystem does not support POSIX ACLs: {done.stderr.strip()}")
+
+
+def _acl_tooling_absent(monkeypatch) -> None:
+    """Simulate a minimal Debian: the `acl` package (getfacl/setfacl) is not installed."""
+
+    def _no_binary(argv, **_kw):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr(state_mod.subprocess, "run", _no_binary)
+
+
+def test_save_does_not_widen_group_access_when_the_acl_cannot_be_carried(
+    monkeypatch, tmp_path
+) -> None:
+    # HI-02. With an ACL present the mode's group bits are the ACL MASK, not a grant:
+    # `user::rw- user:65534:r-- group::--- mask::r--` displays as 0640 while group has
+    # no access at all. Copying that mode and dropping the ACL — what happens when the
+    # `acl` package is absent — hands group a real read the destination never granted,
+    # i.e. this helper would create the very permissions bug it exists to fix.
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    os.chmod(path, 0o600)
+    _acl_or_skip(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640  # the mask, displayed as a grant
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    _acl_tooling_absent(monkeypatch)
+    store.save()
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # narrower, never wider
+    assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 1  # and it still wrote
+
+
+def test_save_keeps_group_bits_when_there_is_no_acl_to_carry(monkeypatch, tmp_path) -> None:
+    # The other half of HI-02: a plain 0640 with no ACL is a genuine group grant, so
+    # withholding it there would be a gratuitous narrowing of every ordinary file on a
+    # box without the `acl` package.
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    os.chmod(path, 0o640)
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    _acl_tooling_absent(monkeypatch)
+    store.save()
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
 def test_save_completes_and_warns_when_metadata_read_fails(monkeypatch, tmp_path, caplog) -> None:
     path = tmp_path / "state.json"
     path.write_text("{}")
