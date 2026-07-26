@@ -754,35 +754,146 @@ def validate_legacy_targets(
     return tuple(problems)
 
 
+def canonical_ups_key(name: str) -> str:
+    """The ONE canonicalisation of a UPS name: strip ``@host``, strip, casefold.
+
+    HI-03/IB-02. Used by the dual-regime detector, by the push-association check and —
+    in 02-07 — by ``events._machine_targets``, so a capitalisation cannot mean two
+    different things in two modules. Correction of record: ``_machine_targets`` does
+    NOT case-fold today; it compares ``normalize_ups_name`` outputs directly, which is
+    why a case-mismatched ``ups`` silently disarms the push path while the record loads
+    clean and reports an active method.
+    """
+    return normalize_ups_name(name).strip().casefold()
+
+
+def canonical_ups_index(
+    upses: Mapping[str, UpsConfig],
+) -> tuple[dict[str, UpsConfig], tuple[tuple[str, str], ...]]:
+    """Build ``{canonical_key: UpsConfig}`` and report authored keys that collide.
+
+    A collision means two authored ``upses`` keys canonicalise to one, which makes
+    projection and lookup ambiguous. That is monitoring-topology corruption rather than
+    a shutdown-authority error, so ``Config.load`` RAISES on it; this function only
+    reports, and raises nothing.
+    """
+    index: dict[str, UpsConfig] = {}
+    collisions: list[tuple[str, str]] = []
+    for authored, ups in upses.items():
+        key = canonical_ups_key(authored)
+        existing = index.get(key)
+        if existing is not None:
+            collisions.append((existing.name, authored))
+            continue
+        index[key] = ups
+    return index, tuple(collisions)
+
+
+def dual_regime_pairs(
+    monitored_machines: tuple[MonitoredMachine, ...],
+    upses: dict[str, UpsConfig],
+) -> tuple[tuple[str, str, str], ...]:
+    """Return ``(machine_name, ups_key, target_name)`` for every dual-regime conflict.
+
+    A conflict is a monitored machine that also appears as an *enabled*
+    ``shutdown_target``. Every ``monitored_machines`` entry carries a
+    ``shutdown_method``, and every value in the allow-set conflicts with a legacy
+    target, so this is a plain overlap test: ``native`` + legacy double-shuts (the
+    secondary fires below LB while the target uses the external-group thresholds);
+    ``serial``/``ssh`` + legacy fires the same box twice over two transports; ``none`` +
+    legacy fires a machine the operator declared off.
+
+    It returns the TRIPLE so a caller can disarm the exact target rather than only learn
+    a machine name, and it reads DECLARED ``shutdown_method`` and DECLARED
+    ``ShutdownTarget.enabled`` (INV-DECLARED) — which is what keeps ``cli.py``'s
+    ``--force`` gate firing against an already-degraded config, and what makes the
+    degrade idempotent across reloads.
+
+    BL-01: a machine whose ``ups`` is blank, or non-empty but resolving to no configured
+    UPS, is scanned against EVERY configured UPS's enabled targets rather than skipped.
+    Fail-closed — a typo must widen the scan, never silence it. Matching is
+    case-insensitive on the machine name and canonicalised on the UPS name (HI-03).
+    It raises nothing.
+    """
+    index, _collisions = canonical_ups_index(upses)
+    pairs: list[tuple[str, str, str]] = []
+    for m in monitored_machines:
+        key = canonical_ups_key(m.ups)
+        match = index.get(key) if key else None
+        scope: tuple[UpsConfig, ...] = (match,) if match is not None else tuple(upses.values())
+        name_key = m.name.strip().casefold()
+        for ups in scope:
+            for t in ups.shutdown_targets:
+                if t.enabled and t.name.strip().casefold() == name_key:
+                    pairs.append((m.name, ups.name, t.name))
+                    break
+    return tuple(pairs)
+
+
+def unknown_ups_references(
+    monitored_machines: tuple[MonitoredMachine, ...],
+    upses: dict[str, UpsConfig],
+) -> tuple[tuple[str, str], ...]:
+    """Return ``(machine_name, ups_name)`` for a non-empty ``ups`` that resolves to nothing.
+
+    A blank ``ups`` is a different defect (see ``unprojectable_push_machines``) and is
+    not reported here. Raises nothing.
+    """
+    index, _collisions = canonical_ups_index(upses)
+    return tuple(
+        (m.name, m.ups)
+        for m in monitored_machines
+        if m.ups.strip() and canonical_ups_key(m.ups) not in index
+    )
+
+
+def unprojectable_push_machines(
+    monitored_machines: tuple[MonitoredMachine, ...],
+    upses: dict[str, UpsConfig],
+) -> tuple[str, ...]:
+    """Return machines declaring an ACTIVE PUSH method that can never be projected.
+
+    The push-association rule, and the correction to BL-01's premise.
+    ``events._machine_targets`` projects a machine only when its UPS matches the UPS
+    being handled, so a ``serial``/``ssh`` machine whose ``ups`` is blank or
+    unresolvable is projected on no event at all: it reports as protected and can never
+    fire. Measured, not reasoned — the shipped projector was probed.
+
+    The interaction that makes this load-bearing rather than academic:
+    ``derive_shutdown_method`` yields a push method ONLY when ``ups`` is blank, so the
+    ENTIRE legacy-derived push class is structurally unfireable while the loader logs
+    ``derived 'ssh'`` and ``monitor list`` shows it. Disarming it is not a regression —
+    ``MonitoredMachine.backup`` has zero runtime consumers, so the push it implied has
+    always been imaginary. Raises nothing.
+    """
+    index, _collisions = canonical_ups_index(upses)
+    return tuple(
+        m.name
+        for m in monitored_machines
+        if m.shutdown_method.strip().lower() in ("serial", "ssh")
+        and canonical_ups_key(m.ups) not in index
+    )
+
+
 def dual_regime_conflicts(
     monitored_machines: tuple[MonitoredMachine, ...],
     upses: dict[str, UpsConfig],
 ) -> tuple[str, ...]:
     """Return names of machines governed by BOTH shutdown regimes.
 
-    A conflict is a monitored machine that also appears as an *enabled*
-    ``shutdown_target`` on the UPS it references. Since every ``monitored_machines``
-    entry now carries an EFFECTIVE ``shutdown_method`` (explicit or derived), this
-    is re-keyed on that method rather than on "is a native secondary": every
-    value in the allow-set conflicts with a legacy target, so the check is a plain
-    overlap test. ``native`` + legacy still double-shuts (the secondary fires below
-    LB while the target uses the external-group thresholds); ``serial``/``ssh`` +
-    legacy fires the same box twice over two transports; and ``none`` + legacy
-    fires a machine the operator declared off. All four are hard errors at
-    ``Config.load``. ``monitor add`` uses the same detector and refuses without
-    ``--force``. Matching is case-insensitive on the machine name.
+    A de-duplicated projection of ``dual_regime_pairs``' machine-name element, in
+    first-seen order, so ``monitor add``'s ``--force`` gate and its error text stay
+    behaviourally identical. See ``dual_regime_pairs`` for what counts as a conflict.
+
+    Matching is case-insensitive on the machine name AND canonicalised on the UPS name
+    (the earlier docstring advertised the former and was silent about the latter, which
+    is exactly the gap HI-03 exploited). A machine whose ``ups`` is blank or
+    unresolvable is scanned against every UPS rather than skipped (BL-01).
     """
-    conflicts: list[str] = []
-    for m in monitored_machines:
-        ups = upses.get(normalize_ups_name(m.ups))
-        if ups is None:
-            continue
-        name_lower = m.name.strip().lower()
-        for t in ups.shutdown_targets:
-            if t.enabled and t.name.strip().lower() == name_lower:
-                conflicts.append(m.name)
-                break
-    return tuple(conflicts)
+    seen: dict[str, None] = {}
+    for machine_name, _ups_key, _target_name in dual_regime_pairs(monitored_machines, upses):
+        seen.setdefault(machine_name, None)
+    return tuple(seen)
 
 
 def legacy_only_targets(
