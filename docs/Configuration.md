@@ -243,6 +243,7 @@ ups-orchestrator shutdown rehearse mt
 | `serial`, **armed** | Checks the recorded device's presence (a stat, injected in tests) | rc 0 if present and a character device with a usable declared baud, rc 1 otherwise |
 | `ssh`, **armed** | Probes the alias's reachability (`ssh <alias> true`) | rc 0 if reachable, rc 1 otherwise |
 | Config `ups` value is a NUT-metacharacter string, or the `ssh` alias is option-shaped/invalid | Refuses to run the probe (never shells out with an unvalidated value) | **rc 2** |
+| The primary's LAN IP cannot be resolved for a record that *would* be probed | Refuses to probe. `verify` resolves the primary through the same `_resolve_primary_ip` `monitor add` uses — `--primary-ip`, then the first non-loopback `nut_server.listen` entry, then a local `ip -o route get <machine ip>`. It does **not** fall back to `127.0.0.1`: the probe runs `upsc <ups>@<primary>` **on the secondary**, so a loopback address interrogates that box's own upsd rather than this one — a false FAIL for an armed secondary, or a false OK if it happens to run its own upsd with a same-named UPS | **rc 2**, naming `--primary-ip` and `nut_server.listen` as the two remedies |
 | Unknown machine name | — | **rc 2** |
 
 `monitor verify`/`monitor add`/`monitor remove` share **rc 2** for a config or

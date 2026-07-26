@@ -802,16 +802,6 @@ def _monitor_run_local_probe(argv: Sequence[str]) -> tuple[int, str, str]:  # pr
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _monitor_primary_ip(cfg: Config, override: str | None) -> str:
-    """First non-loopback LISTEN address (the LAN IP the secondary connects to)."""
-    if override:
-        return override
-    for addr in cfg.nut_server.listen:
-        if addr not in ("127.0.0.1", "::1", "localhost"):
-            return addr
-    return "127.0.0.1"
-
-
 def _resolve_primary_ip(cfg: Config, override: str | None, toward_ip: str) -> str | None:
     """Resolve the primary's LAN IP the secondary's MONITOR line points at.
 
@@ -1119,7 +1109,26 @@ def _monitor_verify(
                 machine.name,
             )
             return 2
-        primary = _monitor_primary_ip(cfg, args.primary_ip)
+        # ME-C1: the SAME resolver `monitor add` uses, so the two commands agree on
+        # what "the primary" is. The old `_monitor_primary_ip` validated nothing and
+        # fell back to `127.0.0.1` — which, in a command whose whole job is to run
+        # `upsc <ups>@<primary>` ON THE SECONDARY, made the probe interrogate that
+        # box's own (absent) upsd instead of this one. Wrong answer in both
+        # directions: normally a false FAIL telling an operator a protected box is
+        # unprotected, and a false OK if the secondary happens to run its own upsd
+        # with a same-named UPS. `_resolve_primary_ip` returns None rather than
+        # inventing a value, which is what lets this say so.
+        primary = _resolve_primary_ip(cfg, args.primary_ip, machine.ip)
+        if not primary:
+            LOG.error(
+                "monitor verify: could not resolve the primary's LAN IP toward %s — the "
+                "probe runs 'upsc %s@<primary>' ON THAT MACHINE, so a loopback address "
+                "would interrogate its own upsd rather than this one. Pass --primary-ip "
+                "or add a LAN LISTEN to nut_server.listen.",
+                machine.name,
+                machine.ups,
+            )
+            return 2
         ok, detail = nutclient.verify_secondary(
             machine.ssh,
             machine.ups,

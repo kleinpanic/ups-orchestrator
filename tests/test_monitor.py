@@ -2395,3 +2395,68 @@ def test_add_serial_device_under_dev_is_still_accepted(cfg_path) -> None:
     # property the CLI check exists to guarantee.
     machine = cli._monitor_find(cli._load_config(), "x")
     assert machine is not None and not machine.disarmed
+
+
+# --- ME-C1: verify resolves the primary the way `add` does ---------------------
+
+
+def test_verify_never_probes_the_secondarys_own_localhost(cfg_path, monkeypatch) -> None:
+    """`upsc <ups>@127.0.0.1` runs ON THE SECONDARY — it asks the wrong upsd.
+
+    `_monitor_primary_ip` validated nothing and fell back to loopback, so with a
+    loopback-only LISTEN and no `--primary-ip` an armed native secondary was told
+    `FAIL — Connection refused` (rc 1): an operator reading that concludes a
+    protected box is unprotected. It reads as a false OK the other way round if
+    that box happens to run its own upsd with a same-named UPS.
+    """
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="native", ssh="mt", ip="")],
+        extra={"nut_server": {"listen": ["127.0.0.1"], "port": 3493}},
+    )
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_local_probe", lambda _argv: (1, "", "no route"))
+
+    rc = cli.main(["monitor", "verify", "mt"])
+
+    assert rc == 2, "an unresolvable primary is a refusal, not a probe of the wrong host"
+    assert ssh.calls == []
+    assert not any("127.0.0.1" in cmd for cmd in ssh.commands)
+
+
+def test_verify_uses_the_primary_ip_override_the_way_add_does(cfg_path, monkeypatch) -> None:
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="native", ssh="mt", ip="")],
+        extra={"nut_server": {"listen": ["127.0.0.1"], "port": 3493}},
+    )
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    assert cli.main(["monitor", "verify", "mt", "--primary-ip", "192.168.1.125"]) == 0
+    assert "cyberpower@192.168.1.125" in ssh.commands[0]
+
+
+def test_verify_falls_back_to_the_local_route_probe_like_add(cfg_path, monkeypatch) -> None:
+    """The third rung of `_resolve_primary_ip`: route toward the secondary.
+
+    This is what `monitor add` does to learn the primary's own address on the path
+    to a machine, and sharing it is the point — the two commands must not disagree
+    about which address the MONITOR line was written with.
+    """
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="native", ssh="mt", ip="192.168.1.114")],
+        extra={"nut_server": {"listen": ["127.0.0.1"], "port": 3493}},
+    )
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(
+        cli,
+        "_monitor_run_local_probe",
+        lambda _argv: (0, "192.168.1.114 dev eth0 src 192.168.1.125 uid 0\n", ""),
+    )
+
+    assert cli.main(["monitor", "verify", "mt"]) == 0
+    assert "cyberpower@192.168.1.125" in ssh.commands[0]
