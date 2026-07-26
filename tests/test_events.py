@@ -5,10 +5,11 @@ import logging
 import os
 import stat
 import subprocess
+from dataclasses import replace
 
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator import events as events_mod
-from ups_orchestrator.config import MonitoredMachine, ShutdownTarget
+from ups_orchestrator.config import ConfigNotice, MonitoredMachine, ShutdownTarget
 from ups_orchestrator.events import (
     _default_local_shutdown,
     _default_serial_shutdown,
@@ -751,7 +752,7 @@ MT_CMD = "/sbin/shutdown -h now"
 SPARK_CMD = "sudo /sbin/shutdown -h +0"
 
 
-def _mt(*, ups: str = "ups1", baud: int = 9600, name: str = "mt") -> MonitoredMachine:
+def _mt(*, ups: str = "ups1", baud: int | None = 9600, name: str = "mt") -> MonitoredMachine:
     return MonitoredMachine(
         name=name,
         ups=ups,
@@ -776,6 +777,20 @@ def _project(ups, machines) -> list[ShutdownTarget]:
     from ups_orchestrator.events import _machine_targets
 
     return list(_machine_targets(ups, machines))
+
+
+def _project_with_deps(ups, machines, deps) -> list[ShutdownTarget]:
+    from ups_orchestrator.events import _machine_targets
+
+    return list(_machine_targets(ups, machines, deps))
+
+
+def _error_notice(subject: str = "mt") -> ConfigNotice:
+    return ConfigNotice(severity="error", subject=subject, message="disarmed at load")
+
+
+def _advisory_notice(subject: str = "spark") -> ConfigNotice:
+    return ConfigNotice(severity="advisory", subject=subject, message="needs escalation")
 
 
 def _low() -> object:
@@ -959,14 +974,24 @@ def test_mixed_native_and_serial_fires_only_serial() -> None:
 def test_duplicate_projected_name_does_not_swallow_other_machine() -> None:
     # Two machines share a name (a hand-edited config). The duplicate is dropped,
     # but a *distinct* machine's shutdown must still go out.
+    #
+    # `calls` alone passes under a no-guard mutant — with the dedupe removed, the
+    # second "mt" is simply skipped by the shutdowns_sent check and nothing changes.
+    # The block event and the notification are what make removing the guard fail.
     notifier = FakeNotifier()
     machines = (_mt(), _spark(method="ssh", name="mt"), _spark())
     deps, calls = make_deps(notifier, _low(), countdown_every=0, monitored_machines=machines)
+    seen: list[tuple[str, dict[str, object]]] = []
+    deps.event_log = lambda ev, _u, _s, _m, data: seen.append((ev, dict(data or {})))
     ups = make_ups("ups1", shutdown_policy=shutdown_policy())
 
     dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
 
     assert calls == ["mt", "spark"]
+    blocked = [data for ev, data in seen if ev == "shutdown_target_blocked"]
+    assert [d["target"] for d in blocked] == ["mt"]
+    assert "duplicate" in str(blocked[0]["reason"]).lower()
+    assert any("mt" in note.body and "duplicate" in note.body.lower() for note in notifier.sent)
 
 
 def test_projected_target_blocked_when_policy_disabled() -> None:
@@ -1058,6 +1083,142 @@ def test_failed_projected_serial_push_is_not_retried() -> None:
     assert calls == ["mt"]
     assert state.shutdowns_sent == ["mt"]
     assert "shutdown FAILED" in notifier.sent[-1].title
+
+
+# --- Task 3: the projector's association rule and its effective-state reads ----
+#
+# The measured baseline, from the integration audit: a derived-ssh record with no `ups`
+# projects [] on every UPS; an explicit ssh/serial method with no `ups` projects []; the
+# same record with a matching `ups` projects; and `ups:"CyberPower2"` against the key
+# `cyberpower2` used to project [] — that last one is the regression this task closes.
+# The first three stay empty BY DESIGN; 02-06 is what makes them loud at load.
+
+
+def test_machine_targets_match_a_case_mismatched_ups() -> None:
+    # THE regression. _machine_targets compared normalize_ups_name outputs directly and
+    # normalize_ups_name never case-folds, so a machine that loads clean and reports an
+    # active method silently projected nothing.
+    ups = make_ups("cyberpower2")
+
+    assert [t.name for t in _project(ups, (_mt(ups="CyberPower2"),))] == ["mt"]
+
+
+def test_machine_targets_match_a_case_mismatched_host_suffixed_ups() -> None:
+    ups = make_ups("cyberpower2")
+
+    assert [t.name for t in _project(ups, (_mt(ups="CyberPower2@localhost"),))] == ["mt"]
+
+
+def test_machine_targets_blank_ups_projects_on_no_ups() -> None:
+    # Shipped behaviour, and it stays. 02-06 is what makes it loud, by disarming such a
+    # machine at load rather than letting it look protected.
+    assert _project(make_ups("ups1"), (_mt(ups=""),)) == []
+    assert _project(make_ups("ups1"), (_mt(ups="   "),)) == []
+    # ...including against a UPS whose own name canonicalises to blank.
+    assert _project(make_ups("   "), (_mt(ups=""),)) == []
+
+
+def test_machine_targets_unknown_ups_projects_on_no_ups() -> None:
+    assert _project(make_ups("ups1"), (_mt(ups="not-a-real-ups"),)) == []
+
+
+def test_machine_targets_ambiguous_case_pair_is_deduped_by_name() -> None:
+    # Both `ups` values canonicalise to the same key, so both are CONSIDERED for this
+    # UPS — and the name-collision dedupe then drops the second.
+    ups = make_ups("ups1")
+
+    targets = _project(ups, (_mt(ups="ups1"), _mt(ups="UPS1@localhost")))
+
+    assert [t.name for t in targets] == ["mt"]
+
+
+def test_disarmed_machine_is_not_projected_but_keeps_its_declaration() -> None:
+    disarmed = replace(_spark(), load_notices=(_error_notice("spark"),))
+
+    assert _project(make_ups("ups1"), (disarmed,)) == []
+    assert disarmed.shutdown_method == "ssh"  # the declaration on disk is untouched
+    assert disarmed.effective_method == "none"
+
+
+def test_advisory_only_push_machine_projects_identically_to_one_with_no_notices() -> None:
+    # The projection half of the INV-SEVERITY guarantee: the NEW-2 and BL-02 advisories
+    # 02-06 attaches to LIVE push machines must not silently unarm them.
+    plain = _spark()
+    advised = replace(plain, load_notices=(_advisory_notice("spark"),))
+    ups = make_ups("ups1")
+
+    assert _project(ups, (advised,)) == _project(ups, (plain,))
+    assert [t.name for t in _project(ups, (advised,))] == ["spark"]
+
+
+def test_disarmed_legacy_target_neither_fires_nor_reserves_its_name() -> None:
+    legacy = ShutdownTarget(
+        name="mt",
+        kind="serial",
+        enabled=True,
+        device="/dev/x",
+        load_notices=(_error_notice("ups1/mt"),),
+    )
+    notifier = FakeNotifier()
+    captured: list[tuple[str, int, str]] = []
+    deps, calls = make_deps(
+        notifier,
+        _low(),
+        countdown_every=0,
+        monitored_machines=(_mt(),),
+        serial_capture=captured,
+    )
+    ups = make_ups("ups1", targets=(legacy,), shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == ["mt"]  # once — the disarmed legacy target did not fire
+    assert captured == [(MT_DEVICE, 9600, MT_CMD)]  # ...and the machine's own device won
+
+
+def test_serial_machine_with_no_parsed_baud_is_not_projected() -> None:
+    # 02-06's strict parser leaves serial_baud None for a value it could not read.
+    # Projecting it would carry None into `stty -F <dev> None`.
+    assert _project(make_ups("ups1"), (_mt(baud=None),)) == []
+
+
+def _blocked(seen) -> list[dict[str, object]]:
+    return [data for ev, data in seen if ev == "shutdown_target_blocked"]
+
+
+def test_dropped_duplicate_emits_a_block_event_and_a_notification() -> None:
+    # NEW-3: mid-outage syslog is the channel least likely to be read, and the
+    # consequence of the drop is a machine that will not shut down.
+    notifier = FakeNotifier()
+    deps, _calls = make_deps(notifier, snap("OL"))
+    seen = _record_events(deps)
+    ups = make_ups("ups1")
+
+    targets = _project_with_deps(ups, (_mt(), _mt()), deps)
+
+    assert [t.name for t in targets] == ["mt"]
+    assert [d["target"] for d in _blocked(seen)] == ["mt"]
+    assert notifier.sent and "mt" in notifier.sent[-1].body
+
+
+def test_no_baud_skip_emits_a_block_event_and_a_notification() -> None:
+    notifier = FakeNotifier()
+    deps, _calls = make_deps(notifier, snap("OL"))
+    seen = _record_events(deps)
+
+    assert _project_with_deps(make_ups("ups1"), (_mt(baud=None),), deps) == []
+    assert [d["target"] for d in _blocked(seen)] == ["mt"]
+    assert notifier.sent and "mt" in notifier.sent[-1].body
+
+
+def test_machine_targets_without_deps_reports_through_the_log_alone(caplog) -> None:
+    # 02-02's two-argument call sites must keep working; deps is optional.
+    with caplog.at_level(logging.ERROR, logger="ups_orchestrator.events"):
+        assert [t.name for t in _project(make_ups("ups1"), (_mt(), _mt()))] == ["mt"]
+        assert _project(make_ups("ups1"), (_mt(baud=None),)) == []
+
+    assert "duplicate" in caplog.text.lower()
+    assert "baud" in caplog.text.lower()
 
 
 def test_build_deps_wires_monitored_machines() -> None:
