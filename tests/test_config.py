@@ -7,12 +7,17 @@ from pathlib import Path
 import pytest
 
 from ups_orchestrator.config import (
+    BackupShutdown,
     Config,
+    ConfigNotice,
     MonitoredMachine,
     ShutdownTarget,
+    UpsConfig,
     derive_shutdown_method,
     dual_regime_conflicts,
     legacy_only_targets,
+    requires_root_escalation,
+    validate_legacy_targets,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -292,9 +297,11 @@ def test_shutdown_method_unknown_coerces_to_none(caplog) -> None:
     assert any("telepathy" in rec.message for rec in caplog.records)
 
 
-def test_serial_baud_defaults_9600_never_115200() -> None:
-    # An explicit serial method with no baud must default to 9600, matching the
-    # live line — never the 115200 landmine (P2-08).
+def test_serial_baud_absent_is_none_never_assumed() -> None:
+    # P2-08 restated (02-06 deliberate change 3): an ABSENT serial_baud on a
+    # machine is None, not a silently assumed 9600. The operator declares the
+    # baud; assuming one is the same silent-coercion class as HI-04. Config.load
+    # disarms such a machine rather than guessing at the live line's rate.
     m = MonitoredMachine.from_dict(
         {
             "name": "mt",
@@ -303,7 +310,7 @@ def test_serial_baud_defaults_9600_never_115200() -> None:
             "serial_device": "/dev/ttyUSB0",
         }
     )
-    assert m.serial_baud == 9600
+    assert m.serial_baud is None
     assert m.serial_device == "/dev/ttyUSB0"
 
 
@@ -322,46 +329,40 @@ def test_serial_fields_parse_explicit() -> None:
 
 
 def test_derive_native_when_ups_present() -> None:
-    # has-ups => native, evaluated ahead of the backup branch.
-    from ups_orchestrator.config import BackupShutdown
-
+    # has-ups => native. NOTE: this fixture does NOT pin the branch ORDER — it
+    # sets backup.enabled=False, so the backup branch would return "none" anyway.
+    # The ordering is pinned by test_derive_native_ordering_beats_enabled_backup.
     method = derive_shutdown_method(
-        raw={}, ssh="spark", ups="cyberpower", backup=BackupShutdown(enabled=False, kind="remote")
+        ssh="spark", ups="cyberpower", backup=BackupShutdown(enabled=False, kind="remote")
     )
     assert method == "native"
 
 
 def test_derive_none_when_nothing() -> None:
-    from ups_orchestrator.config import BackupShutdown
-
     method = derive_shutdown_method(
-        raw={}, ssh="", ups="", backup=BackupShutdown(enabled=False, kind="remote")
+        ssh="", ups="", backup=BackupShutdown(enabled=False, kind="remote")
     )
     assert method == "none"
 
 
 def test_derive_backup_remote_to_ssh_only_when_enabled() -> None:
-    from ups_orchestrator.config import BackupShutdown
-
     # No ups, backup enabled+remote => ssh
     assert (
         derive_shutdown_method(
-            raw={}, ssh="host", ups="", backup=BackupShutdown(enabled=True, kind="remote")
+            ssh="host", ups="", backup=BackupShutdown(enabled=True, kind="remote")
         )
         == "ssh"
     )
     # No ups, backup enabled+serial => serial requires migration (no serial fields to project)
     # handled by from_dict; the raw derivation for serial maps to "serial".
     assert (
-        derive_shutdown_method(
-            raw={}, ssh="", ups="", backup=BackupShutdown(enabled=True, kind="serial")
-        )
+        derive_shutdown_method(ssh="", ups="", backup=BackupShutdown(enabled=True, kind="serial"))
         == "serial"
     )
     # backup disabled => never derives an active method
     assert (
         derive_shutdown_method(
-            raw={}, ssh="host", ups="", backup=BackupShutdown(enabled=False, kind="remote")
+            ssh="host", ups="", backup=BackupShutdown(enabled=False, kind="remote")
         )
         == "none"
     )
@@ -665,3 +666,287 @@ def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> Non
     bad.write_text("{ not valid json ")
     monkeypatch.setenv("UPS_ORCH_CONFIG", str(bad))
     assert cli._load_config() is None  # graceful, not a crash
+
+
+# --- Plan 02-06 Task 1: the declaration/effect model (INV-DEGRADE, INV-SEVERITY) ---
+
+
+def test_config_notice_renders_severity_subject_and_message() -> None:
+    n = ConfigNotice(severity="error", subject="mt", message="no serial device")
+    assert str(n) == "[error] mt: no serial device"
+
+
+# NEW-1 — the has-ups => native ORDERING. Every pre-existing derivation test sets
+# backup.enabled=False whenever ups is set, so the ordering was never pinned and two
+# independent branch-inverting mutants passed all 41 tests. The discriminating shape
+# below sets ups AND backup{enabled:true} SIMULTANEOUSLY: swap the two branches and
+# these assertions fail. It matters because this shape carries a MATCHING ups, so a
+# mis-derived push method IS projected and DOES fire — an ssh/serial push onto a box
+# whose own upsmon is already self-halting on FSD. It is the only surviving route to a
+# genuine double-shutdown once every other 02-06 fix lands.
+
+
+def test_derive_native_ordering_beats_enabled_backup() -> None:
+    assert (
+        derive_shutdown_method(
+            ssh="spark", ups="cyberpower", backup=BackupShutdown(enabled=True, kind="remote")
+        )
+        == "native"
+    )
+    assert (
+        derive_shutdown_method(
+            ssh="spark", ups="cyberpower", backup=BackupShutdown(enabled=True, kind="serial")
+        )
+        == "native"
+    )
+
+
+def test_derive_native_ordering_beats_enabled_backup_through_from_dict() -> None:
+    # The same ordering through the real parse path an operator's record takes.
+    for kind in ("remote", "serial"):
+        m = MonitoredMachine.from_dict(
+            {
+                "name": "spark",
+                "ssh": "spark",
+                "ups": "cyberpower",
+                "backup": {"enabled": True, "kind": kind},
+            }
+        )
+        assert m.shutdown_method == "native", kind
+
+
+# --- one strict baud parser, both paths (HI-04 + LO-12) ---
+
+
+def test_machine_serial_baud_strict_parse() -> None:
+    def baud(value: object) -> int | None:
+        return MonitoredMachine.from_dict({"name": "mt", "serial_baud": value}).serial_baud
+
+    assert baud(19200) == 19200
+    assert baud("19200") == 19200
+    assert baud("  9600  ") == 9600  # whitespace was never the defect
+    assert baud(True) is None  # JSON boolean, not a baud
+    assert baud(115.2) is None  # a float is not an integer-valued declaration
+    assert baud("115.2k") is None
+    assert baud("fast") is None
+    assert MonitoredMachine.from_dict({"name": "mt"}).serial_baud is None
+
+
+def test_machine_serial_baud_accepts_nested_block() -> None:
+    m = MonitoredMachine.from_dict({"name": "mt", "serial": {"device": "/dev/ttyUSB0", "baud": 9600}})
+    assert m.serial_device == "/dev/ttyUSB0"
+    assert m.serial_baud == 9600
+
+
+def test_target_baud_strict_parse() -> None:
+    def baud(value: object) -> int | None:
+        return ShutdownTarget.from_dict({"name": "s", "kind": "serial", "baud": value}).baud
+
+    assert baud(19200) == 19200
+    assert baud("19200") == 19200
+    assert baud("  9600  ") == 9600
+    assert baud(True) is None
+    assert baud(115.2) is None
+    assert baud("fast") is None
+    # LO-12: an ABSENT key keeps the 9600 back-compat default (P2-07); only a
+    # DECLARED-but-unparseable value yields None. Previously "fast" became 9600 and
+    # sailed past the baud <= 0 check.
+    assert ShutdownTarget.from_dict({"name": "s", "kind": "serial"}).baud == 9600
+
+
+def test_to_dict_leaves_unparseable_baud_untouched() -> None:
+    # INV-DEGRADE at the to_dict boundary: a value that could not be parsed is never
+    # written back, so the operator's own "fast" survives the raw merge verbatim and
+    # the notice can quote what they actually wrote — forever, across any number of
+    # monitor add/remove persists.
+    m = MonitoredMachine.from_dict({"name": "mt", "serial_baud": "fast"})
+    assert m.serial_baud is None
+    assert m.to_dict()["serial_baud"] == "fast"
+
+
+def test_to_dict_emits_a_parsed_baud() -> None:
+    m = MonitoredMachine.from_dict({"name": "mt", "serial_baud": "19200"})
+    assert m.to_dict()["serial_baud"] == 19200
+
+
+def test_to_dict_omits_serial_baud_when_undeclared() -> None:
+    assert "serial_baud" not in MonitoredMachine.from_dict({"name": "mt"}).to_dict()
+
+
+def test_to_dict_drops_nested_serial_block() -> None:
+    # LO-14: emitting a stale nested block alongside the flat fields gives a record two
+    # contradictory sources of truth, so an operator editing the nested form is silently
+    # ignored. The nested form stays ACCEPTED on input; the flat fields are the authority.
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "serial": {"device": "/dev/ttyUSB0", "baud": 9600}}
+    )
+    out = m.to_dict()
+    assert "serial" not in out
+    assert out["serial_device"] == "/dev/ttyUSB0"
+    assert out["serial_baud"] == 9600
+
+
+# --- INV-SEVERITY: the notice/disarm seam is a TYPE, not a rule to remember ---
+
+
+def _err(msg: str = "boom") -> ConfigNotice:
+    return ConfigNotice(severity="error", subject="mt", message=msg)
+
+
+def _adv(msg: str = "look at this") -> ConfigNotice:
+    return ConfigNotice(severity="advisory", subject="mt", message=msg)
+
+
+def test_disarmed_is_structurally_false_for_native() -> None:
+    # Config.load cannot disarm a native authority: the remote box's own upsmon halts
+    # it on the primary's FSD and lives in that box's /etc. Marking it disarmed would
+    # report an armed box as unprotected.
+    m = MonitoredMachine(name="spark", shutdown_method="native", load_notices=(_err(),))
+    assert m.disarmed is False
+    assert m.effective_method == "native"
+
+
+def test_disarmed_true_for_push_with_error_notice() -> None:
+    m = MonitoredMachine(name="mt", shutdown_method="ssh", ssh="mt", load_notices=(_err(),))
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+
+
+def test_advisory_never_disarms_a_push_machine() -> None:
+    # The blocker-1 guarantee. An advisory traverses the whole notice chain and changes
+    # nothing in it: attaching one cannot alter effective_method, because the fold
+    # ignores every non-error severity.
+    one = MonitoredMachine(name="mt", shutdown_method="ssh", ssh="mt", load_notices=(_adv(),))
+    assert one.disarmed is False
+    assert one.effective_method == one.shutdown_method == "ssh"
+
+    # Two advisories — the tuple ACCUMULATES rather than overwriting, which a
+    # single-slot ConfigNotice | None could not do.
+    two = MonitoredMachine(
+        name="mt", shutdown_method="ssh", ssh="mt", load_notices=(_adv("a"), _adv("b"))
+    )
+    assert two.disarmed is False
+    assert two.effective_method == "ssh"
+    assert [n.message for n in two.load_notices] == ["a", "b"]
+
+
+def test_advisory_and_error_together_disarm_and_retain_both() -> None:
+    # A push machine can legitimately earn BOTH the NEW-2 advisory and a T-02-10
+    # ssh-alias error in one load. Every finding is preserved; the effect is the fold.
+    m = MonitoredMachine(
+        name="mt", shutdown_method="ssh", ssh="-oProxyCommand=x", load_notices=(_adv(), _err())
+    )
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+    assert len(m.load_notices) == 2
+    assert {n.severity for n in m.load_notices} == {"advisory", "error"}
+
+
+def test_load_notices_are_not_compared() -> None:
+    # compare=False: a diagnostic overlay must not make two identical declarations
+    # unequal, and must never participate in persistence identity.
+    bare = MonitoredMachine(name="mt", shutdown_method="ssh", ssh="mt")
+    noted = MonitoredMachine(name="mt", shutdown_method="ssh", ssh="mt", load_notices=(_err(),))
+    assert bare == noted
+
+
+def test_target_effective_enabled_folds_on_error() -> None:
+    t = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt")
+    assert t.effective_enabled is True
+    disarmed = dataclasses.replace(t, load_notices=(_err(),))
+    assert disarmed.enabled is True  # the DECLARATION is never rewritten
+    assert disarmed.effective_enabled is False
+    advised = dataclasses.replace(t, load_notices=(_adv(),))
+    assert advised.effective_enabled is True
+
+
+def test_target_enabled_string_false_disables() -> None:
+    # MED-07: bare bool("false") is True, which made the disabled-target exemption
+    # conditional on the operator having written a real JSON boolean.
+    assert ShutdownTarget.from_dict({"name": "s", "enabled": "false"}).enabled is False
+    assert ShutdownTarget.from_dict({"name": "s", "enabled": "no"}).enabled is False
+    assert ShutdownTarget.from_dict({"name": "s", "enabled": "true"}).enabled is True
+    assert ShutdownTarget.from_dict({"name": "s", "enabled": True}).enabled is True
+    assert ShutdownTarget.from_dict({"name": "s"}).enabled is False
+
+
+# --- NEW-2's VALUE-based predicate (round-4 blocker 2) ---
+
+
+def test_requires_root_escalation_true_for_unescalated_halt_binaries() -> None:
+    # /sbin/shutdown, /usr/sbin/shutdown and a bare `shutdown` on PATH are one defect
+    # wearing three spellings, so the test is on the BASENAME, case-folded.
+    assert requires_root_escalation("/sbin/shutdown -h now") is True
+    assert requires_root_escalation("shutdown -h now") is True
+    assert requires_root_escalation("/usr/sbin/shutdown -h now") is True
+    assert requires_root_escalation("/usr/sbin/poweroff") is True
+    assert requires_root_escalation("SHUTDOWN -h now") is True
+    assert requires_root_escalation("halt") is True
+    assert requires_root_escalation("telinit 0") is True
+    assert requires_root_escalation("systemctl poweroff") is True
+    assert requires_root_escalation("/usr/bin/systemctl --no-block halt") is True
+
+
+def test_requires_root_escalation_false_when_escalated_or_custom() -> None:
+    assert requires_root_escalation("sudo /sbin/shutdown -h now") is False
+    assert requires_root_escalation("doas shutdown -h now") is False
+    assert requires_root_escalation("pkexec systemctl poweroff") is False
+    assert requires_root_escalation("su -c 'shutdown -h now'") is False
+    assert requires_root_escalation("run0 poweroff") is False
+    # A genuinely custom command (a setuid wrapper, an operator script) is never nagged.
+    assert requires_root_escalation("/usr/local/bin/my-halt") is False
+    assert requires_root_escalation("systemctl restart foo") is False
+    assert requires_root_escalation("") is False
+    assert requires_root_escalation("   ") is False
+
+
+def test_requires_root_escalation_never_raises_on_unbalanced_quote() -> None:
+    # A predicate that raises out of the load path would turn an advisory into an
+    # outage. shlex.split raises on an unbalanced quote; the fallback is str.split.
+    result = requires_root_escalation('/sbin/shutdown -h "now')
+    assert isinstance(result, bool)
+    assert result is True
+    assert requires_root_escalation("sudo 'shutdown") is False
+
+
+# --- the legacy-target disarm set ---
+
+
+def _ups_with_targets(*targets: dict[str, object]) -> dict[str, UpsConfig]:
+    return {"cyberpower": UpsConfig.from_dict("cyberpower", {"shutdown_targets": list(targets)})}
+
+
+def test_validate_legacy_targets_reports_unfireable_shapes() -> None:
+    def one(target: dict[str, object]) -> str:
+        found = validate_legacy_targets(_ups_with_targets(target))
+        assert len(found) == 1, found
+        ups_key, target_name, message = found[0]
+        assert ups_key == "cyberpower"
+        assert target_name == target["name"]
+        return message
+
+    # POSIX B0 means hang up the line, so `stty -F <dev> 0` disconnects the very
+    # console it was about to write to.
+    assert "baud" in one(
+        {"name": "a", "kind": "serial", "enabled": True, "device": "/dev/ttyUSB0", "baud": 0}
+    )
+    assert "baud" in one(
+        {"name": "b", "kind": "serial", "enabled": True, "device": "/dev/ttyUSB0", "baud": "fast"}
+    )
+    assert "device" in one({"name": "c", "kind": "serial", "enabled": True, "baud": 9600})
+    # config.py accepts a blank host and ssh can never connect to it.
+    assert "host" in one({"name": "d", "kind": "remote", "enabled": True})
+    # events.py dispatch treats anything not local and not serial as SSH, so an
+    # unknown kind silently becomes an ssh attempt against a blank host.
+    assert "kind" in one({"name": "e", "kind": "telepathy", "enabled": True, "host": "h"})
+
+
+def test_validate_legacy_targets_silent_on_healthy_and_disabled() -> None:
+    healthy = _ups_with_targets(
+        {"name": "ok-remote", "kind": "remote", "enabled": True, "host": "h"},
+        {"name": "ok-serial", "kind": "serial", "enabled": True, "device": "/dev/ttyUSB0"},
+        {"name": "ok-local", "kind": "local", "enabled": True},
+        # DECLARED-disabled targets fire nothing, so they are never reported.
+        {"name": "off", "kind": "telepathy", "enabled": False},
+    )
+    assert validate_legacy_targets(healthy) == ()
