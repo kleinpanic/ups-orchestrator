@@ -183,7 +183,20 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
     add``/``remove`` or the poll loop's state save) has no recovery path. A
     destination that does not exist yet has nothing to inherit and is not an
     error.
+
+    MED-03: a symlinked destination is RESOLVED first. ``Path.stat()`` follows a
+    symlink but ``Path.replace()`` does not — it renames over the link path — so a
+    deployment that symlinks ``/etc/ups-orchestrator/config.json`` into a git-managed
+    or ``/srv`` location (a normal pattern for config under version control) was
+    silently detached by the first ``monitor add``: from then on the daemon read a
+    file the operator did not edit and edited a file the daemon did not read, with
+    the link's target metadata copied so nothing looked wrong. The atomic rename now
+    lands where the link points.
     """
+    # os.path.islink rather than Path.is_symlink: it swallows its own OSError, so a
+    # destination that cannot even be lstat'd stays on the ordinary path below.
+    if os.path.islink(dest_path):
+        dest_path = Path(os.path.realpath(dest_path))
     try:
         st: os.stat_result | None = dest_path.stat()
     except FileNotFoundError:

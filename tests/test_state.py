@@ -262,3 +262,38 @@ def test_save_completes_when_the_acl_helpers_hang(monkeypatch, tmp_path, caplog)
 
     assert seen and all(t == 5 for t in seen)  # every ACL call is bounded
     assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 1
+
+
+def test_replace_follows_a_symlinked_destination(tmp_path) -> None:
+    # MED-03. Path.stat() follows a symlink; Path.replace() does not — it renames
+    # OVER the link path. A deployment that symlinks config.json into a git-managed
+    # or /srv location was silently detached by the first write: the daemon then read
+    # a file the operator did not edit and edited a file the daemon did not read, and
+    # because the metadata copied was the TARGET's, nothing looked wrong.
+    real = tmp_path / "real.json"
+    real.write_text("{}")
+    os.chmod(real, 0o640)
+    link = tmp_path / "config.json"
+    link.symlink_to(real)
+
+    tmp = tmp_path / ".config.json.tmp"
+    tmp.write_text('{"new": 1}')
+    state_mod.replace_preserving_metadata(tmp, link)
+
+    assert link.is_symlink(), "the operator's symlink was replaced by a regular file"
+    assert json.loads(real.read_text()) == {"new": 1}  # the real file got the write
+    assert stat.S_IMODE(real.stat().st_mode) == 0o640  # ...and kept its mode
+
+
+def test_state_store_save_through_a_symlink_keeps_the_link(tmp_path) -> None:
+    real = tmp_path / "real.json"
+    real.write_text("{}")
+    link = tmp_path / "state.json"
+    link.symlink_to(real)
+
+    store = StateStore(link)
+    store.get("ups1").onbatt_since = 7
+    store.save()
+
+    assert link.is_symlink()
+    assert json.loads(real.read_text())["ups1"]["onbatt_since"] == 7
