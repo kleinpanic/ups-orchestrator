@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,97 @@ def _as_bool(value: object, default: bool) -> bool:
         if s in ("0", "false", "no", "n", "off", "disabled"):
             return False
     return default
+
+
+def _strict_baud(value: object) -> int | None:
+    """Parse a DECLARED baud strictly, or return ``None``.
+
+    ``_as_int`` substitutes a default for anything it cannot read, so ``"fast"``
+    became 9600 and then sailed past a ``baud <= 0`` check as a perfectly plausible
+    rate (HI-04 on ``MonitoredMachine.serial_baud``, LO-12 on ``ShutdownTarget.baud``
+    — one class on two lines, so one parser serves both). Only an int or an
+    integer-valued string parses; a JSON boolean, a float and a non-integer string
+    all yield ``None`` so the caller can quote what the operator actually wrote.
+    Surrounding whitespace is tolerated — whitespace was never the defect.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; a boolean is not a baud
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+# Wrappers that hand the caller root without the command itself needing to be root.
+_ESCALATORS = frozenset({"sudo", "doas", "su", "pkexec", "run0"})
+# Binaries that halt the box and refuse to run as anyone but root.
+_ROOT_HALT_BINARIES = frozenset({"shutdown", "poweroff", "halt", "reboot", "telinit", "init"})
+# `systemctl <verb>` forms that reach the same place.
+_SYSTEMCTL_HALT_VERBS = frozenset({"poweroff", "halt", "reboot"})
+
+
+def requires_root_escalation(cmd: str) -> bool:
+    """Does ``cmd`` invoke a root-only halt binary with no escalation wrapper?
+
+    NEW-2: ``shutdown_cmd`` is overloaded across two privilege contexts. The default
+    ``/sbin/shutdown -h now`` is CORRECT for ``native`` — ``upsmon`` runs SHUTDOWNCMD
+    as root — and WRONG for a push, where it runs as the ssh user or the far-end
+    auto-login user. Over ssh a permission failure is a non-zero rc; over serial it is
+    SILENT (the bytes are delivered, the write completes, rc is 0, and success is
+    reported for a box that stayed up).
+
+    The test is on the VALUE, never on key presence: ``to_dict`` writes
+    ``shutdown_cmd`` unconditionally and the CLI defaults it method-independently, so
+    every persisted record carries the key at exactly the wrong-for-push value and a
+    key-presence detector would warn about none of them. Basenames rather than full
+    paths, because ``/sbin/shutdown``, ``/usr/sbin/shutdown`` and a bare ``shutdown``
+    on PATH are one defect wearing three spellings; case-folded because the field is
+    operator-authored free text. Anything unrecognised is False, so a genuinely custom
+    command (a setuid wrapper, an operator script) is never nagged about. This never
+    raises: a predicate that threw out of the load path would turn an advisory into an
+    outage.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:  # unbalanced quote
+        tokens = cmd.split()
+    if not tokens:
+        return False
+    head = PurePosixPath(tokens[0]).name.casefold()
+    if head in _ESCALATORS:
+        return False  # the operator already handled the privilege gap
+    if head in _ROOT_HALT_BINARIES:
+        return True
+    if head == "systemctl":
+        return any(PurePosixPath(t).name.casefold() in _SYSTEMCTL_HALT_VERBS for t in tokens[1:])
+    return False
+
+
+@dataclass(frozen=True)
+class ConfigNotice:
+    """One load-time degrade report.
+
+    ``severity`` is the whole seam between "an authority changed state" and "look at
+    this". It is carried in the VALUE rather than implied by a notice existing at all,
+    so an advisory is structurally incapable of disarming a machine: ``disarmed``
+    folds on ``severity == "error"`` and ignores everything else.
+
+    ``subject`` is a machine name or an ``<ups>/<target>`` label; ``message`` states
+    what is wrong AND the concrete remedy. No secret has ever entered this module and
+    none may now — messages interpolate only machine names, UPS names, method strings,
+    device paths, kinds and baud values.
+    """
+
+    severity: str  # "error" | "advisory"
+    subject: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"[{self.severity}] {self.subject}: {self.message}"
 
 
 def _opt_int(value: object) -> int | None:
@@ -245,9 +337,7 @@ class BackupShutdown:
         return {"enabled": self.enabled, "kind": self.kind}
 
 
-def derive_shutdown_method(
-    raw: dict[str, object], ssh: str, ups: str, backup: BackupShutdown
-) -> str:
+def derive_shutdown_method(ssh: str, ups: str, backup: BackupShutdown) -> str:
     """Derive the effective shutdown method for a record that predates ``shutdown_method``.
 
     This is a BACK-COMPAT path only — a newly written record carries an explicit
@@ -257,6 +347,18 @@ def derive_shutdown_method(
     ``backup`` projection fires ONLY when ``backup.enabled`` — an absent/disabled
     backup parses as ``enabled=False, kind="remote"`` and must not turn a native
     secondary into ssh.
+
+    The branch ORDER is load-bearing and is pinned by
+    ``test_derive_native_ordering_beats_enabled_backup``: with a MATCHING non-empty
+    ``ups`` a mis-derived push method is projected and does fire, pushing onto a box
+    whose own upsmon is already self-halting on FSD. Note the corollary that makes the
+    no-``ups`` half inert: a push method is derived ONLY when ``ups`` is empty, and
+    ``events._machine_targets`` projects only a machine whose UPS matches the UPS being
+    handled — so the entire derived-push class is structurally unfireable, which is why
+    ``unprojectable_push_machines`` disarms it rather than warning about it.
+
+    LO-11: this consults only its arguments. It used to take a ``raw`` parameter it
+    never referenced, which read as though the record were consulted.
     """
     if ups.strip():
         return "native"
@@ -290,11 +392,45 @@ class MonitoredMachine:
     # record with no explicit value derives one via ``derive_shutdown_method``.
     shutdown_method: str = "none"  # "none" | "native" | "serial" | "ssh"
     serial_device: str = ""  # method == "serial": e.g. /dev/serial/by-id/...
-    serial_baud: int = 9600  # operator-declared; NEVER a silent 115200 (P2-08)
+    # Operator-declared; NEVER a silent 115200 and never a silent 9600 either (P2-08).
+    # An absent declaration is None and disarms a serial machine at load rather than
+    # guessing at the live line's rate.
+    serial_baud: int | None = None
     # The original raw entry, so operator-authored keys (e.g. a per-machine
     # ``_comment``) survive an add/remove round-trip instead of being dropped by
     # a known-fields-only to_dict. Never carries a secret — the config holds none.
     raw: dict[str, object] = field(default_factory=dict, compare=False)
+    # INV-DEGRADE: the ONLY state a load-time degrade may write. Non-persisted and
+    # compare=False — a diagnostic overlay, never part of the declaration.
+    load_notices: tuple[ConfigNotice, ...] = field(default=(), compare=False)
+
+    @property
+    def disarmed(self) -> bool:
+        """Has a load-time ERROR taken this machine's push authority away?
+
+        Not a stored field, so two guarantees are structural rather than remembered:
+
+        1. A declared-``native`` machine is NEVER disarmed. Its authority is the REMOTE
+           box's own ``upsmon`` reacting to this primary's FSD, configured in that
+           box's ``/etc``; nothing a config parser does changes it, and reporting it
+           disarmed would tell an operator a still-protected box is unprotected. The
+           only real disarm is ``monitor remove <name>``.
+        2. An ADVISORY can never disarm anything, because the fold ignores every
+           severity but ``"error"``. There is no code path by which attaching one
+           changes ``effective_method``.
+
+        It reads the DECLARED ``shutdown_method`` (INV-DECLARED), which is what makes
+        the native carve-out unforgeable: nothing in this module rewrites that field.
+        """
+        return (
+            any(n.severity == "error" for n in self.load_notices)
+            and self.shutdown_method != "native"
+        )
+
+    @property
+    def effective_method(self) -> str:
+        """The method that FIRES. Detection, gates and persistence read the declaration."""
+        return "none" if self.disarmed else self.shutdown_method
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> MonitoredMachine:
@@ -309,10 +445,7 @@ class MonitoredMachine:
         serial_blk = data.get("serial")
         serial_blk = serial_blk if isinstance(serial_blk, dict) else {}
         serial_device = str(data.get("serial_device", serial_blk.get("device", "")))
-        serial_baud = _as_int(
-            data.get("serial_baud", serial_blk.get("baud")),
-            9600,
-        )
+        serial_baud = _strict_baud(data.get("serial_baud", serial_blk.get("baud")))
 
         # Effective method: an explicit valid shutdown_method always wins; else a
         # legacy record derives one. Unknown/blank explicit values coerce to "none"
@@ -331,7 +464,7 @@ class MonitoredMachine:
                 )
                 method = "none"
         else:
-            method = derive_shutdown_method(raw=data, ssh=ssh, ups=ups, backup=backup)
+            method = derive_shutdown_method(ssh=ssh, ups=ups, backup=backup)
             if method != "none":
                 logger.warning(
                     "monitored machine %r has no explicit shutdown_method; "
@@ -374,6 +507,10 @@ class MonitoredMachine:
         # Merge known fields into the preserved raw entry so unknown operator keys
         # (a _comment, a custom tag) are not lost on the next persist.
         merged: dict[str, object] = dict(self.raw)
+        # LO-14: never emit a stale nested ``serial`` block alongside the flat fields.
+        # Two contradictory sources of truth means an operator editing the nested form
+        # is silently ignored. The nested form stays ACCEPTED on input.
+        merged.pop("serial", None)
         merged.update(
             {
                 "name": self.name,
@@ -386,9 +523,16 @@ class MonitoredMachine:
                 "backup": self.backup.to_dict(),
                 "shutdown_method": self.shutdown_method,
                 "serial_device": self.serial_device,
-                "serial_baud": self.serial_baud,
             }
         )
+        # INV-DEGRADE at the persistence boundary, as a MECHANISM rather than a special
+        # case: a value that could not be parsed is never written back. The key is
+        # simply not emitted, so the merge of ``raw`` leaves the operator's own "fast"
+        # in place verbatim and the notice can quote what they actually wrote. Without
+        # this, ``_monitor_persist`` would write the parser's sentinel over the
+        # declaration and the next load would quote a value the operator never typed.
+        if self.serial_baud is not None:
+            merged["serial_baud"] = self.serial_baud
         return merged
 
 
@@ -418,10 +562,15 @@ class ShutdownTarget:
     host: str = ""
     user: str = ""
     device: str = ""  # serial: e.g. /dev/ttyUSB0
-    baud: int = 9600  # serial baud rate (matches the live line; never 115200 — P2-08)
+    # Serial baud rate (matches the live line; never 115200 — P2-08). The 9600
+    # DATACLASS default is retained for P2-07 back-compat: an ABSENT key still yields
+    # 9600. Only a DECLARED-but-unparseable value yields None (LO-12).
+    baud: int | None = 9600
     cmd: str = "sudo /sbin/shutdown -h now"
     battery_below: int | None = None
     runtime_below: int | None = None
+    # INV-DEGRADE mirror of MonitoredMachine.load_notices. Non-persisted, compare=False.
+    load_notices: tuple[ConfigNotice, ...] = field(default=(), compare=False)
 
     @property
     def is_local(self) -> bool:
@@ -431,16 +580,28 @@ class ShutdownTarget:
     def is_serial(self) -> bool:
         return self.kind.lower() == "serial"
 
+    @property
+    def effective_enabled(self) -> bool:
+        """Whether this target FIRES. ``enabled`` stays the declaration (INV-DECLARED).
+
+        Folds on severity identically to ``MonitoredMachine.disarmed``: an advisory
+        leaves the target armed. Unlike ``native``, a legacy target's authority is
+        in-process, so an ERROR here genuinely disarms it.
+        """
+        return self.enabled and not any(n.severity == "error" for n in self.load_notices)
+
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> ShutdownTarget:
         return cls(
             name=str(data.get("name", data.get("host", "target"))),
             kind=str(data.get("kind", "remote")).lower(),
-            enabled=bool(data.get("enabled", False)),
+            # MED-07: bare bool("false") is True, which made the disabled-target
+            # exemption conditional on the operator having written a real JSON boolean.
+            enabled=_as_bool(data.get("enabled"), False),
             host=str(data.get("host", "")),
             user=str(data.get("user", "")),
             device=str(data.get("device", "")),
-            baud=_as_int(data.get("baud"), 9600),
+            baud=_strict_baud(data["baud"]) if "baud" in data else 9600,
             cmd=str(data.get("cmd", "sudo /sbin/shutdown -h now")),
             battery_below=_opt_int(data.get("battery_below")),
             runtime_below=_opt_int(data.get("runtime_below")),
@@ -503,12 +664,94 @@ def validate_active_transports(
         if method == "serial":
             if not m.serial_device.strip():
                 errors.append(f"{m.name}: serial method with empty serial_device")
-            if m.serial_baud <= 0:
+            if m.serial_baud is None or m.serial_baud <= 0:
                 errors.append(f"{m.name}: serial method with non-positive serial_baud")
         elif method == "ssh":
             if not m.ssh.strip():
                 errors.append(f"{m.name}: ssh method with empty ssh alias")
     return tuple(errors)
+
+
+# Every kind ``events._fire_target`` dispatches deliberately. Anything else is not
+# rejected there — it falls through to the SSH runner (events.py:470).
+_LEGACY_TARGET_KINDS = frozenset({"remote", "serial", "local"})
+
+
+def validate_legacy_targets(
+    upses: Mapping[str, UpsConfig],
+) -> tuple[tuple[str, str, str], ...]:
+    """Return ``(ups_key, target_name, message)`` for enabled targets that cannot fire.
+
+    A pure reporter — it raises nothing and reads the DECLARED ``enabled`` flag
+    (INV-DECLARED), so it keeps reporting the same shapes on a reload of an
+    already-degraded config. Four shapes, each unfireable or misdispatching:
+
+    * a serial target whose baud is non-positive or unparseable. POSIX ``B0`` means
+      *hang up the line*, so ``stty -F <device> 0`` actively disconnects the console it
+      was about to write to;
+    * a serial target with a blank device;
+    * a ``remote`` target with a blank host — ``from_dict`` accepts it and ``ssh`` can
+      never connect to it;
+    * a ``kind`` that is none of remote/serial/local, because dispatch treats anything
+      not local and not serial as SSH, so an unknown kind becomes a silent ssh attempt
+      against whatever ``host`` happens to hold.
+    """
+    problems: list[tuple[str, str, str]] = []
+    for ups_key, ups in upses.items():
+        for t in ups.shutdown_targets:
+            if not t.enabled:
+                continue
+            kind = t.kind.strip().lower()
+            if kind not in _LEGACY_TARGET_KINDS:
+                problems.append(
+                    (
+                        ups_key,
+                        t.name,
+                        f"unknown target kind {t.kind!r}; dispatch treats anything that is "
+                        f"not 'local' or 'serial' as SSH, so this would become a silent ssh "
+                        f"attempt. Set kind to one of remote/serial/local.",
+                    )
+                )
+                continue
+            if kind == "serial":
+                if not t.device.strip():
+                    problems.append(
+                        (
+                            ups_key,
+                            t.name,
+                            "serial target with a blank device; set device to the "
+                            "console device under /dev/.",
+                        )
+                    )
+                if t.baud is None:
+                    problems.append(
+                        (
+                            ups_key,
+                            t.name,
+                            "serial target with an unparseable baud; declare an integer "
+                            "baud matching the live console (9600 here).",
+                        )
+                    )
+                elif t.baud <= 0:
+                    problems.append(
+                        (
+                            ups_key,
+                            t.name,
+                            f"serial target with a non-positive baud {t.baud}; POSIX B0 "
+                            f"hangs up the line, so stty would disconnect the console it "
+                            f"was about to use. Declare the live console's baud (9600 here).",
+                        )
+                    )
+            elif kind == "remote" and not t.host.strip():
+                problems.append(
+                    (
+                        ups_key,
+                        t.name,
+                        "remote target with a blank host; ssh can never connect. Set host "
+                        "to the hostname or ssh_config alias of the box to shut down.",
+                    )
+                )
+    return tuple(problems)
 
 
 def dual_regime_conflicts(

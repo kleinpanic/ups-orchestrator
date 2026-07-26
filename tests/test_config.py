@@ -733,7 +733,9 @@ def test_machine_serial_baud_strict_parse() -> None:
 
 
 def test_machine_serial_baud_accepts_nested_block() -> None:
-    m = MonitoredMachine.from_dict({"name": "mt", "serial": {"device": "/dev/ttyUSB0", "baud": 9600}})
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "serial": {"device": "/dev/ttyUSB0", "baud": 9600}}
+    )
     assert m.serial_device == "/dev/ttyUSB0"
     assert m.serial_baud == 9600
 
