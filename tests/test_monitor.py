@@ -1558,3 +1558,376 @@ def test_add_push_shutdown_cmd_double_quote_still_rejected_rc2(cfg_path, monkeyp
         ]
     )
     assert rc == 2
+
+
+# =============================================================================
+# 02-03 Task 2 — method- and degrade-aware list/verify/remove, plus the
+# `watch`-startup degrade surface (RA-01, T-02-46, T-02-47, T-02-48, IW-04/06)
+#
+# INV-DECLARED again: every branch below reads `shutdown_method`, never
+# `effective_method`. Branching on the effect would render a temporarily
+# degraded machine identically to a deliberately-declared `none`.
+# =============================================================================
+
+
+class _RecNotifier:
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    def send(self, note):  # noqa: ANN001
+        from ups_orchestrator.notify import DeliveryResult
+
+        self.sent.append(note)
+        return DeliveryResult(configured=True, ok=True)
+
+
+def _load(cfg_path: Path):
+    from ups_orchestrator.config import Config
+
+    return Config.load(cfg_path)
+
+
+# --- list ---------------------------------------------------------------------
+
+
+def test_list_shows_declared_and_effective_method(cfg_path, capsys) -> None:
+    # IW-04: today the line prints only `backup:on/off`, so the live spark renders
+    # as `backup:off` while its governing authority is `native` — the CLI reports
+    # the RETIRED flag and omits the one that decides whether the box dies.
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("spark", method="native", ssh="spark", ip="192.168.1.120"),
+            # blank ups => structurally unprojectable => disarmed at load
+            _machine_entry("mt", method="serial", ups="", device="/dev/ttyUSB0", baud=9600),
+        ],
+    )
+    assert cli.main(["monitor", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "method=native" in out
+    assert "method=serial" in out and "effective:none" in out
+
+
+def test_list_renders_degraded_notices(cfg_path, capsys) -> None:
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="serial", ups="", device="/dev/ttyUSB0", baud=9600)],
+    )
+    assert cli.main(["monitor", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "DEGRADED CONFIG" in out
+    assert "mt" in out and "can never fire" in out
+
+
+def test_list_renders_degraded_notices_with_zero_machines(cfg_path, capsys) -> None:
+    # A config can have zero machines and a disabled legacy target: the
+    # `no machines enrolled` early return must STILL reach the notices.
+    _write_config(
+        cfg_path,
+        extra={
+            "upses": {
+                "cyberpower": {
+                    "label": "CyberPower",
+                    "shutdown_targets": [{"name": "ghost", "enabled": True, "host": ""}],
+                }
+            }
+        },
+    )
+    assert cli.main(["monitor", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "no machines enrolled" in out
+    assert "DEGRADED CONFIG" in out and "blank host" in out
+
+
+def test_list_prints_no_degrade_block_when_clean(cfg_path, capsys) -> None:
+    _write_config(cfg_path, machines=[_machine_entry("spark", method="native", ssh="spark")])
+    assert cli.main(["monitor", "list"]) == 0
+    assert "DEGRADED" not in capsys.readouterr().out
+
+
+# --- verify: the four mutually distinguishable shapes (T-02-46) ---------------
+
+
+def test_verify_disarmed_push_record_is_rc1_and_names_its_declaration(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="serial", ups="", device="/dev/ttyUSB0", baud=9600)],
+    )
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    rc = cli.main(["monitor", "verify", "mt"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DISARMED (declared serial)" in out
+    assert "can never fire" in out  # the reason travels with the verdict
+    assert "no active shutdown authority" not in out
+
+
+def test_verify_declared_none_without_ups_is_rc0_and_probes_nothing(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    _write_config(cfg_path, machines=[_machine_entry("shelf", method="none", ups="")])
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    rc = cli.main(["monitor", "verify", "shelf"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no active shutdown authority" in out
+    assert "DISARMED" not in out
+    assert ssh.calls == []
+
+
+def test_verify_native_with_a_load_notice_still_probes_the_secondary(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    # 02-06: config cannot disarm a native authority. The remote upsmon is the only
+    # thing that decides, and this probe is the only evidence this box has about it.
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="native", ssh="mt", ip="192.168.1.114")],
+        extra=_UPS_WITH_MT_TARGET,
+    )
+    assert _load(cfg_path).monitored_machines[0].load_notices
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    rc = cli.main(["monitor", "verify", "mt"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert ssh.calls, "a declared-native record must ALWAYS run the secondary probe"
+    assert "OK" in out
+    assert "monitor remove mt" in out  # the only real disarm, named
+
+
+def test_verify_declared_none_with_ups_advisory_probes_and_is_rc1_when_answered(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    # BL-02's exact signature. Reporting "no active authority" here would falsely
+    # reassure the one operator who most needs the truth.
+    _write_config(cfg_path, machines=[_machine_entry("spark", method="none", ups="cyberpower")])
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    rc = cli.main(["monitor", "verify", "spark"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert ssh.calls
+    assert "monitor remove spark" in out
+    assert "no active shutdown authority" not in out
+
+
+def test_verify_declared_none_with_ups_is_rc0_when_no_secondary_answers(
+    cfg_path, monkeypatch
+) -> None:
+    _write_config(cfg_path, machines=[_machine_entry("spark", method="none", ups="cyberpower")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(1, "", "connection refused")]))
+    assert cli.main(["monitor", "verify", "spark"]) == 0
+
+
+def test_verify_declared_ssh_with_a_stale_enrollment_ip_advisory_probes_rc1(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    # IW-05: `ip` is written ONLY by the native enrollment path, so a push record
+    # carrying one is a probable hand-edited former native secondary.
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower", ip="192.168.1.114")
+        ],
+    )
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    rc = cli.main(["monitor", "verify", "mt"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert ssh.calls
+    assert "DISARMED (declared ssh)" in out
+    assert "monitor remove mt" in out
+
+
+def test_verify_serial_checks_device_presence_through_the_injected_stat(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(
+                "spark", method="serial", ups="cyberpower", device="/dev/ttyUSB0", baud=9600
+            )
+        ],
+    )
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    seen: list[str] = []
+
+    def _fake_stat(path: str):  # noqa: ANN202
+        seen.append(path)
+        return os.stat_result((stat.S_IFCHR | 0o660, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+    rc = cli._monitor_verify(_load(cfg_path), ["spark"], stat_fn=_fake_stat)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert seen == ["/dev/ttyUSB0"]  # no real /dev node was ever reached
+    assert "9600" in out
+    assert ssh.calls == []  # no ssh alias, no NUT probe
+
+
+def test_verify_serial_missing_device_is_rc1(cfg_path, capsys) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(
+                "spark", method="serial", ups="cyberpower", device="/dev/ttyUSB0", baud=9600
+            )
+        ],
+    )
+
+    def _fake_stat(path: str):  # noqa: ANN202
+        raise FileNotFoundError(path)
+
+    rc = cli._monitor_verify(_load(cfg_path), ["spark"], stat_fn=_fake_stat)
+    assert rc == 1
+    assert "/dev/ttyUSB0" in capsys.readouterr().out
+
+
+def test_verify_ssh_probes_the_alias_and_runs_no_nut_check(cfg_path, monkeypatch, capsys) -> None:
+    _write_config(
+        cfg_path, machines=[_machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower")]
+    )
+    ssh = FakeSSH([(0, "", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    called: list[str] = []
+    monkeypatch.setattr(
+        cli.nutclient,
+        "verify_secondary",
+        lambda *a, **k: (called.append("nut"), (True, "OL"))[1],
+    )
+    rc = cli.main(["monitor", "verify", "mt"])
+    assert rc == 0
+    assert ssh.calls and called == []
+    assert "mt" in capsys.readouterr().out
+
+
+def test_verify_ssh_unreachable_alias_is_rc1(cfg_path, monkeypatch) -> None:
+    _write_config(
+        cfg_path, machines=[_machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower")]
+    )
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(255, "", "no route to host")]))
+    assert cli.main(["monitor", "verify", "mt"]) == 1
+
+
+# --- remove: method-aware and ambiguity-refusing (T-02-48) --------------------
+
+
+def test_remove_non_native_skips_the_nut_disarm_and_the_nft_rewrite(
+    cfg_path, monkeypatch
+) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(
+                "spark", method="serial", ups="cyberpower", device="/dev/ttyUSB0", baud=9600
+            ),
+            _machine_entry("mt", method="native", ssh="mt", ip="192.168.1.114"),
+        ],
+    )
+    ssh, nft = FakeSSH(), FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+    assert cli.main(["monitor", "remove", "spark"]) == 0
+    assert ssh.calls == [] and nft.calls == []
+    data = json.loads(cfg_path.read_text())
+    assert [m["name"] for m in data["monitored_machines"]] == ["mt"]
+    # The native survivor is untouched, declaration included.
+    assert _entry(cfg_path, "mt")["shutdown_method"] == "native"
+
+
+def test_remove_native_still_disarms_and_rewrites_the_firewall(cfg_path, monkeypatch) -> None:
+    _write_config(cfg_path, machines=[_machine_entry("mt", method="native", ssh="mt", ip="1.2.3.4")])
+    ssh, nft = FakeSSH(), FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+    assert cli.main(["monitor", "remove", "mt"]) == 0
+    assert ssh.calls and nft.calls
+
+
+def test_remove_refuses_an_ambiguous_name_rc2(cfg_path, monkeypatch) -> None:
+    # 02-06 KEEPS every duplicate and disarms them all, so `_monitor_find`'s
+    # first-wins would delete an arbitrary one of them.
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="ssh", ssh="mt"),
+            _machine_entry("MT", method="ssh", ssh="mt2"),
+        ],
+    )
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    assert cli.main(["monitor", "remove", "mt"]) == 2
+    assert ssh.calls == []
+    data = json.loads(cfg_path.read_text())
+    assert len(data["monitored_machines"]) == 2  # nothing deleted
+
+
+# --- watch startup degrade surface + IW-06 -----------------------------------
+
+
+@pytest.fixture
+def watch_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("UPS_ORCH_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("UPS_ORCH_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(tmp_path / "notify.jsonl"))
+    monkeypatch.setenv("UPS_ORCH_SAMPLES", str(tmp_path / "samples.jsonl"))
+    monkeypatch.setattr(cli, "dispatch", lambda *_a, **_k: None)
+
+    def _sleep(_s: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", _sleep)
+    return tmp_path
+
+
+def test_watch_startup_sends_exactly_one_aggregated_notification(
+    cfg_path, watch_env, monkeypatch, caplog
+) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="serial", ups="", device="/dev/ttyUSB0", baud=9600),
+            _machine_entry("spark", method="ssh", ssh="spark", ups="nosuchups"),
+        ],
+    )
+    rec = _RecNotifier()
+    monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: rec)
+    with caplog.at_level("WARNING"), pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+    assert len(rec.sent) == 1, "one aggregated notification, never one per notice"
+    body = rec.sent[0].title + rec.sent[0].body + str(rec.sent[0].fields)
+    assert "mt" in body and "spark" in body
+    assert "mt" in caplog.text and "spark" in caplog.text
+
+
+def test_watch_startup_sends_nothing_when_the_config_is_clean(
+    cfg_path, watch_env, monkeypatch
+) -> None:
+    _write_config(cfg_path, machines=[_machine_entry("spark", method="native", ssh="spark")])
+    rec = _RecNotifier()
+    monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: rec)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+    assert rec.sent == []
+
+
+def test_watch_returns_nonzero_when_the_config_cannot_be_loaded(cfg_path, watch_env) -> None:
+    cfg_path.write_text("{ this is not json")
+    assert cli.main(["watch"]) != 0
+
+
+def test_event_returns_nonzero_when_the_config_cannot_be_loaded(cfg_path, watch_env) -> None:
+    # IW-06: upssched-cmd.sh invokes this for onbatt/lowbatt/remote_shutdown, so a
+    # config that cannot be loaded used to turn every real NUT power event into a
+    # silent no-op that reported SUCCESS.
+    cfg_path.write_text("{ this is not json")
+    assert cli.main(["onbatt", "cyberpower"]) != 0
