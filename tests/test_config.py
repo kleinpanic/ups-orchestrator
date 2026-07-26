@@ -22,6 +22,7 @@ from ups_orchestrator.config import (
     requires_root_escalation,
     unknown_ups_references,
     unprojectable_push_machines,
+    validate_active_transports,
     validate_legacy_targets,
 )
 
@@ -915,6 +916,44 @@ def test_to_dict_emits_a_parsed_baud() -> None:
 
 def test_to_dict_omits_serial_baud_when_undeclared() -> None:
     assert "serial_baud" not in MonitoredMachine.from_dict({"name": "mt"}).to_dict()
+
+
+def test_to_dict_preserves_an_unparseable_nested_baud(tmp_path: Path) -> None:
+    # HI-01, the nested-form half of the survival property
+    # test_to_dict_leaves_unparseable_baud_untouched pins for the flat form. LO-14 pops
+    # the nested block whole and the `serial_baud is not None` guard then declined to
+    # emit a replacement, so an unrelated `monitor add` DELETED the operator's
+    # declaration and the notice mutated from "declares serial_baud 'fast'" to the
+    # generic "with no serial_baud" — destroying the diagnostic and breaking the
+    # idempotence validate_active_transports' docstring claims.
+    record: dict[str, object] = {
+        "name": "mt",
+        "ups": "cyberpower",
+        "shutdown_method": "serial",
+        "serial": {"device": "/dev/ttyUSB0", "baud": "fast"},
+    }
+    m = MonitoredMachine.from_dict(record)
+    assert m.serial_baud is None
+    before = validate_active_transports((m,))
+
+    persisted = m.to_dict()
+    assert persisted["serial_baud"] == "fast"  # verbatim, not a parser sentinel
+    after = validate_active_transports((MonitoredMachine.from_dict(persisted),))
+
+    assert after == before
+    assert any("'fast'" in message for _n, _s, message in before)
+    # ...and it survives any number of persists, not just the first.
+    third = MonitoredMachine.from_dict(MonitoredMachine.from_dict(persisted).to_dict())
+    assert validate_active_transports((third,)) == before
+
+
+def test_to_dict_flat_serial_baud_still_wins_over_a_nested_one() -> None:
+    # The lift must never resurrect a nested value the flat field already answers for,
+    # or the nested block becomes a second source of truth again (LO-14).
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "serial_baud": 19200, "serial": {"baud": "fast"}}
+    )
+    assert m.to_dict()["serial_baud"] == 19200
 
 
 def test_to_dict_drops_nested_serial_block() -> None:

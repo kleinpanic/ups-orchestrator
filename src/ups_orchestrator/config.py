@@ -504,7 +504,7 @@ class MonitoredMachine:
         # LO-14: never emit a stale nested ``serial`` block alongside the flat fields.
         # Two contradictory sources of truth means an operator editing the nested form
         # is silently ignored. The nested form stays ACCEPTED on input.
-        merged.pop("serial", None)
+        nested_serial = merged.pop("serial", None)
         merged.update(
             {
                 "name": self.name,
@@ -527,6 +527,14 @@ class MonitoredMachine:
         # declaration and the next load would quote a value the operator never typed.
         if self.serial_baud is not None:
             merged["serial_baud"] = self.serial_baud
+        elif isinstance(nested_serial, dict) and "baud" in nested_serial:
+            # HI-01. The paragraph above held for the FLAT form only: the nested block
+            # `from_dict` also accepts was popped whole by LO-14, and this guard then
+            # declined to emit a replacement, so an unparseable nested baud was DELETED
+            # from disk by an unrelated `monitor add`. The operator's own value is
+            # carried across verbatim instead, which keeps the degrade idempotent and
+            # keeps the notice quoting what they actually wrote.
+            merged.setdefault("serial_baud", nested_serial["baud"])
         return merged
 
 
