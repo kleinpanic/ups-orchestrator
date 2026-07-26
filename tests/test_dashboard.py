@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ups_orchestrator.dashboard import (
     _daily_energy_kwh,
     _multipart,
@@ -121,11 +123,17 @@ def test_post_png_sets_user_agent(monkeypatch) -> None:
     assert seen["ctype"] and "multipart/form-data" in seen["ctype"]
 
 
+@pytest.mark.allow_subprocess  # matplotlib's font manager shells out to fc-list
 def test_render_png_smoke(monkeypatch, tmp_path) -> None:
     # Exercises the matplotlib render path; skipped where matplotlib is absent
     # (CI installs the [dashboard] extra before pytest so this runs there).
-    import pytest
-
+    #
+    # The subprocess opt-out is real, not a workaround: on a cold font cache
+    # matplotlib runs `fc-list` to enumerate system fonts. A warm ~/.cache
+    # hides it locally and a fresh CI runner does not, which is exactly the
+    # environment-dependent spawn the tripwire exists to surface. Nothing in
+    # ups_orchestrator spawns here — the transport seams are already faked
+    # below — so the escape hatch is scoped to matplotlib's own startup.
     pytest.importorskip("matplotlib")
     import ups_orchestrator.dashboard as dash
     from conftest import make_ups
