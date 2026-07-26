@@ -97,7 +97,7 @@ entries are added by `monitor add`, not by hand.
 | `name` | — | Machine name (also the `ssh` alias if none given) |
 | `shutdown_method` | `none` | **`none` \| `native` \| `serial` \| `ssh`** — the single effective shutdown authority for this machine. Equal weight with every other field below. |
 | `ssh` | `""` | `ssh_config` Host alias. Required for `shutdown_method: native` (bootstraps the NUT secondary over this alias) and `ssh` (the push destination); ignored for `serial`/`none`. |
-| `ups` | `""` | NUT UPS name the machine is powered by (e.g. `cyberpower`). Required for `native`; required for `serial`/`ssh` to be projected at all (see below) |
+| `ups` | `""` | NUT UPS name the machine is powered by (e.g. `cyberpower`). `monitor add --ups` is **required** for every method except `none` — a push record with no `ups` could never be projected onto any UPS's low-battery event, so the CLI refuses it up front (rc 2) rather than accepting a dead-letter entry. `--method none` is the only method where `--ups` is optional at the CLI: omitted, the record carries no shutdown authority to project in the first place; given anyway, it is stored and makes `monitor verify` run the BL-02 advisory probe described below. |
 | `powervalue` | `1` | `1` = powered by this UPS (counts toward `MINSUPPLIES`); never `0` for a real feed. Only meaningful for `native` |
 | `os` | `auto` | `auto` \| `arch` \| `ubuntu` \| `debian` — picks the install/config path. Only consulted for `native` |
 | `shutdown_cmd` | `/sbin/shutdown -h now` | Command run on trigger. **Per-transport, not universal — see below.** |
@@ -192,7 +192,9 @@ scoped for this phase and **dropped**; it may return in a future phase.
 ```bash
 # Enroll — --method selects the authority. native is the default (back-compat
 # with pre-Phase-2 invocations that omit --method); --ssh is required only for
-# native and ssh.
+# native and ssh. --ups is required for every method EXCEPT none (rc 2 if
+# missing) — a push with no ups can never be projected onto a low-battery
+# event, so the CLI refuses the dead-letter record up front.
 sudo ups-orchestrator monitor add mt --method serial \
      --serial-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0 \
      --serial-baud 9600 --ups cyberpower
@@ -201,6 +203,9 @@ sudo ups-orchestrator monitor add spark --method native --ssh spark --ups cyberp
 
 sudo ups-orchestrator monitor add somebox --method ssh --ssh somebox --ups cyberpower
 
+# --method none is the ONE method where --ups is optional — omit it entirely
+# for "no shutdown authority at all", or pass it if this box is still worth
+# probing for a stray live secondary (see the monitor verify table below).
 sudo ups-orchestrator monitor add somebox --method none
 
 # Method-aware lifecycle
@@ -230,12 +235,26 @@ ups-orchestrator shutdown rehearse mt
 
 | Declared method | What verify does | Result |
 |---|---|---|
-| `native` | Always runs the NUT secondary probe (`verify_secondary`) — this is the only evidence available on this box about an authority that lives on another one | Reports the remote secondary's armed state; if a load notice is present it is shown alongside, naming `monitor remove <name>` as the real disarm |
-| `none` **with** a non-empty `ups` | Also runs the secondary probe, as an advisory — this is exactly BL-02's signature (an operator may have hand-edited a former native record to `none` without actually tearing it down) | If a secondary answers: reports it, rc 1; falsely reporting "no active authority" here would be the whole problem |
-| `none`, no `ups` | No probe | `no active shutdown authority`, rc 0 |
-| `serial`, not disarmed | Checks the recorded device's presence | Device path + baud reported |
-| `ssh`, not disarmed | Probes the alias's reachability | Reachability reported |
-| Any method, **disarmed by a load-time notice** | — | `DISARMED (declared <method>): <reason>` plus the remedy, rc 1 — deliberately never rendered as a plain "no active authority", which would be indistinguishable from a genuine `none` |
+| `native` | Always runs the NUT secondary probe (`verify_secondary`) — this is the only evidence available on this box about an authority that lives on another one | rc 0 if the secondary answers, rc 1 if not; if a load notice is present it is shown alongside, naming `monitor remove <name>` as the real disarm |
+| `none` **with** a non-empty `ups` | Also runs the secondary probe, as an advisory — this is exactly BL-02's signature (an operator may have hand-edited a former native record to `none` without actually tearing it down) | If a secondary answers: reports it, **rc 1**; if not: **rc 0**. Falsely reporting "no active authority" here would be the whole problem |
+| `none`, no `ups` | No probe | `no active shutdown authority`, **rc 0** |
+| `serial`/`ssh` declaring a non-empty `ip` | This shape is **always disarmed at load** (IW-05 — `ip` is written only by the native enrollment path, so a push record carrying one is almost certainly a former native secondary that was hand-edited rather than torn down): prints `DISARMED (declared serial/ssh): …` **and still runs the secondary probe** | **rc 1** regardless of what the probe finds — the probe result is shown for diagnosis, but the disarm alone already forces rc 1 |
+| `serial`/`ssh`, **disarmed for any other reason** (missing device/alias, unresolvable `ups`, dual-regime conflict, …) | No probe — there is no `ip` to suspect a stray secondary over | `DISARMED (declared <method>): <reason>` plus the remedy, **rc 1** — deliberately never rendered as a plain "no active authority", which would be indistinguishable from a genuine `none` |
+| `serial`, **armed** | Checks the recorded device's presence (a stat, injected in tests) | rc 0 if present and a character device with a usable declared baud, rc 1 otherwise |
+| `ssh`, **armed** | Probes the alias's reachability (`ssh <alias> true`) | rc 0 if reachable, rc 1 otherwise |
+| Config `ups` value is a NUT-metacharacter string, or the `ssh` alias is option-shaped/invalid | Refuses to run the probe (never shells out with an unvalidated value) | **rc 2** |
+| Unknown machine name | — | **rc 2** |
+
+`monitor verify`/`monitor add`/`monitor remove` share **rc 2** for a config or
+argument problem the command refuses to act on: an unknown machine, an
+invalid `--ups`/`--ssh`/`--primary-ip` literal, or (on `monitor add`) a
+missing method-required flag such as `--ssh` on `native`/`ssh` or `--ups` on
+anything but `none`. Those specific checks are hand-written validation inside
+`_monitor_add`/`_monitor_verify` — a plain `return 2` from `main()`, not a
+raised `SystemExit`. An invalid `--method`/`--os`/`--powervalue` **choice**
+still exits 2 the ordinary argparse way (`parser.error` → `SystemExit(2)`),
+which any caller sees as the same process exit code but is a different code
+path than the hand-written checks.
 
 A `monitor add` that would switch an existing **declared-`native`** record to
 `serial`/`ssh`/`none` is **refused** — `monitor remove <name>` first, which is
@@ -243,18 +262,37 @@ the only command that runs the real remote NUT teardown. Leaving the switch
 unrefused would silently orphan the old secondary's `upsmon` while also
 activating a push, i.e. two live shutdown authorities on one machine.
 
-!!! note "CLI syntax sourced from the plan spec, not yet reconciled against shipped code"
-    The invocations above (in particular `--method`, `--serial-device`,
-    `--serial-baud`, `remote-shutdown --dry-run`, and `shutdown rehearse`) are
-    transcribed from `02-03-PLAN.md`, whose plan wave was executing
-    concurrently with this documentation pass. `monitor add`'s two
-    authorisation flags — `--force` (overrides only the local dual-regime
-    refusal) and a second, separate flag required to overwrite an **unmarked**
-    remote NUT config on a third host — are described in the plan only by
-    behaviour, not by a locked flag name; the plan does not commit to a
-    spelling for the second flag. Treat the shape of these commands as
-    authoritative and the exact flag spelling as pending a reconcile pass
-    against `src/ups_orchestrator/cli.py` once 02-03 lands.
+!!! danger "`--force` and `--force-remote-config` authorise two DIFFERENT things — never conflate them"
+    `monitor add` has two independent force flags. Passing one never implies
+    the other, and confusing them lets an operator who only meant to clear a
+    **local** warning also clobber a **third machine's** NUT config:
+
+    - **`--force`** overrides only the **local** dual-regime refusal — the
+      guard that fires when a machine's active `shutdown_method` and an
+      enabled legacy `shutdown_target` on the same UPS would both govern it
+      (double-shutdown risk). It authorises nothing on any remote host.
+    - **`--force-remote-config`** authorises a `native` enrollment to
+      overwrite an **unmarked** remote `/etc/nut/upsmon.conf` (one carrying a
+      `MONITOR` line outside the orchestrator's own managed block — i.e. an
+      operator's hand-written config) or to demote a remote `/etc/nut/nut.conf`
+      away from `MODE=standalone`/`MODE=netserver` (a real NUT server on that
+      box). Without it, `monitor add` refuses to write and reports which
+      condition tripped the refusal, changing nothing on the remote box.
+
+    Example — enrolling over a remote that already runs its own NUT server,
+    with a pre-existing local double-shutdown conflict:
+
+    ```bash
+    sudo ups-orchestrator monitor add mt --method native --ssh mt --ups cyberpower \
+         --force --force-remote-config
+    ```
+
+    Passing only `--force` here clears the local conflict but still refuses
+    to touch `mt`'s existing NUT config; passing only `--force-remote-config`
+    authorises the remote overwrite but still refuses at the local
+    dual-regime guard. Both are required together only when both conditions
+    are actually present — neither flag does anything the other's condition
+    doesn't trigger.
 
 ### Legacy: `shutdown_targets[]` and `backup` (back-compat only)
 
