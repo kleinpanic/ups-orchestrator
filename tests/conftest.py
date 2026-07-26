@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+from collections.abc import Callable, Iterator
+from typing import Any
+
+import pytest
+
 from ups_orchestrator.config import (
     MonitoredMachine,
     ShutdownGroupPolicy,
@@ -12,6 +19,90 @@ from ups_orchestrator.config import (
 from ups_orchestrator.events import Deps
 from ups_orchestrator.notify import DeliveryResult, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot
+
+# ---- the process tripwire (LO-C3) -------------------------------------------
+#
+# The previous tripwire was a plain helper in `test_cli.py` that four tests called
+# by hand: it was opt-IN rather than armed, it was absent from `test_monitor.py` —
+# the file that drives every enrollment path, i.e. every ssh/nft/systemctl seam —
+# and it covered `subprocess.run` alone, so `subprocess.Popen` and the `system`,
+# `popen` and `exec*` families on `os` walked straight past it. A test that forgot
+# to monkeypatch a transport seam therefore reached a REAL process. It is armed for
+# the whole suite now, at every process-spawning entry point this code can reach.
+#
+# ONE documented exception: `state._copy_acl` shells out to the platform's own
+# getfacl/setfacl on every persist (T-02-SC declined a pylibacl dependency), and
+# the ACL-preservation tests assert on what those two binaries actually did. They
+# are local metadata tools — not a transport, not a host, not a device — so they
+# are allowed through BY NAME and everything else is refused. A test that genuinely
+# needs a different binary opts out with `@pytest.mark.allow_subprocess`.
+_ALLOWED_BINARIES = frozenset({"getfacl", "setfacl"})
+
+# Every stdlib entry point that can put a new process on this box. `subprocess.run`
+# is built on `Popen`, so patching `run` alone leaves `Popen` — and `call`,
+# `check_call` and `check_output`, which all go through it — wide open.
+_SPAWN_TARGETS: tuple[tuple[Any, str], ...] = (
+    (subprocess, "run"),
+    (subprocess, "Popen"),
+    (os, "system"),
+    (os, "popen"),
+    (os, "posix_spawn"),
+    (os, "posix_spawnp"),
+    *((os, _n) for _n in sorted(dir(os)) if _n.startswith("exec")),
+)
+
+
+def _allowed(args: tuple[Any, ...]) -> bool:
+    """Whether this call names one of the allow-listed local metadata binaries."""
+    argv = args[0] if args else None
+    if isinstance(argv, (list, tuple)) and argv:
+        argv = argv[0]
+    if not isinstance(argv, (str, bytes, os.PathLike)):
+        return False
+    return os.path.basename(os.fsdecode(argv)) in _ALLOWED_BINARIES
+
+
+@pytest.fixture(autouse=True)
+def no_real_processes(request: pytest.FixtureRequest, monkeypatch: Any) -> Iterator[list[str]]:
+    """Refuse every real process spawn for the duration of a test.
+
+    Raising is not enough on its own: several call sites here catch broad
+    exceptions deliberately (a shutdown runner must not strand the rest of the
+    sweep), so an AssertionError raised inside one would be swallowed and the
+    escape would go unnoticed. Every blocked call is therefore RECORDED as well,
+    and the recording is asserted empty after the test body returns.
+
+    Yields that recording, so the tripwire's own tests can request the fixture by
+    name, provoke a block deliberately, and clear it.
+    """
+    if request.node.get_closest_marker("allow_subprocess"):
+        yield []
+        return
+
+    escaped: list[str] = []
+
+    def _blocker(label: str, real: Callable[..., Any]) -> Callable[..., Any]:
+        def _blocked(*args: Any, **kwargs: Any) -> Any:
+            if _allowed(args):
+                return real(*args, **kwargs)
+            escaped.append(f"{label}{args!r}")
+            raise AssertionError(
+                f"a real process escaped the test fakes: {label}{args!r}. "
+                "Monkeypatch the transport seam, or mark the test "
+                "@pytest.mark.allow_subprocess if it genuinely needs a process."
+            )
+
+        return _blocked
+
+    for module, name in _SPAWN_TARGETS:
+        real = getattr(module, name, None)
+        if real is None:  # not present on every platform/build
+            continue
+        monkeypatch.setattr(module, name, _blocker(f"{module.__name__}.{name}", real))
+
+    yield escaped
+
+    assert not escaped, "real process spawns escaped the fakes: " + "; ".join(escaped)
 
 
 class FakeNotifier(Notifier):

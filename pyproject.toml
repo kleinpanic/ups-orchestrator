@@ -74,6 +74,12 @@ follow_imports = "skip"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  # LO-C3: the `no_real_processes` autouse tripwire in tests/conftest.py refuses
+  # every process spawn. A test that genuinely needs one opts out with this marker
+  # and says why in a comment — it is not a way to silence an escape.
+  "allow_subprocess: this test must reach a real process (state its reason)",
+]
 
 [tool.coverage.run]
 branch = true

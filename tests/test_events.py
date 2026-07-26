@@ -7,6 +7,8 @@ import stat
 import subprocess
 from dataclasses import replace
 
+import pytest
+
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator import events as events_mod
 from ups_orchestrator.config import ConfigNotice, MonitoredMachine, ShutdownTarget
@@ -474,8 +476,11 @@ def test_local_runner_returns_failure_on_unbalanced_quote() -> None:
     assert "local" in err
 
 
+@pytest.mark.allow_subprocess
 def test_local_runner_returns_failure_on_empty_command() -> None:
-    # subprocess.run([]) raises IndexError before any process is spawned.
+    # subprocess.run([]) raises IndexError before any process is spawned — which is
+    # exactly the behaviour under test, so this is the one place in the suite that
+    # must reach the real `subprocess.run` (LO-C3's opt-out). No process is created.
     rc, _out, err = _default_local_shutdown("   ")
 
     assert rc == 1

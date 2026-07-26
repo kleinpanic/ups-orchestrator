@@ -57,10 +57,11 @@ def test_status_command_renders(env_config, monkeypatch, capsys) -> None:
 
 
 def test_report_print_command(env_config, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(
-        "ups_orchestrator.report.read_snapshot",
-        lambda _n: UpsSnapshot("OL", 100, 600, 12, 120.0, realpower_nominal=900),
-    )
+    # LO-C3: this used to patch `report.read_snapshot`, which `build_report` bound
+    # as a DEFAULT ARGUMENT at def time — so the patch never took and the test
+    # spawned a real `upsc`. The armed tripwire is what surfaced it. Patch the
+    # snapshot source itself, which no default argument can capture around.
+    _fake_ups(monkeypatch, "OL", 100, 600)
     assert cli.main(["report", "--print"]) == 0
     assert "UPS load and runtime report" in capsys.readouterr().out
 
@@ -84,13 +85,13 @@ def test_boot_audit_command(env_config, monkeypatch) -> None:
 
 
 def test_notify_test_print(env_config, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("ups_orchestrator.report.read_snapshot", lambda _n: _SNAP)
+    _fake_ups(monkeypatch, "OL", 100, 600)  # see test_report_print_command (LO-C3)
     assert cli.main(["notify-test", "--print"]) == 0
     assert "delivery test" in capsys.readouterr().out.lower()
 
 
 def test_notify_test_send_without_webhook_returns_one(env_config, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("ups_orchestrator.report.read_snapshot", lambda _n: _SNAP)
+    _fake_ups(monkeypatch, "OL", 100, 600)  # see test_report_print_command (LO-C3)
     rc = cli.main(["notify-test"])  # empty webhook → NullNotifier → ok=False
     assert "configured=False" in capsys.readouterr().out
     assert rc == 1
@@ -374,18 +375,6 @@ def _fake_ups(monkeypatch, status: str, charge: int, runtime: int) -> None:
     )
 
 
-def _no_transports(monkeypatch) -> list[str]:
-    """Any real transport reaching argv is a bug; record instead of executing."""
-    ran: list[str] = []
-
-    def _boom(*a, **k):  # noqa: ANN002, ANN003
-        ran.append(str(a))
-        raise AssertionError(f"a real subprocess escaped the fakes: {a!r}")
-
-    monkeypatch.setattr("subprocess.run", _boom)
-    return ran
-
-
 # --- the _fire_target guard: the dry-run returns at the TOP (T-02-13) ---------
 
 
@@ -435,7 +424,6 @@ def test_remote_shutdown_dry_run_lists_targets_and_touches_nothing(
 ) -> None:
     _dry_run_config(env_config)
     _fake_ups(monkeypatch, "OB LB", 5, 60)
-    _no_transports(monkeypatch)
     rec = _patch_recorder(monkeypatch)
     assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
     out = capsys.readouterr().out
@@ -453,7 +441,6 @@ def test_remote_shutdown_dry_run_against_an_online_ups_still_lists_every_target(
     # would fire. Neither: a FULL listing annotated with the concrete reason.
     _dry_run_config(env_config, require_outage=True)
     _fake_ups(monkeypatch, "OL", 100, 3600)
-    _no_transports(monkeypatch)
     assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "mt" in out
@@ -467,7 +454,6 @@ def test_remote_shutdown_dry_run_reports_a_disabled_global_policy(
     # This makes the disabled flag VISIBLE at the moment the operator asks.
     _dry_run_config(env_config, policy_enabled=False)
     _fake_ups(monkeypatch, "OB LB", 5, 60)
-    _no_transports(monkeypatch)
     assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "mt" in out
@@ -491,7 +477,6 @@ def test_remote_shutdown_dry_run_lists_projected_machines(
         ],
     )
     _fake_ups(monkeypatch, "OB LB", 5, 60)
-    _no_transports(monkeypatch)
     assert cli.main(["remote-shutdown", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "spark" in out and "/dev/ttyUSB0" in out
@@ -568,7 +553,6 @@ def test_rehearse_sends_the_hardcoded_logger_command_over_serial(
 ) -> None:
     _rehearse_config(env_config)
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
     assert cli.main(["shutdown", "rehearse", "spark"]) == 0
     assert len(seen) == 1
     kind, target = seen[0]
@@ -585,7 +569,6 @@ def test_rehearse_sends_the_hardcoded_logger_command_over_serial(
 def test_rehearse_never_carries_the_persisted_shutdown_cmd(env_config, monkeypatch) -> None:
     _rehearse_config(env_config)
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
     assert cli.main(["shutdown", "rehearse", "mt"]) == 0
     _kind, target = seen[0]
     assert target.cmd == _REHEARSAL
@@ -599,7 +582,6 @@ def test_rehearse_works_with_the_global_shutdown_policy_disabled(env_config, mon
     _rehearse_config(env_config)
     assert json.loads(env_config.read_text())["shutdown"]["enabled"] is False
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
     assert cli.main(["shutdown", "rehearse", "spark"]) == 0
     assert seen
 
@@ -607,7 +589,6 @@ def test_rehearse_works_with_the_global_shutdown_policy_disabled(env_config, mon
 def test_rehearse_refuses_a_local_target(env_config, monkeypatch) -> None:
     _rehearse_config(env_config)
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
     assert cli.main(["shutdown", "rehearse", "pi"]) == 2
     assert seen == []
 
@@ -667,7 +648,6 @@ def test_rehearse_refuses_an_option_shaped_legacy_user(env_config, monkeypatch) 
         )
     )
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
 
     assert cli.main(["shutdown", "rehearse", "legacy"]) == 2
     assert seen == []
@@ -697,7 +677,6 @@ def test_rehearse_still_accepts_an_ordinary_user_at_host(env_config, monkeypatch
         )
     )
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
 
     assert cli.main(["shutdown", "rehearse", "legacy"]) == 0
     assert [kind for kind, _t in seen] == ["ssh"]
@@ -758,7 +737,6 @@ def test_preview_annotates_a_disabled_target_without_implying_a_battery_wait(
         )
     )
     _fake_ups(monkeypatch, "OB LB", 5, 60)
-    _no_transports(monkeypatch)
     assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "would fire: no — target not enabled" in out
@@ -783,14 +761,12 @@ def test_preview_annotates_a_target_disarmed_at_load(env_config, monkeypatch, ca
         )
     )
     _fake_ups(monkeypatch, "OB LB", 5, 60)
-    _no_transports(monkeypatch)
     assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
     assert "disarmed at load" in capsys.readouterr().out
 
 
 def test_preview_reports_a_ups_with_no_resolved_targets(env_config, monkeypatch, capsys) -> None:
     _fake_ups(monkeypatch, "OL", 100, 3600)
-    _no_transports(monkeypatch)
     assert cli.main(["remote-shutdown", "--dry-run"]) == 0
     assert "no shutdown targets resolved" in capsys.readouterr().out
 
@@ -807,7 +783,6 @@ def test_remote_shutdown_without_dry_run_takes_the_real_event_route(
 ) -> None:
     _dry_run_config(env_config, policy_enabled=False)
     _fake_ups(monkeypatch, "OB LB", 5, 60)
-    _no_transports(monkeypatch)
     rec = _patch_recorder(monkeypatch)
     assert cli.main(["remote-shutdown", "ups1"]) == 0
     # handle_remote_shutdown short-circuits on the disabled policy and says so.
@@ -922,7 +897,6 @@ def test_rehearse_resolves_a_legacy_serial_shutdown_target(env_config, monkeypat
         )
     )
     seen = _capture_runners(monkeypatch)
-    _no_transports(monkeypatch)
     assert cli.main(["shutdown", "rehearse", "mt"]) == 0
     kind, target = seen[0]
     assert kind == "serial" and target.device == "/dev/ttyUSB1"

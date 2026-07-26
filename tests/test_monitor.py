@@ -2115,3 +2115,53 @@ def test_add_does_not_grant_an_upsd_accept_to_a_non_native_record(cfg_path, monk
         ],
     )
     assert cli._survivor_saddrs(cli._load_config().monitored_machines) == ["192.168.1.120"]
+
+
+# --- LO-C3: the process tripwire is ARMED, in this file, at every entry point ---
+
+
+def test_process_tripwire_is_armed_in_this_file(no_real_processes) -> None:
+    """`test_monitor.py` drives every enrollment path and had no tripwire at all.
+
+    The old one was a plain helper four `test_cli.py` tests called by hand, so it
+    was opt-in rather than armed and it never covered this file — the one that
+    exercises the ssh/nft/systemctl/upsc seams. It is autouse now, so it is in
+    force here without this file asking for it.
+    """
+    with pytest.raises(AssertionError, match="escaped the test fakes"):
+        subprocess.run(["true"], capture_output=True)
+    assert len(no_real_processes) == 1
+    no_real_processes.clear()  # the block above IS the assertion, not a leak
+
+
+def test_process_tripwire_covers_more_than_subprocess_run(no_real_processes) -> None:
+    """The old tripwire patched `subprocess.run` alone — four ways around it."""
+    spawns = [
+        lambda: subprocess.run(["true"], capture_output=True),
+        lambda: subprocess.Popen(["true"]),
+        lambda: os.system("true"),  # noqa: S605 — patched; never reaches a shell
+        lambda: os.execv("/bin/true", ["true"]),
+    ]
+    for spawn in spawns:
+        with pytest.raises(AssertionError, match="escaped the test fakes"):
+            spawn()
+    assert len(no_real_processes) == len(spawns)
+    no_real_processes.clear()
+
+
+def test_process_tripwire_allows_only_the_named_acl_binaries() -> None:
+    """`state._copy_acl` shells out to getfacl/setfacl on every persist (T-02-SC).
+
+    That pair is the ONE documented exception, keyed on the binary name, so the
+    allowance cannot be widened by accident into "any local command".
+    """
+    from conftest import _allowed
+
+    assert _allowed((["getfacl", "--omit-header", "--", "/tmp/x"],))
+    assert _allowed((["/usr/bin/setfacl", "--set-file=-", "--", "/tmp/x"],))
+    assert not _allowed((["ssh", "mt", "true"],))
+    assert not _allowed((["nft", "-f", "/etc/nftables.conf"],))
+    assert not _allowed((["systemctl", "restart", "nut-monitor"],))
+    assert not _allowed((["upsc", "cyberpower@192.168.1.125"],))
+    assert not _allowed(([],))
+    assert not _allowed(())
