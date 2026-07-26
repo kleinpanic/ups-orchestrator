@@ -642,6 +642,67 @@ def test_rehearse_refuses_a_machine_with_no_push_transport(env_config, monkeypat
     assert seen == []
 
 
+def test_rehearse_refuses_an_option_shaped_legacy_user(env_config, monkeypatch) -> None:
+    # HI-C3. `ssh_dest` builds f"{user}@{host}", so validating `host` alone left the
+    # argv element that actually reaches ssh unchecked. `_rehearsal_target` also
+    # force-enables the target, so a DISABLED legacy target is a live ssh sink here.
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "legacy",
+                                "kind": "remote",
+                                "enabled": False,
+                                "host": "box",
+                                "user": "-oProxyCommand=touch /tmp/pwn",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+    _no_transports(monkeypatch)
+
+    assert cli.main(["shutdown", "rehearse", "legacy"]) == 2
+    assert seen == []
+
+
+def test_rehearse_still_accepts_an_ordinary_user_at_host(env_config, monkeypatch) -> None:
+    # `_SSH_ALIAS_RE` permits the user@host shape, so the tighter check must not
+    # refuse a legitimate operator spelling.
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "legacy",
+                                "kind": "remote",
+                                "enabled": True,
+                                "host": "box",
+                                "user": "root",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+    _no_transports(monkeypatch)
+
+    assert cli.main(["shutdown", "rehearse", "legacy"]) == 0
+    assert [kind for kind, _t in seen] == ["ssh"]
+
+
 # --- IW-07: a failing projected push must not deadlock the local target -------
 
 
