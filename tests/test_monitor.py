@@ -2460,3 +2460,69 @@ def test_verify_falls_back_to_the_local_route_probe_like_add(cfg_path, monkeypat
 
     assert cli.main(["monitor", "verify", "mt"]) == 0
     assert "cyberpower@192.168.1.125" in ssh.commands[0]
+
+
+# --- ME-C2: the advisory's own remedy has to be runnable ----------------------
+
+
+def test_verify_native_with_a_blank_ups_is_rc1_not_rc2(cfg_path, monkeypatch, capsys) -> None:
+    """`Config` cannot disarm a native authority, so the advisory says: go verify.
+
+    `valid_nut_name("")` is False, so the command that advisory names answered
+    rc 2 — which in every other branch here means "bad input to the command", i.e.
+    a script (and an operator) reading it concludes the machine name was typo'd.
+    The remedy the phase designed for this exact state was unreachable. A blank
+    `ups` is not bad input; it is the state being diagnosed.
+    """
+    _write_config(cfg_path, machines=[_machine_entry("mt", method="native", ssh="mt", ups="")])
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    rc = cli.main(["monitor", "verify", "mt"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert ssh.calls == []  # there is no `upsc <ups>@<primary>` to run
+    assert "cannot probe" in out
+    assert "monitor remove mt" in out  # ...and the real disarm is named
+    assert "no active shutdown authority" not in out  # never the reassuring answer
+
+
+def test_verify_blank_ups_does_not_take_the_metachar_branch(cfg_path, monkeypatch, caplog) -> None:
+    """A blank value is not an injection, and must not be reported as one."""
+    _write_config(cfg_path, machines=[_machine_entry("mt", method="native", ssh="mt", ups="")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+
+    with caplog.at_level("ERROR"):
+        assert cli.main(["monitor", "verify", "mt"]) == 1
+    assert "is invalid" not in caplog.text
+
+
+def test_verify_metachar_ups_is_still_rc2_after_the_blank_carve_out(cfg_path, monkeypatch) -> None:
+    """The charset check keeps its own rc — the blank branch sits ABOVE it, not
+    instead of it."""
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="native", ssh="mt", ups="x; touch /tmp/pwned")],
+    )
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    assert cli.main(["monitor", "verify", "mt"]) == 2
+    assert ssh.calls == []
+
+
+def test_verify_blank_ssh_alias_still_reaches_the_probe(cfg_path, monkeypatch) -> None:
+    """Guard on the ME-C2 fix: a blank ALIAS is a different thing from a blank UPS.
+
+    `_verify_ssh_alias`'s option-shaped refusal is keyed on `machine.ssh.strip()`
+    being non-empty on purpose — a blank alias is not an injection, and BL-02's
+    advisory probe (`none` carrying a `ups`) is exactly a record with no alias.
+    Rejecting it would silence the probe that finds a stray live secondary.
+    """
+    _write_config(cfg_path, machines=[_machine_entry("spark", method="none", ups="cyberpower")])
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    assert cli.main(["monitor", "verify", "spark"]) == 1
+    assert ssh.calls and ssh.calls[0][0] == ""  # probed over a blank alias, deliberately

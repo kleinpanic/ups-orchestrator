@@ -1085,6 +1085,25 @@ def _monitor_verify(
 
     probe = _probe_secondary_reason(machine)
     if probe is not None:
+        # ME-C2: a BLANK ups is not bad input to this command — it is the state the
+        # command was sent to diagnose. `Config` cannot disarm a native authority, so
+        # the advisory for that record says in as many words: "Run 'monitor verify
+        # <name>' to learn whether that secondary is actually armed." `valid_nut_name("")`
+        # is False, so the remedy the phase designed for this state answered rc 2 —
+        # which means "bad input to the command" in every other branch here, and sends
+        # a script (and an operator) off to check for a typo'd machine name. Report the
+        # real answer instead: there is no `upsc <ups>@<primary>` to run, so nothing can
+        # be established, which is rc 1. Kept ABOVE the charset check so a blank value
+        # never lands in the metachar branch — a blank alias is not an injection.
+        if not machine.ups.strip():
+            print(
+                f"  cannot probe: this record has no 'ups', so there is no "
+                f"'upsc <ups>@<primary>' to run and nothing here can establish whether a "
+                f"secondary is armed on that box. Set 'ups' to the UPS that powers it, or "
+                f"run 'monitor remove {machine.name}' — the only command that actually "
+                f"disarms the remote secondary."
+            )
+            return 1
         # machine.ups is config-sourced and flows into a remote shell string in
         # verify_secondary; refuse a metachar-bearing value instead of running it.
         if not nutclient.valid_nut_name(machine.ups):
