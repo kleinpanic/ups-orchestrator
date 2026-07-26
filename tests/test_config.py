@@ -2223,3 +2223,54 @@ def test_backup_raw_does_not_change_machine_equality() -> None:
     plain = BackupShutdown.from_dict({"enabled": True, "kind": "serial"})
     tagged = BackupShutdown.from_dict({"enabled": True, "kind": "serial", "_tag": "x"})
     assert plain == tagged
+
+
+# --- LO-04: an internal threshold the local target cannot actually reach -------
+
+
+def _threshold_config(tmp_path: Path, internal: int, external: int) -> Path:
+    return _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "shutdown": {
+                "enabled": True,
+                "external": {"enabled": True, "battery_below": external},
+                "internal": {"enabled": True, "battery_below": internal},
+            },
+        },
+    )
+
+
+def test_an_unreachable_internal_threshold_is_reported(tmp_path: Path) -> None:
+    # LO-04. Local targets are held until every enabled remote has been sent, so an
+    # internal threshold that trips EARLIER than the external one is not the promise it
+    # reads as: the watcher host runs past its own declared threshold with (before
+    # LO-03) no explanation anywhere.
+    cfg = Config.load(_threshold_config(tmp_path, internal=10, external=5), env={})
+
+    (notice,) = [n for n in cfg.degraded if "internal" in n.message]
+    assert notice.severity == "advisory"  # a policy shape, never a disarm
+    assert notice.subject == "cyberpower"
+    assert "10%" in notice.message and "5%" in notice.message
+
+
+def test_an_ordinary_threshold_ordering_is_not_reported(tmp_path: Path) -> None:
+    assert Config.load(_threshold_config(tmp_path, internal=5, external=10), env={}).degraded == ()
+    assert Config.load(_threshold_config(tmp_path, internal=10, external=10), env={}).degraded == ()
+
+
+def test_threshold_ordering_is_not_reported_when_a_group_is_disabled(tmp_path: Path) -> None:
+    # With one group off there is no hold and nothing to explain.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "shutdown": {
+                "enabled": True,
+                "external": {"enabled": False, "battery_below": 5},
+                "internal": {"enabled": True, "battery_below": 10},
+            },
+        },
+    )
+    assert Config.load(p, env={}).degraded == ()

@@ -1018,6 +1018,46 @@ def validate_legacy_targets(
     return tuple(problems)
 
 
+def validate_shutdown_thresholds(
+    upses: Mapping[str, UpsConfig],
+) -> tuple[tuple[str, str], ...]:
+    """Return ``(ups_key, message)`` for internal thresholds the locals cannot reach.
+
+    LO-04. ``events._run_shutdown_targets`` holds every ``local`` target until every
+    enabled remote has been sent, so an internal threshold that trips EARLIER than the
+    external one is not the promise it reads as: the watcher host passes its own
+    declared threshold and keeps running until the remotes fire. Nothing checked the
+    relationship, and (with LO-03) nothing explained the wait either.
+
+    Reported, never disarming — the ordering is a legitimate operator choice as often
+    as it is a mistake, and this is a policy shape rather than an unsafe transport. A
+    pure reporter: it raises nothing and reads the declaration.
+    """
+    found: list[tuple[str, str]] = []
+    for ups_key, ups in upses.items():
+        policy = ups.shutdown_policy
+        if not (policy.enabled and policy.internal.enabled and policy.external.enabled):
+            continue
+        for label, internal, external, unit in (
+            ("battery_below", policy.internal.battery_below, policy.external.battery_below, "%"),
+            ("runtime_below", policy.internal.runtime_below, policy.external.runtime_below, "s"),
+        ):
+            if internal is None or external is None or internal <= external:
+                continue
+            found.append(
+                (
+                    ups_key,
+                    f"shutdown.internal.{label} ({internal}{unit}) trips before "
+                    f"shutdown.external.{label} ({external}{unit}), but local targets are "
+                    f"held until every enabled remote has been sent — so this host runs "
+                    f"past its own declared threshold and halts on the external one "
+                    f"instead. Set the internal threshold at or below the external one, "
+                    f"or accept that the internal value is not what decides.",
+                )
+            )
+    return tuple(found)
+
+
 def canonical_ups_key(name: str) -> str:
     """The ONE canonicalisation of a UPS name: strip ``@host``, strip, casefold.
 
@@ -1412,6 +1452,12 @@ def _apply_degrades(
                 f"powers this box off on the primary's FSD. Run 'monitor verify {m.name}' to "
                 f"check, and 'monitor remove {m.name}' to actually disarm it.",
             )
+
+    # 8. LO-04, an UPS-subject advisory. It attaches to no machine and no target — the
+    # finding is about the policy's own shape — so it is recorded directly. INV-DEGRADE
+    # holds trivially: nothing here writes a persisted field either.
+    for ups_key, message in validate_shutdown_thresholds(upses):
+        _record(ConfigNotice(severity="advisory", subject=ups_key, message=message))
 
     degraded_upses = {
         key: dataclasses.replace(ups, shutdown_targets=tuple(target_lists[key]))
