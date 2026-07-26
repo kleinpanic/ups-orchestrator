@@ -9,10 +9,15 @@ the environment and must never appear on any recorded argv.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import ups_orchestrator
 from ups_orchestrator import cli
 
 # The operator's real policy-drop input base chain (mirrors the live box). The
@@ -952,3 +957,68 @@ def test_add_refuse_on_existing_monitor_line_without_force(cfg_path, add_env, mo
     _seed_nft(add_env["tmp"] / "u.nft")
     rc = cli.main(["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower"])
     assert rc == 3  # write_remote_nut_config guard refusal → remote bootstrap failure
+
+
+# --- T-02-23: _monitor_persist preserves config file metadata -----------------
+#
+# `_monitor_persist` writes /etc/ups-orchestrator/config.json via the same
+# temp+fsync+replace idiom as StateStore.save; a bare Path.replace stripped
+# the installer's 0640 root:nut + run-user ACL down to 0600 root:root on the
+# live box (see 02-09-PLAN.md). These prove the fix using state.py's shared
+# helper, entirely under tmp_path.
+
+
+def test_monitor_persist_preserves_mode_group_acl(tmp_path) -> None:
+    cfg = tmp_path / "config.json"
+    _write_config(cfg, machines=[_machine("mt")])
+    os.chmod(cfg, 0o640)
+
+    current_gid = cfg.stat().st_gid
+    alt_gid = next((gid for gid in os.getgroups() if gid != current_gid), None)
+    if alt_gid is not None:
+        os.chown(cfg, -1, alt_gid)
+
+    acl_supported = shutil.which("setfacl") is not None and shutil.which("getfacl") is not None
+    if acl_supported:
+        setfacl = subprocess.run(
+            ["setfacl", "-m", "u:65534:r", str(cfg)], capture_output=True, text=True
+        )
+        acl_supported = setfacl.returncode == 0
+
+    cli._monitor_persist(cfg, [_machine("mt"), _machine("spark", ip="192.168.1.120")])
+
+    after = json.loads(cfg.read_text())
+    assert len(after["monitored_machines"]) == 2  # the write actually happened
+
+    # Mode is always assertable — this is the core of the fix and never skips.
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o640
+    # Group and ACL are only assertable where the environment supports them;
+    # the mode assertion above means the test itself is never skipped outright.
+    if alt_gid is not None:
+        assert cfg.stat().st_gid == alt_gid
+    if acl_supported:
+        acl = subprocess.run(
+            ["getfacl", "-n", "--omit-header", str(cfg)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert "user:65534:r--" in acl
+
+
+def test_named_temporaryfile_confined_to_known_sites() -> None:
+    # Source-level guard: the defect is a PATTERN (raw tempfile.NamedTemporaryFile
+    # + bare .replace()), and the only durable defence against a third copy is a
+    # test that notices the pattern re-appearing anywhere else under src/.
+    src_dir = Path(ups_orchestrator.__file__).parent
+    hits = {
+        str(path.relative_to(src_dir))
+        for path in sorted(src_dir.rglob("*.py"))
+        if "NamedTemporaryFile" in path.read_text()
+    }
+    assert hits == {"cli.py", "state.py"}, (
+        "NamedTemporaryFile appeared outside cli.py/_monitor_persist and "
+        "state.py/StateStore.save (T-02-23, 02-09-PLAN.md) — a new temp-file "
+        "write must go through state.replace_preserving_metadata instead of "
+        "reimplementing the unprotected temp+replace idiom"
+    )
