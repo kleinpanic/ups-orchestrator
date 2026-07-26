@@ -269,6 +269,56 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         '        rc, out, _err = _monitor_run_local_probe(["ip", "-o", "route", "get", toward_ip])',
         "cli: primary-ip auto-detect route probe guard (LIVE BUG #3)",
     ),
+    # --- the security-audit round (F1/F2/F4/F6/F7) and HI-C1/ME-C4 -------------
+    (
+        "src/ups_orchestrator/notify.py",
+        "    return parts.scheme.lower() in _ALLOWED_SCHEMES and bool(parts.netloc)",
+        "    return True",
+        "notify: webhook URL scheme validation bypassed (F1 — daemon restart loop)",
+    ),
+    (
+        "src/ups_orchestrator/notify.py",
+        "                if status is None:",
+        "                if False:",
+        "notify: file:// URL None-status guard bypassed (F1 — TypeError escapes send)",
+    ),
+    (
+        "src/ups_orchestrator/notify.py",
+        "            except Exception as exc:  # noqa: BLE001 — the promise in the docstring",
+        "            except _NeverRaised as exc:  # mutated",
+        "notify: send catch-all removed (F1 — 'never raises' becomes false again)",
+    ),
+    (
+        "src/ups_orchestrator/config.py",
+        "        except (ValueError, OverflowError):  # NaN / ±inf\n            return default",
+        "        except ValueError:  # mutated — OverflowError escapes again\n"
+        "            return default",
+        "config: _as_int OverflowError guard narrowed (F4 — inf kills the daemon)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    bad = [s for s in saddrs if not valid_ipv4(s)]",
+        "    bad = [s for s in saddrs if not valid_ip(s)]",
+        "nutclient: nft saddr accepts IPv6 again (F2 — nft -f rejects the ruleset)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "        try:\n            conf.write_text(text)",
+        "        try:\n            pass  # mutated — leave the rejected ruleset on disk",
+        "nutclient: apply_nft rollback removed (F2 — unloadable ruleset survives)",
+    ),
+    (
+        "src/ups_orchestrator/cli.py",
+        "        return 2 if manual else 0",
+        "        return 0",
+        "cli: remote-shutdown no-UPS silent success restored (HI-C1)",
+    ),
+    (
+        "src/ups_orchestrator/state.py",
+        "            if ownership_flips or os.geteuid() == 0:",
+        "            if os.geteuid() == 0:",
+        "state: ownership-flip warning re-gated on root only (F7)",
+    ),
 ]
 
 
