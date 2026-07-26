@@ -217,7 +217,6 @@ def test_monitored_machines_parse(tmp_path: Path) -> None:
         {
             "monitored_machines": [
                 {"name": "mt", "ssh": "mt", "ups": "cyberpower", "powervalue": 2},
-                "not-a-dict",
             ],
             "upses": {"u1": {"label": "U1"}},
         },
@@ -228,6 +227,46 @@ def test_monitored_machines_parse(tmp_path: Path) -> None:
     assert m.name == "mt" and m.ssh == "mt" and m.ups == "cyberpower"
     assert m.powervalue == 2
     assert m.backup.enabled is False  # default-off backup
+
+
+@pytest.mark.parametrize("shape", [{}, None, "spark", 7])
+def test_non_list_monitored_machines_refuses_to_load(tmp_path: Path, shape: object) -> None:
+    # The silent-unprotection hole. Authored as an OBJECT keyed by name, or as `null`,
+    # this used to coerce to `()`: zero machines, zero degraded notices, zero log lines,
+    # and a status banner reading healthy while every push machine was unprotected. It
+    # is the identical defect class already closed for `upses`.
+    p = _write(tmp_path, {"monitored_machines": shape, "upses": {"u1": {"label": "U1"}}})
+    with pytest.raises(ValueError, match="monitored_machines"):
+        Config.load(p, env={})
+
+
+def test_non_dict_monitored_machine_entry_refuses_to_load(tmp_path: Path) -> None:
+    # A single bad entry used to be dropped just as silently, unprotecting exactly the
+    # machine the operator fat-fingered. The error names the index so it is findable.
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [
+                {"name": "mt", "ssh": "mt", "ups": "u1"},
+                "spark",
+            ],
+            "upses": {"u1": {"label": "U1"}},
+        },
+    )
+    with pytest.raises(ValueError, match="index 1"):
+        Config.load(p, env={})
+
+
+def test_absent_monitored_machines_is_still_fine(tmp_path: Path) -> None:
+    # Back-compat (P2-07): an ABSENT key is not an authored mistake. Every pre-Phase-2
+    # config on disk omits it, and none of them may start refusing to load.
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    assert Config.load(p, env={}).monitored_machines == ()
+    # An explicitly empty array is equally fine.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    p2 = _write(sub, {"monitored_machines": [], "upses": {"u1": {"label": "U1"}}})
+    assert Config.load(p2, env={}).monitored_machines == ()
 
 
 def test_monitored_machine_to_dict_preserves_unknown_keys() -> None:

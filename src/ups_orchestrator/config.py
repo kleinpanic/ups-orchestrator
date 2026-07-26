@@ -1651,12 +1651,31 @@ class Config:
                 + "; ".join(f"{first!r} and {second!r}" for first, second in collisions)
             )
 
+        # The same treatment `upses` gets twelve lines above, and for the same reason.
+        # A hand-edited `monitored_machines` authored as an OBJECT keyed by name, or as
+        # `null`, used to coerce silently to `()`: zero machines, zero degraded notices,
+        # zero log lines, and a status/web banner reading healthy while every push
+        # machine was unprotected. A non-dict entry inside the list was dropped the same
+        # way. This is the worst failure mode the phase has — a config that silently
+        # protects nothing — so it is a refusal to load, not a degrade. It is NOT a
+        # shutdown-authority error that RA-01 would want degraded and reported: there is
+        # no record left to attach a notice to.
         machines_raw = raw.get("monitored_machines", [])
-        monitored_machines = (
-            tuple(MonitoredMachine.from_dict(m) for m in machines_raw if isinstance(m, dict))
-            if isinstance(machines_raw, list)
-            else ()
-        )
+        if not isinstance(machines_raw, list):
+            raise ValueError(
+                f"'monitored_machines' in {cfg_path} is {type(machines_raw).__name__}, not a "
+                f"list. Every monitored machine would be silently dropped and nothing would "
+                f"report it. Author it as a JSON array of objects."
+            )
+        non_dicts = [i for i, m in enumerate(machines_raw) if not isinstance(m, dict)]
+        if non_dicts:
+            raise ValueError(
+                f"Non-object 'monitored_machines' entr"
+                f"{'y' if len(non_dicts) == 1 else 'ies'} in {cfg_path} at index "
+                f"{', '.join(str(i) for i in non_dicts)}. Dropping them silently would "
+                f"unprotect those machines with no notice and no log line."
+            )
+        monitored_machines = tuple(MonitoredMachine.from_dict(m) for m in machines_raw)
 
         # RA-01: per-machine mutual exclusion is still ENFORCED (P2-06) — but by disarming
         # every disarmable authority and reporting it, not by refusing to load. See
