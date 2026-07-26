@@ -60,6 +60,7 @@ class _SerialWiring:
         self.opened: list[tuple[str, int]] = []  # os.open(path, flags)
         self.blocking_opened: list[str] = []  # builtins.open — must stay empty (T-02-25)
         self.flags_set: list[int] = []  # fcntl F_SETFL history
+        self.closed: list[int] = []  # descriptors handed back to os.close
 
 
 class _FakeFcntl:
@@ -68,13 +69,16 @@ class _FakeFcntl:
     F_GETFL = fcntl.F_GETFL
     F_SETFL = fcntl.F_SETFL
 
-    def __init__(self, wiring: _SerialWiring, initial: int) -> None:
+    def __init__(self, wiring: _SerialWiring, initial: int, error: OSError | None = None) -> None:
         self._wiring = wiring
         self._flags = initial
+        self._error = error
 
     def fcntl(self, _fd: int, op: int, arg: int = 0) -> int:
         if op == self.F_GETFL:
             return self._flags
+        if self._error is not None:
+            raise self._error
         self._flags = arg
         self._wiring.flags_set.append(arg)
         return 0
@@ -89,6 +93,7 @@ def _wire_serial(
     run_raises: BaseException | None = None,
     st_mode: int = _CHAR_DEVICE_MODE,
     stat_error: OSError | None = None,
+    fcntl_error: OSError | None = None,
 ) -> _SerialWiring:
     """Drive ``_default_serial_shutdown`` against fakes only.
 
@@ -106,6 +111,7 @@ def _wire_serial(
     wiring = _SerialWiring()
     completed = _Proc(0) if stty is None else stty
     real_stat, real_open, real_fdopen = os.stat, os.open, os.fdopen
+    real_close = os.close
 
     def fake_stat(path, *a, **k):
         if path != device:
@@ -131,6 +137,12 @@ def _wire_serial(
             return real_fdopen(fd, *a, **k)
         return _FakePort(cmd_written or 0)
 
+    def fake_close(fd):
+        if fd != _SENTINEL_FD:
+            return real_close(fd)
+        wiring.closed.append(fd)
+        return None
+
     def fake_blocking_open(path, *_a, **_k):
         wiring.blocking_opened.append(path)
         return _FakePort(cmd_written or 0)
@@ -140,7 +152,12 @@ def _wire_serial(
     monkeypatch.setattr(events_mod.os, "stat", fake_stat)
     monkeypatch.setattr(events_mod.os, "open", fake_os_open)
     monkeypatch.setattr(events_mod.os, "fdopen", fake_fdopen)
-    monkeypatch.setattr(events_mod, "fcntl", _FakeFcntl(wiring, os.O_WRONLY | os.O_NONBLOCK))
+    monkeypatch.setattr(events_mod.os, "close", fake_close)
+    monkeypatch.setattr(
+        events_mod,
+        "fcntl",
+        _FakeFcntl(wiring, os.O_WRONLY | os.O_NONBLOCK, fcntl_error),
+    )
     monkeypatch.setattr("builtins.open", fake_blocking_open)
     return wiring
 
@@ -302,6 +319,22 @@ def test_serial_opens_non_blocking_and_then_clears_the_flag(monkeypatch) -> None
     # the short-write guard depends on are preserved.
     assert wiring.flags_set and not (wiring.flags_set[-1] & os.O_NONBLOCK)
     assert wiring.blocking_opened == []  # never through a blocking builtins.open
+
+
+def test_serial_closes_the_descriptor_when_clearing_the_flag_fails(monkeypatch) -> None:
+    # The descriptor is already open by then, so failing to clear the flag must not
+    # leak it — the poll loop runs this every tick for the life of an outage.
+    wiring = _wire_serial(
+        monkeypatch,
+        cmd_written=len(b"poweroff\n"),
+        fcntl_error=OSError(9, "Bad file descriptor"),
+    )
+
+    rc, _out, err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 1
+    assert SERIAL_DEVICE in err
+    assert wiring.closed == [_SENTINEL_FD]
 
 
 # --- T-02-24: a transport runner returns a failure tuple, it never raises ------
