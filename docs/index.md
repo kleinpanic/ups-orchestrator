@@ -2,10 +2,14 @@
 
 A small, dependency-free daemon that watches your UPSes through
 [NUT](https://networkupstools.org/) and turns power events into per-UPS Discord
-embeds. With an explicit opt-in policy it can also shut down the machines a UPS
-powers — over a serial console, SSH, or locally — while leaving the host's own
-protective shutdown to NUT's `upsmon`. It runs well on a Raspberry Pi and has no
-runtime dependencies beyond the standard library and NUT's `upsc`/`upscmd` CLIs.
+embeds. Each machine you enroll (`monitor add --method ...`) gets exactly one
+shutdown authority: **`native`** wraps NUT's own primary/secondary model (the
+secondary's `upsmon` shuts itself down when the primary declares low battery),
+and **`serial`**/**`ssh`** are the orchestrator's own opt-in push transports —
+gated by a central policy that requires the UPS to be both on battery and
+close to empty, and disabled by default. It runs well on a Raspberry Pi and has
+no runtime dependencies beyond the standard library and NUT's
+`upsc`/`upscmd` CLIs.
 
 ## Architecture at a glance
 
@@ -19,15 +23,19 @@ flowchart LR
   WATCH --> EVENTS
   EVENTS -->|embeds| DISCORD["Discord"]
   CTL -->|embeds| DISCORD
-  EVENTS -->|gated policy| SHUT["shutdown: serial · SSH · local"]
+  EVENTS -->|gated policy| SHUT["shutdown: native · serial · SSH · local"]
   REC --> STORE[("samples · state · logs")]
 ```
 
 ## Where to go next
 
-- **[Configuration](Configuration.md)** — the `config.json` reference (poll cadence,
-  on-battery notify grace, per-UPS load-step overrides, shutdown policy).
-- **[Shutdown targets](Shutdown-Targets.md)** — serial vs SSH vs local, policy gates, ordering.
+- **[Configuration](Configuration.md)** — the `config.json` reference: per-machine
+  `shutdown_method` (none/native/serial/ssh), poll cadence, on-battery notify
+  grace, per-UPS load-step overrides, the central shutdown policy.
+- **[Shutdown mechanisms](Shutdown-Mechanisms.md)** — native NUT vs. serial vs.
+  SSH push, ordering, and the trade-offs between them.
+- **[Shutdown targets](Shutdown-Targets.md)** *(legacy, back-compat only)* — the
+  per-UPS `shutdown_targets[]` array that predates the per-machine model.
 - **[Deployment](Deployment.md)** — system install, NUT wiring, the watch service, the
   least-privilege control user.
 - **[Architecture](Architecture.md)** — the event path and the poll path in detail.

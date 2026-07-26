@@ -63,18 +63,36 @@ upsc -l   # your UPSes should be listed
 For multiple USB UPSes with the same vendor/product id, pin each section with a
 `serial = ...` line. `nut-scanner -U` is the quickest way to list those serials.
 
-## 2b. Enroll NUT secondaries (`monitor add`)
+## 2b. Enroll a machine (`monitor add --method ...`)
 
-Network-reachable, nut-capable boxes shut *themselves* down as NUT secondaries
-instead of being pushed a shutdown over SSH (the credential-minimal, coordinated
-design — see [SSH vs. native NUT](Shutdown-Mechanisms.md)). `monitor add` runs on
-the **primary** (eulerpi5) as root and drives the whole enrollment:
+`monitor add --method {none|native|serial|ssh}` (default `native`, matching
+pre-Phase-2 invocations that omit `--method`) is the one enrollment command for
+every shutdown authority. `serial`/`ssh`/`none` are **record-only**: they
+write a `monitored_machines` entry and touch nothing else — no
+`upsd.users`/`LISTEN`, no firewall, no remote NUT install. Only `native` runs
+the privileged NUT-secondary bootstrap described below, and it runs on the
+**primary** (eulerpi5) as root:
 
 ```bash
-sudo ups-orchestrator monitor add mt --ssh mt --ups cyberpower --os arch --powervalue 1
+# native — network-reachable, nut-capable box: bootstraps a real NUT secondary
+sudo ups-orchestrator monitor add mt --method native --ssh mt --ups cyberpower --os arch --powervalue 1
+
+# serial — network-independent push over a console cable; no --ssh needed
+sudo ups-orchestrator monitor add mt --method serial \
+     --serial-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0 \
+     --serial-baud 9600 --ups cyberpower
+
+# ssh — push transport, no NUT enrollment
+sudo ups-orchestrator monitor add somebox --method ssh --ssh somebox --ups cyberpower
 ```
 
-What it does, in order:
+You cannot switch a `native` record to `serial`/`ssh`/`none` in place —
+`monitor add` refuses that transition and tells you to `monitor remove <name>`
+first, because that is the only command that runs the real remote NUT
+teardown. Skipping it would leave the old secondary's `upsmon` armed while also
+activating a push — two live shutdown authorities on one machine.
+
+The rest of this section describes the `native` bootstrap. What it does, in order:
 
 1. **Bootstrap the primary.** Append the LAN `LISTEN` to `/etc/nut/upsd.conf`,
    add the `[upsmon_secondary]` account to `/etc/nut/upsd.users`, then run a
@@ -149,6 +167,58 @@ Also apply the `nut-monitor` network-online drop-in
 (`deploy/nut/nut-monitor-network-online.conf`) on each secondary so `upsmon`
 starts after the network is actually up, not merely configured — otherwise it
 logs a spurious comm-loss on boot until DHCP settles.
+
+## 2c. Serial push far-end setup (`--method serial`)
+
+**Operator-only actions on the far-end machine** (e.g. `mt`) — the orchestrator
+never touches another host's `/etc`; this is reference guidance for whoever
+administers that box, and Phase 2 ships **code only**: nothing here has been
+carried out against a live host as part of this phase, and `shutdown.enabled`
+stays `false` in production.
+
+A `serial` push writes a shutdown command into a passwordless/auto-login getty
+on the target's console tty. Three prerequisites, **scoped to that one serial
+tty only** — none of this should loosen SSH or the physical console login:
+
+1. **Auto-login getty on the serial console, at the SAME baud the primary
+   uses.** On a systemd host, override the console-getty unit for the specific
+   serial tty (name unverified for any given box — commonly `ttyS0`/`ttyS1`;
+   the operator confirms it against that machine's actual wiring):
+
+   ```bash
+   sudo systemctl edit serial-getty@ttyS0.service
+   ```
+
+   ```ini
+   [Service]
+   ExecStart=
+   ExecStart=-/sbin/agetty --autologin youruser -L %I 9600 $TERM
+   ```
+
+   (The exact flags depend on your distro's `agetty` version — treat this as
+   a starting point to verify against `man agetty` on the target, not a
+   drop-in guarantee.) The baud given here (`9600` above) **must match** what
+   the primary declares as `serial_baud` for this machine — see the baud
+   call-out in [Configuration](Configuration.md). A mismatch here is exactly
+   the silent failure mode described there: the write still "succeeds" (rc 0)
+   and nothing happens.
+
+2. **NOPASSWD for shutdown/poweroff**, if the auto-login user above is not
+   root — the pushed command (`shutdown_cmd`, see
+   [Configuration → per-transport shutdown_cmd](Configuration.md)) must be able
+   to run without a password prompt, or it will sit on the console waiting for
+   input that a push over a 3-wire cable can never provide:
+
+   ```
+   youruser ALL=(root) NOPASSWD: /sbin/shutdown, /sbin/poweroff
+   ```
+
+3. **BIOS/SOL must not steal the tty from the OS getty post-boot.** On a Dell
+   PowerEdge (or similar server BMC), Serial-Over-LAN can redirect the same
+   physical UART to the BMC console after boot, in which case the pushed bytes
+   reach the BMC, not the running Linux getty, and the "shutdown" never
+   happens. Confirm SOL is disabled for the tty you're wiring to, or that it
+   hands the port back to the OS before this path is relied on.
 
 ### Known limitation: primary-dies-first (b2 / c-OL)
 

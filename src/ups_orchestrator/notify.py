@@ -19,6 +19,7 @@ import json
 import logging
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -88,6 +89,42 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# F1. The webhook URL's last path segment IS the credential — a Discord webhook URL
+# is bearer-equivalent, and anyone who reads one can post to that channel forever.
+# It must never reach a log line, an exception message, a traceback, or
+# `DeliveryResult.error` (which `AuditedNotifier` persists to notifications.jsonl).
+_REDACTED = "<webhook url redacted>"
+
+# Only these two schemes are ever handed to `urlopen`. Everything else is refused
+# at CONSTRUCTION, which is what makes the failure a quiet `configured=False`
+# instead of an exception on the daemon's startup path:
+#
+#  * a scheme-less or malformed URL (`https//…` — a missing colon, i.e. the typo)
+#    makes `urllib.request.Request` raise **ValueError**, which the send loop did
+#    not catch, and whose message embeds the whole URL including the token;
+#  * `file://` does not raise at all — `urlopen` succeeds, `resp.getcode()` returns
+#    None, and `200 <= None` raises **TypeError**.
+#
+# Neither is an `OSError`, so neither was caught, and `_notify_degraded` is the one
+# `send` on the daemon path outside every guard — and it fires ONLY when the config
+# is degraded. So a degraded config killed `watch` before it reached the poll loop,
+# `Restart=always` respawned it, and the box monitored nothing in a permanent
+# restart loop. RA-01 replaced hard-fail with degrade-and-disarm precisely so a bad
+# config could not stop monitoring; this reintroduced it through the notifier.
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+def usable_webhook_url(url: str) -> bool:
+    """True iff ``url`` is something ``urlopen`` can POST to. PURE, never raises."""
+    if not url:
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in _ALLOWED_SCHEMES and bool(parts.netloc)
+
+
 class DiscordWebhookNotifier:
     """Delivers notifications as rich Discord embeds via an incoming webhook."""
 
@@ -107,6 +144,20 @@ class DiscordWebhookNotifier:
         self.host = host
         self.timeout = timeout
         self.max_attempts = max(1, max_attempts)
+
+    def _redact(self, text: str) -> str:
+        """Strip the webhook URL and its token out of any text about to escape.
+
+        The URL's last path segment is the credential, so it is removed on its own
+        as well: an error string may carry the token without the full URL around it.
+        """
+        if not text:
+            return text
+        out = text.replace(self.webhook_url, _REDACTED)
+        token = self.webhook_url.rsplit("/", 1)[-1]
+        if len(token) >= 8:
+            out = out.replace(token, _REDACTED)
+        return out
 
     def _embed(self, note: Notification) -> dict[str, object]:
         embed: dict[str, object] = {
@@ -171,9 +222,25 @@ class DiscordWebhookNotifier:
         return payload
 
     def send(self, note: Notification) -> DeliveryResult:
-        """POST the notification. Never raises — a down webhook must not break NUT.
+        """POST the notification. NEVER raises — a down webhook must not break NUT.
 
         Retries transient failures and honours Discord ``retry_after`` on 429.
+
+        F1: this promise used to be aspirational. The loop caught ``HTTPError`` and
+        ``(URLError, OSError)``, and neither covers ``urllib.request.Request``'s
+        ``ValueError`` on a malformed URL nor the ``TypeError`` a ``file://`` URL
+        produces from ``resp.getcode()`` returning None. Both escaped, and
+        ``_notify_degraded`` — the one ``send`` on the daemon's startup path outside
+        every guard, fired ONLY when the config is degraded — turned a config typo
+        into a permanent `watch` restart loop monitoring nothing.
+
+        Two independent defences, because this must not depend on enumerating the
+        exception classes correctly: the scheme is validated once at construction
+        (``build_notifier`` falls back to ``NullNotifier``), and the loop body has a
+        catch-all below. Every error string is redacted before it leaves this
+        method — ``DeliveryResult.error`` is persisted to notifications.jsonl by
+        ``AuditedNotifier``, so an unredacted one puts the token on disk as well as
+        in the journal.
         """
         data = json.dumps(self._payload(note)).encode("utf-8")
         last_error = ""
@@ -190,6 +257,19 @@ class DiscordWebhookNotifier:
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
                     status = resp.getcode()
+                if status is None:
+                    # A non-HTTP handler answered (file://, data://). There is no
+                    # status to compare, and `200 <= None` is the TypeError.
+                    LOG.warning(
+                        "Discord webhook: the configured URL is not an HTTP endpoint "
+                        "(no status code returned); treating as undelivered"
+                    )
+                    return DeliveryResult(
+                        configured=True,
+                        ok=False,
+                        attempts=attempt,
+                        error="webhook URL is not an HTTP endpoint",
+                    )
                 LOG.info("Discord webhook delivered: status=%s attempts=%d", status, attempt)
                 return DeliveryResult(
                     configured=True,
@@ -198,14 +278,14 @@ class DiscordWebhookNotifier:
                     status_code=status,
                 )
             except urllib.error.HTTPError as exc:
-                last_error = f"HTTP {exc.code}: {exc.reason}"
+                last_error = self._redact(f"HTTP {exc.code}: {exc.reason}")
                 if exc.code == 429 and attempt < self.max_attempts:
                     time.sleep(_retry_after(exc))
                     continue
                 if 500 <= exc.code <= 599 and attempt < self.max_attempts:
                     time.sleep(_backoff(attempt))
                     continue
-                LOG.warning("Discord webhook HTTP %s: %s", exc.code, exc.reason)
+                LOG.warning("Discord webhook HTTP %s: %s", exc.code, self._redact(str(exc.reason)))
                 return DeliveryResult(
                     configured=True,
                     ok=False,
@@ -214,16 +294,35 @@ class DiscordWebhookNotifier:
                     error=last_error,
                 )
             except (urllib.error.URLError, OSError) as exc:
-                last_error = str(exc)
+                last_error = self._redact(str(exc))
                 if attempt < self.max_attempts:
                     time.sleep(_backoff(attempt))
                     continue
-                LOG.warning("Discord webhook delivery failed after %d attempts: %s", attempt, exc)
+                LOG.warning(
+                    "Discord webhook delivery failed after %d attempts: %s", attempt, last_error
+                )
                 return DeliveryResult(
                     configured=True,
                     ok=False,
                     attempts=attempt,
                     error=last_error,
+                )
+            except Exception as exc:  # noqa: BLE001 — the promise in the docstring
+                # Deliberately unconditional and deliberately NOT retried. This is
+                # the backstop that makes "never raises" true whatever urllib grows
+                # next; a bad URL will not become good on attempt 2, and the daemon
+                # must reach its poll loop. The class name is logged rather than the
+                # message, because a urllib ValueError's message embeds the URL.
+                LOG.warning(
+                    "Discord webhook delivery raised %s; notification dropped "
+                    "(check the webhook URL — it is not echoed here on purpose)",
+                    type(exc).__name__,
+                )
+                return DeliveryResult(
+                    configured=True,
+                    ok=False,
+                    attempts=attempt,
+                    error=f"delivery raised {type(exc).__name__}",
                 )
         return DeliveryResult(
             configured=True,
@@ -295,9 +394,27 @@ def build_notifier(
     host: str = "",
     delivery_log_path: Path | None = None,
 ) -> Notifier:
-    """Return a webhook notifier if a URL is set, else a no-op notifier."""
+    """Return a webhook notifier if a USABLE URL is set, else a no-op notifier.
+
+    F1: "set" is not enough. `https//…` (a missing colon) and `file:///…` are both
+    non-empty, and both used to reach `send` and escape it as an uncaught
+    ValueError/TypeError — on the daemon's startup path, where the only caller
+    fires when the config is ALREADY degraded. Validated once here so the failure
+    mode is a quiet `configured=False` and one log line, not a restart loop.
+
+    The URL is never echoed: it is bearer-equivalent, so the log line that reports
+    it as unusable is the last place it should appear.
+    """
     if not webhook_url:
         notifier: Notifier = NullNotifier()
+    elif not usable_webhook_url(webhook_url):
+        LOG.error(
+            "webhook_url is set but is not a usable http(s) URL (scheme and host are "
+            "both required) — notifications are DISABLED for this run. The value is "
+            "not logged: a Discord webhook URL is a credential. Fix 'webhook_url' in "
+            "the config; monitoring is unaffected."
+        )
+        notifier = NullNotifier()
     else:
         notifier = DiscordWebhookNotifier(
             webhook_url, username=username, avatar_url=avatar_url, host=host

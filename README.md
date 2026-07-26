@@ -20,9 +20,11 @@
 It turns [Network UPS Tools](https://networkupstools.org/) power events into
 **per-UPS Discord embeds** for on-battery alerts, a runtime-remaining countdown,
 power-restored summaries, and low-battery warnings. NUT's own `upsmon` still
-handles the host's protective shutdown, and the orchestrator can optionally shut
-down UPS-powered machines over **serial**, **SSH**, or **locally** when a
-central opt-in policy says the UPS is both on battery and close to empty.
+handles the host's protective shutdown. Each machine you enroll gets exactly
+one shutdown authority (`monitor add --method {native|serial|ssh|none}`):
+**native** wraps NUT's own primary/secondary model, and **serial**/**ssh** are
+the orchestrator's own opt-in push transports, gated by a central policy that
+requires the UPS to be both on battery and close to empty.
 
 Works with any NUT-supported UPS and monitors **any number** of them. Nothing is
 hard-coded to a model.
@@ -209,7 +211,8 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
       "label": "Rack UPS",
       "shutdown_targets": [
         { "name": "bigserver", "kind": "serial", "enabled": false,
-          "device": "/dev/ttyUSB0", "baud": 115200,
+          "device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0",
+          "baud": 9600,   // MATCH YOUR CONSOLE'S ACTUAL BAUD — see warning below
           "cmd": "sudo /sbin/shutdown -h now" },
         { "name": "fileserver", "kind": "remote", "enabled": false,
           "host": "mt", "cmd": "sudo /sbin/shutdown -h now" },
@@ -222,6 +225,15 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
 }
 ```
 
+> **⚠️ Baud is yours to declare, and a wrong value is silent.** `stty` only
+> configures the *local* tty — it returns success at essentially any
+> recognised rate on the same physical line, so a mismatched baud sends
+> garbage down the wire and the orchestrator reports success anyway (rc 0, no
+> shutdown). It cannot detect a far-end speed mismatch, only a rejected local
+> line configuration. Declare the real speed of the console you're wiring to
+> (`9600` above matches this project's own rpi5 console — do not copy it
+> blindly).
+
 Shutdown policy:
 - `shutdown.enabled` is the master switch. If it is false, no external or
   internal target command runs.
@@ -233,14 +245,36 @@ Shutdown policy:
 - `external.enabled` covers `serial` and `remote`; `internal.enabled` covers
   `local`. Local targets run only after enabled external targets have been sent.
 
-Per target transport:
+Per target transport (`shutdown_targets[]` is **LEGACY** — see
+`monitored_machines` below for the current per-machine model):
 - **`kind`**: `serial` (`device`+`baud`, to a passwordless/auto-login getty;
   network-independent), `remote` (`host` is a hostname *or* `ssh_config` alias;
   omit `user` for `ssh <alias>`), or `local`.
 - **Ordering**: `local` targets always run *after* every enabled serial/remote
-  target on the UPS, so the watcher host dies last.
+  target on the UPS, so the watcher host dies last; serial fires before ssh
+  when both are due, since serial doesn't depend on the network being up.
 - `local` targets need passwordless shutdown (set up by `deploy/install.sh`);
   `serial`/`remote` need a passwordless console/SSH on the far end.
+
+### Monitored machines (`monitored_machines`)
+
+The current, non-legacy way to enroll a machine's shutdown authority. Each
+entry carries exactly one `shutdown_method`: `none` (default), `native` (a
+real NUT secondary — `upsmon` on that box shuts it down when the primary
+raises FSD), `serial` (push over a console cable), or `ssh` (push over SSH).
+A machine can never hold two authorities on the same UPS at once — see
+[docs/Configuration.md](https://kleinpanic.github.io/ups-orchestrator/Configuration/)
+for the full field reference, the mutual-exclusion/degrade behaviour, the
+per-transport `shutdown_cmd` rule, and the `monitor add/list/verify/remove`
+CLI.
+
+```bash
+sudo ups-orchestrator monitor add mt --method serial \
+     --serial-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0 \
+     --serial-baud 9600 --ups cyberpower
+sudo ups-orchestrator monitor add spark --method native --ssh spark --ups cyberpower3
+ups-orchestrator monitor list
+```
 
 Config path resolves to `$UPS_ORCH_CONFIG`, else `/etc/ups-orchestrator/config.json`,
 else `<repo>/config.json`. State resolves similarly via `$UPS_ORCH_STATE` /

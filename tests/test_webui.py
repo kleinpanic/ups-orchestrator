@@ -7,7 +7,7 @@ from http.server import ThreadingHTTPServer
 
 from conftest import make_ups
 from ups_orchestrator import webui
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, ConfigNotice
 from ups_orchestrator.nut import UpsSnapshot
 
 _SNAP = UpsSnapshot(
@@ -33,6 +33,49 @@ def test_status_payload_shape(monkeypatch) -> None:
     assert u["label"] == "Test ups1"
     assert u["watts"] == 225 and u["headroom_watts"] == 675
     assert u["battery_voltage"] == 27.0 and u["battery_voltage_percent"] == 112
+    assert payload["degraded"] == []
+
+
+def test_status_payload_degraded_empty_leaves_other_keys_unchanged(monkeypatch) -> None:
+    monkeypatch.setattr(webui, "read_snapshot", lambda _n: _SNAP)
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    payload = webui.status_payload(cfg, now=1000.0)
+    assert payload["degraded"] == []
+    assert set(payload) == {"time", "upses", "degraded"}
+    (u,) = payload["upses"]
+    assert u["status"] == "OL"
+
+
+def test_status_payload_degraded_carries_severity_subject_message(monkeypatch) -> None:
+    monkeypatch.setattr(webui, "read_snapshot", lambda _n: _SNAP)
+    degraded = (
+        ConfigNotice(severity="error", subject="mt", message="no serial device — disarmed"),
+        ConfigNotice(severity="advisory", subject="spark", message="shutdown_cmd needs sudo"),
+    )
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)
+    payload = webui.status_payload(cfg, now=1000.0)
+    assert payload["degraded"] == [
+        {"severity": "error", "subject": "mt", "message": "no serial device — disarmed"},
+        {"severity": "advisory", "subject": "spark", "message": "shutdown_cmd needs sudo"},
+    ]
+
+
+def test_served_page_shows_banner_for_degraded_config(monkeypatch) -> None:
+    monkeypatch.setattr(webui, "read_snapshot", lambda _n: _SNAP)
+    degraded = (ConfigNotice(severity="error", subject="mt", message="no serial device"),)
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)
+    page = webui._render_page(cfg)
+    assert 'id="degraded"' in page
+    assert "mt" in page and "no serial device" in page and "error" in page
+
+
+def test_served_page_has_no_banner_for_healthy_config(monkeypatch) -> None:
+    monkeypatch.setattr(webui, "read_snapshot", lambda _n: _SNAP)
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    page = webui._render_page(cfg)
+    # The banner ELEMENT, not the id string — LO-07's client-side renderer names the
+    # same id when it creates the node on the fly.
+    assert '<div class="degraded"' not in page
 
 
 def test_history_payload_downsamples(tmp_path) -> None:
@@ -88,3 +131,22 @@ def test_http_endpoints_round_trip(monkeypatch, tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_the_degraded_payload_is_actually_rendered_client_side() -> None:
+    # LO-07: status_payload has carried `degraded` since 02-08 and the shipped
+    # refresh() ignored it — the banner came only from the server-rendered `/`, so a
+    # dashboard left open across a daemon restart showed one that was arbitrarily
+    # stale in either direction. The data was already on the wire.
+    page = webui._INDEX_HTML
+    assert "renderDegraded(st.degraded)" in page
+    # Built with textContent, not string-interpolated HTML: these are config-authored
+    # values and MED-06's standard applies here too.
+    assert "sub.textContent=n.subject" in page
+    assert "sev.textContent=n.severity" in page
+
+
+def test_the_banner_is_removed_client_side_when_the_config_becomes_healthy() -> None:
+    # The other direction, which is the one that matters: a banner left on screen for
+    # a degrade the operator has since fixed is worse than no banner at all.
+    assert "if(!items||!items.length){if(el)el.remove();return}" in webui._INDEX_HTML

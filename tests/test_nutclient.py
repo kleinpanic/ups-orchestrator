@@ -210,6 +210,25 @@ def test_upsmon_rejects_quote_in_shutdown_cmd():
         _upsmon(shutdown_cmd='/sbin/shutdown -h now"; rm -rf /')
 
 
+def test_upsmon_rejects_a_newline_in_shutdown_cmd():
+    """LO-C4: the quote was rejected and the NEWLINE was not.
+
+    `SHUTDOWNCMD "<cmd>"` is one directive on one line, so a newline ends it and
+    everything after becomes a further upsmon directive in the SECONDARY's
+    /etc/nut/upsmon.conf — a third machine's config, written by us.
+    """
+    with pytest.raises(ValueError, match="control character"):
+        _upsmon(shutdown_cmd="sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x")
+
+
+def test_valid_shutdown_cmd_is_the_one_predicate_for_both_sinks():
+    assert nutclient.valid_shutdown_cmd("sudo /sbin/shutdown -h now")
+    assert not nutclient.valid_shutdown_cmd('halt"')
+    assert not nutclient.valid_shutdown_cmd("halt\nNOTIFYCMD /tmp/x")
+    assert not nutclient.valid_shutdown_cmd("halt\rNOTIFYCMD /tmp/x")
+    assert not nutclient.valid_shutdown_cmd("halt\x00")
+
+
 # --- render_upsd_* snippets (pure) --------------------------------------------
 
 
@@ -852,3 +871,79 @@ def test_bootstrap_primary_failing_nft_returns_four(tmp_path):
     )
     assert rc == 4
     assert any("nft apply failed" in line for line in log)
+
+
+# --- F2: the saddr set is IPv4, and a rejected ruleset is never left on disk ---
+
+
+def test_valid_ipv4_rejects_the_v6_family():
+    assert nutclient.valid_ipv4("192.168.1.114")
+    assert not nutclient.valid_ipv4("2001:db8::1")
+    assert not nutclient.valid_ipv4("::1")
+    assert not nutclient.valid_ipv4("not-an-ip")
+    # ...while the general predicate still accepts both, for LISTEN/--primary-ip.
+    assert nutclient.valid_ip("2001:db8::1")
+
+
+def test_render_nft_accept_rule_refuses_an_ipv6_member():
+    """`ip saddr` is nftables' IPv4 matcher; the v6 spelling is `ip6 saddr`.
+
+    A v6 literal there does not merely fail to match — `nft -f` rejects the WHOLE
+    ruleset, which is how the operator's policy drop stops loading.
+    """
+    with pytest.raises(ValueError, match="ip6 saddr"):
+        nutclient.render_nft_accept_rule(["2001:db8::1"])
+    with pytest.raises(ValueError, match="IPv4 literals"):
+        nutclient.render_nft_accept_rule(["192.168.1.114", "2001:db8::1"])
+
+
+def test_apply_nft_restores_the_file_when_the_reload_is_rejected(tmp_path):
+    """The write happened BEFORE `nft -f` got to judge it.
+
+    `nft -f` is atomic, so a failed load leaves the RUNNING ruleset untouched —
+    but `nftables.service` reads this file at boot, so a rejected ruleset left on
+    disk means the next reboot comes up with no policy-drop chain at all.
+    """
+    conf = tmp_path / "main.nft"
+    original = (
+        "table inet filter {\n"
+        "    chain input {\n"
+        "        type filter hook input priority filter; policy drop;\n"
+        "        ct state established,related accept\n"
+        "    }\n"
+        "}\n"
+    )
+    conf.write_text(original)
+    calls: list[str] = []
+
+    def _rejecting_nft(path: str) -> tuple[int, str, str]:
+        calls.append(path)
+        return 1, "", "Error: syntax error, unexpected junk"
+
+    rc, _out, err = nutclient.apply_nft(
+        str(conf), ["192.168.1.114"], _rejecting_nft, lambda: None
+    )
+
+    assert rc == 1
+    assert calls, "the reload was attempted"
+    assert conf.read_text() == original, "a rejected ruleset must not survive on disk"
+    assert "restored" in err
+
+
+def test_apply_nft_keeps_the_file_when_the_reload_succeeds(tmp_path):
+    conf = tmp_path / "main.nft"
+    conf.write_text(
+        "table inet filter {\n"
+        "    chain input {\n"
+        "        type filter hook input priority filter; policy drop;\n"
+        "        ct state established,related accept\n"
+        "    }\n"
+        "}\n"
+    )
+    restarted: list[bool] = []
+    rc, _out, _err = nutclient.apply_nft(
+        str(conf), ["192.168.1.114"], lambda _p: (0, "", ""), lambda: restarted.append(True)
+    )
+    assert rc == 0
+    assert "192.168.1.114" in conf.read_text()
+    assert restarted == [True]

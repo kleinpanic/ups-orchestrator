@@ -19,20 +19,25 @@ so the handlers unit-test without a real UPS or network.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import shlex
+import stat
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ups_orchestrator.config import (
     LoadStepPolicy,
+    MonitoredMachine,
     ShutdownGroupPolicy,
     ShutdownTarget,
     UpsConfig,
+    canonical_ups_key,
 )
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
@@ -56,14 +61,35 @@ def ssh_dest(target: ShutdownTarget) -> str:
     return f"{target.user}@{target.host}" if target.user else target.host
 
 
+# A transport runner's contract is *return a failure tuple, never raise*. The caller
+# appends to ``state.shutdowns_sent`` AFTER the runner returns and holds the local
+# targets until every remote has been sent, so a runner that escapes leaves the target
+# unmarked and the local hosts unreached — the watcher Pi's own poweroff starves on the
+# battery it shares with the machine that hung (T-02-24). Hence the broad catch: it is
+# the contract, not laziness.
 def _default_ssh_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_dest(target), target.cmd]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+    dest = ssh_dest(target)
+    # BL-01 belt-and-braces at the sink. `config.validate_legacy_targets` disarms an
+    # option-shaped host/user at load, but a hand-constructed target never passes
+    # through the validator. `--` terminates OpenSSH's option parsing, so a leading
+    # '-' in dest is read as a destination rather than as `-oProxyCommand=...`.
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", dest, target.cmd]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+    except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
+        return 1, "", f"ssh transport to {dest} failed: {exc}"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
 def _default_local_shutdown(cmd: str) -> tuple[int, str, str]:
-    proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=20, check=False)
+    try:
+        # shlex.split raises ValueError on an unbalanced quote and subprocess.run
+        # raises IndexError on an empty argv, both before any process exists.
+        proc = subprocess.run(
+            shlex.split(cmd), capture_output=True, text=True, timeout=20, check=False
+        )
+    except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
+        return 1, "", f"local transport ({cmd!r}) failed: {exc}"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -71,16 +97,103 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
     """Send ``cmd`` to a serial console (assumes a passwordless/auto-login getty).
 
     Network-independent: works during an outage when SSH can't reach the box.
-    Fire-and-forget — we can't easily read the far end back, so success means the
-    bytes were written.
+
+    Success means two things and no more: the LOCAL tty was configured at the declared
+    baud, and the bytes were written. The far end is never read back, so a far-end speed
+    MISMATCH is **not** detectable here — ``stty -F <dev> <rate>`` returns 0 for 9600,
+    19200, 115200 and 0 alike, and the payload write completes at any of them. What the
+    captured return code catches is a MALFORMED rate or a line that could not be
+    configured locally. Bidirectional readback is deferred as OQ-02.
     """
     try:
-        subprocess.run(
-            ["stty", "-F", target.device, str(target.baud), "raw", "-echo"],
+        # Cheapest and most destructive-to-get-wrong checks first.
+        if target.baud is None:
+            # 02-06's strict parser yields None for a declared-but-unparseable baud.
+            # Reachable here because a hand-constructed target never passes through
+            # ``validate_active_transports``. Rendering it would run `stty -F <dev> None`.
+            return (
+                1,
+                "",
+                f"serial target {target.name} has no usable baud rate; declare a "
+                f"positive integer serial_baud (the live console here is 9600). "
+                f"Nothing was sent to {target.device}.",
+            )
+        mode = os.stat(target.device).st_mode
+        if not stat.S_ISCHR(mode):
+            # Defence in depth over 02-06's config-side /dev/ prefix check, and
+            # deliberately not redundant with it: a path under /dev/ can still be a
+            # regular file, which the "wb" open below would TRUNCATE and then report
+            # success for.
+            return (
+                1,
+                "",
+                f"serial device {target.device} is not a character device "
+                f"(mode {stat.filemode(mode)}); refusing to write to it. Check the "
+                f"serial_device path for a typo.",
+            )
+        # HI-04: `raw` touches ignbrk/brkint/…/icanon/opost/isig and NOTHING in
+        # c_cflag, so it sets neither clocal nor -crtscts. `clocal` is the correct
+        # setting for the 3-wire TX/RX/GND console this transport targets — it never
+        # asserts DCD — and makes the carrier question moot for the blocking write and
+        # the close() that follow, rather than only for the open(). Without -crtscts a
+        # cable with no CTS can block the write, and close() can block in
+        # tty_wait_until_sent for closing_wait (30 s) inside the poll loop.
+        stty = subprocess.run(
+            [
+                "stty",
+                "-F",
+                target.device,
+                str(target.baud),
+                "raw",
+                "-echo",
+                "clocal",
+                "-crtscts",
+            ],
+            capture_output=True,
+            text=True,
             timeout=5,
             check=False,
         )
-        with open(target.device, "wb", buffering=0) as port:
+        if stty.returncode != 0:
+            # check=False keeps this the single decision point; raising
+            # CalledProcessError instead would just escape into the handler below.
+            return (
+                1,
+                "",
+                f"could not configure the local serial line {target.device} at "
+                f"{target.baud} baud (stty rc={stty.returncode}: "
+                f"{stty.stderr.strip() or '(no stderr)'}); the shutdown command was "
+                f"NOT sent. This says nothing about the far end's line speed.",
+            )
+        # T-02-25: open NON-BLOCKING, then clear the flag. `stty raw` does not set
+        # clocal and the kernel's default termios leaves CLOCAL clear, so a blocking
+        # open on a tty waits for DCD — which a 3-wire TX/RX/GND console cable never
+        # asserts. The open would then never return: handle_tick never returns, the
+        # poll loop wedges, every UPS stops being polled, and Restart=always never
+        # fires because the process is still alive. Clearing the flag immediately
+        # restores the blocking write semantics the short-write guard depends on.
+        # (A manual `stty -F` smoke test never reproduces the hang: GNU stty already
+        # opens O_RDONLY|O_NONBLOCK.)
+        #
+        # HI-04: O_NOCTTY as well. systemd puts each service in its own session, so
+        # this process is a session leader with no controlling terminal — and under
+        # POSIX such a process opening a tty WITHOUT O_NOCTTY acquires that tty as its
+        # controlling terminal. A carrier transition on the line would then deliver
+        # SIGHUP to the session and kill the daemon mid-outage. Unconditionally correct
+        # for a daemon, and it costs nothing.
+        fd = os.open(target.device, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+            # LO-01: the fdopen belongs INSIDE this try. It sat below, so an OSError
+            # there leaked the descriptor — once per poll, for the whole outage, until
+            # the daemon's fd table was exhausted. Once fdopen returns, the file object
+            # owns the fd and the `with` closes it.
+            port = os.fdopen(fd, "wb", buffering=0)
+        except Exception:
+            os.close(fd)
+            raise
+        with port:
             port.write(b"\r")  # nudge the shell to a fresh prompt
             time.sleep(0.5)
             payload = (target.cmd + "\n").encode()
@@ -90,8 +203,9 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
             # (device unplugged / no getty). Report failure, not false success.
             return 1, "", f"short serial write: {written}/{len(payload)} bytes to {target.device}"
         return 0, "", ""
-    except OSError as exc:
-        return 1, "", str(exc)
+    except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
+        # OSError alone let subprocess.TimeoutExpired escape straight past this.
+        return 1, "", f"serial transport to {target.device} failed: {exc}"
 
 
 def _noop_event_log(
@@ -121,6 +235,26 @@ class Deps:
     event_log: EventLogger = _noop_event_log
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
     sample_path: Path | None = None  # recorder JSONL, for draw-history sparklines
+    # Enrolled machines, projected onto ephemeral shutdown targets by
+    # ``_machine_targets``. Empty by default so a handler built without config
+    # (tests, one-off dispatch) pushes to nothing.
+    monitored_machines: tuple[MonitoredMachine, ...] = ()
+    # When set, ``_fire_target`` returns at the TOP: no event-log line, no attempt
+    # notification, no runner and — critically — no ``shutdowns_sent`` append, so a
+    # preview can never poison the dedupe key that decides whether a REAL outage
+    # later shuts a box down. ``remote-shutdown --dry-run`` sets it. It is a
+    # belt-and-braces guarantee rather than the preview's mechanism: the preview
+    # reports the gate without reaching the firing path at all, and this makes any
+    # future path that does reach it under a dry run inert (T-02-13).
+    dry_run: bool = False
+    # LO-02: ``_machine_targets`` is re-evaluated on EVERY poll while on battery, and
+    # ``_report_unprojectable`` had no rate limit at all, so one unprojectable machine
+    # would page every ``poll_seconds`` for the whole outage. ``_check_load_step``
+    # already solves this with a cooldown; this is the same pattern. Keyed
+    # ``<ups>/<machine>`` -> last notified, mutable because ``_build_deps`` constructs
+    # Deps ONCE for the life of the watch loop.
+    unprojectable_cooldown: int = 600
+    unprojectable_notified: dict[str, int] = field(default_factory=dict)
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -203,6 +337,23 @@ def _log_event(
         deps.event_log(event, ups, snap, message, data)
     except Exception:  # noqa: BLE001 - logging must never break UPS handling
         LOG.exception("event log failed for %s/%s", ups.name, event)
+
+
+def _notify(deps: Deps, note: Notification) -> None:
+    """Send a notification on the SHUTDOWN path without ever raising out of it.
+
+    The mirror of ``_log_event``, and load-bearing for the same reason. The three
+    notify sites below sit on the path that powers machines off, and
+    ``state.shutdowns_sent`` is appended only after the transport returns — so a
+    notifier that raises (a dead switch mid-outage is the expected case) leaves the
+    target unmarked and the local hosts unreached, which is the T-02-24 starvation the
+    ``_fire_target`` backstop exists to prevent. ``_report_unprojectable`` raises out of
+    the ``_machine_targets`` generator instead, i.e. before anything has fired at all.
+    """
+    try:
+        deps.notifier.send(note)
+    except Exception:  # noqa: BLE001 - a notification must never break a shutdown
+        LOG.exception("shutdown notification failed")
 
 
 def _record_status_transition(
@@ -410,13 +561,14 @@ def _notify_shutdown_attempt(
     fields = _snapshot_fields(snap)
     fields.insert(0, ("Target", f"{target.name} via {where}"))
     fields.insert(1, ("Trigger", reason))
-    deps.notifier.send(
+    _notify(
+        deps,
         Notification(
             title=f"🛑 {ups.label} — shutdown attempt for {target.name}",
             body="The orchestrator is issuing a configured shutdown command.",
             level=Level.CRITICAL,
             fields=fields,
-        )
+        ),
     )
 
 
@@ -426,20 +578,22 @@ def _notify_shutdown_result(
     if not ups.shutdown_policy.notify:
         return
     if rc == 0:
-        deps.notifier.send(
+        _notify(
+            deps,
             Notification(
                 title=f"🛑 {ups.label} — shutdown sent to {target.name}",
                 body=f"Graceful shutdown issued to {where}.",
                 level=Level.CRITICAL,
-            )
+            ),
         )
     else:
-        deps.notifier.send(
+        _notify(
+            deps,
             Notification(
                 title=f"❗ {ups.label} — shutdown FAILED for {target.name}",
                 body=f"rc={rc}; stderr={err or '(none)'}",
                 level=Level.CRITICAL,
-            )
+            ),
         )
 
 
@@ -452,6 +606,15 @@ def _fire_target(
     reason: str,
 ) -> None:
     where = _target_location(target)
+    # T-02-13. FIRST statement with a side effect in sight, deliberately: every line
+    # below this point either tells someone a shutdown happened or makes the system
+    # behave as though one did. Returning here rather than skipping the runner alone
+    # is what keeps a dry run from poisoning `shutdowns_sent`.
+    if deps.dry_run:
+        LOG.info(
+            "[dry-run] would fire %s via %s: %s (%s)", target.name, where, target.cmd, reason
+        )
+        return
     _log_event(
         deps,
         "shutdown_attempt",
@@ -460,13 +623,26 @@ def _fire_target(
         "Issuing configured shutdown target command.",
         {"target": target.name, "where": where, "reason": reason},
     )
-    _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
-    if target.is_local:
-        rc, _out, err = deps.local_shutdown(target.cmd)
-    elif target.is_serial:
-        rc, _out, err = deps.serial_shutdown(target)
-    else:
-        rc, _out, err = deps.ssh_shutdown(target)
+    # Backstop for the runner contract, and NOT redundant with the defaults' own
+    # handlers: ``Deps`` carries injected runners (tests, any future transport) that
+    # those handlers do not cover. Only the call site can guarantee the invariant that
+    # matters — ``shutdowns_sent`` is always appended, so the local targets below are
+    # always reached even when every remote blows up on a dead switch (T-02-24).
+    #
+    # HI-03: the attempt notification used to sit one line ABOVE this try, which put a
+    # blocking Discord POST — up to ~16.5 s of retries against a switch the outage just
+    # killed — outside the backstop's reach. It is inside now AND non-raising via
+    # ``_notify``, so no path can reach the runner without the append that follows it.
+    try:
+        _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
+        if target.is_local:
+            rc, _out, err = deps.local_shutdown(target.cmd)
+        elif target.is_serial:
+            rc, _out, err = deps.serial_shutdown(target)
+        else:
+            rc, _out, err = deps.ssh_shutdown(target)
+    except Exception as exc:  # noqa: BLE001 - an escaping runner must not strand the rest
+        rc, err = 1, f"shutdown transport for {target.name} ({where}) raised: {exc}"
     state.shutdowns_sent.append(target.name)
     _log_event(
         deps,
@@ -479,10 +655,134 @@ def _fire_target(
     _notify_shutdown_result(ups, deps, target, rc, err, where)
 
 
+def _report_unprojectable(
+    ups: UpsConfig, machine: MonitoredMachine, deps: Deps | None, reason: str
+) -> None:
+    """Report a machine this UPS considered and then did NOT project.
+
+    NEW-3: the dropped machine never enters ``remotes``, so it would otherwise get
+    neither the ``shutdown_target_blocked`` event nor the notification every other
+    non-firing decision gets — leaving mid-outage syslog, the channel least likely to
+    be read, as the only trace of a machine that will not shut down. One reporting
+    path for every "projected nothing" decision, not one per reason.
+    """
+    LOG.error("Machine %r on UPS %s was not projected: %s", machine.name, ups.name, reason)
+    if deps is None:  # 02-02's two-argument call sites and tests
+        return
+    _log_event(
+        deps,
+        "shutdown_target_blocked",
+        ups,
+        None,
+        "Enrolled machine could not be projected onto a shutdown target.",
+        {"target": machine.name, "reason": reason},
+    )
+    # LO-02: the event line is written every time (it is the audit trail); the PAGE is
+    # rate-limited, exactly as `_check_load_step` does it. This path is re-reached on
+    # every poll for the whole outage.
+    key = f"{ups.name}/{machine.name}"
+    last = deps.unprojectable_notified.get(key)
+    now = deps.now()
+    if last is not None and now - last < deps.unprojectable_cooldown:
+        return
+    deps.unprojectable_notified[key] = now
+    _notify(
+        deps,
+        Notification(
+            title=f"❗ {ups.label} — {machine.name} will NOT be shut down",
+            body=f"{machine.name} was not projected onto a shutdown target: {reason}",
+            level=Level.CRITICAL,
+        ),
+    )
+
+
+def _machine_targets(
+    ups: UpsConfig, machines: Sequence[MonitoredMachine], deps: Deps | None = None
+) -> Iterator[ShutdownTarget]:
+    """Project this UPS's push-managed machines onto ephemeral shutdown targets.
+
+    A machine's ``shutdown_method`` selects the *transport*; the existing
+    ``ShutdownPolicy`` gate still decides *whether and when*. The projected targets
+    are handed to the unchanged firing path, so no new shutdown or transport logic
+    exists anywhere.
+
+    ``native`` machines are deliberately never projected: their ``upsmon`` secondary
+    powers itself off on the primary's FSD, so a push as well would shut the box
+    down twice (P2-01/P2-06). ``none`` machines opted out of shutdown entirely.
+
+    ``serial_baud`` is carried verbatim. ``_default_serial_shutdown`` runs
+    ``stty -F <device> <baud>``, so a substituted baud writes garbage down the line
+    and still returns rc=0 — a silent no-shutdown (P2-08).
+
+    The association is resolved through ``canonical_ups_key`` — the SAME
+    canonicalisation 02-06's detectors use — so a capitalisation cannot mean two
+    different things in two modules. A blank ``ups`` matches no UPS at all, including
+    one whose own name canonicalises to blank; ``Config.load`` disarms such a machine
+    with a notice rather than letting it look protected.
+
+    Projection reads EFFECTIVE state (``effective_method`` here,
+    ``effective_enabled`` for the legacy targets in ``seen``), so a machine or target
+    that ``Config.load`` disarmed is already excluded while its declaration on disk is
+    untouched. ``Config.load`` no longer rejects a machine that collides with an
+    enabled legacy target — it disarms one of them instead.
+
+    The projected target is named after the machine, which is the
+    ``state.shutdowns_sent`` dedupe key. A name already claimed on this UPS would
+    make the later target a no-op with no trace, so a collision is dropped and
+    reported through ``_report_unprojectable``.
+    """
+    ups_key = canonical_ups_key(ups.name)
+    seen = {t.name.strip().lower() for t in ups.shutdown_targets if t.effective_enabled}
+    for m in machines:
+        if not m.ups.strip() or canonical_ups_key(m.ups) != ups_key:
+            continue
+        method = m.effective_method.strip().lower()
+        if method == "ssh":
+            target = ShutdownTarget(
+                name=m.name, kind="remote", enabled=True, host=m.ssh, cmd=m.shutdown_cmd
+            )
+        elif method == "serial":
+            if m.serial_baud is None:
+                _report_unprojectable(
+                    ups,
+                    m,
+                    deps,
+                    "its declared serial_baud could not be parsed; declare a positive "
+                    "integer serial_baud (the live console here is 9600)",
+                )
+                continue
+            target = ShutdownTarget(
+                name=m.name,
+                kind="serial",
+                enabled=True,
+                device=m.serial_device,
+                baud=m.serial_baud,
+                cmd=m.shutdown_cmd,
+            )
+        else:
+            continue
+        key = m.name.strip().lower()
+        if key in seen:
+            _report_unprojectable(
+                ups,
+                m,
+                deps,
+                "it has a duplicate shutdown target name on this UPS; rename it or that "
+                "machine will never be shut down",
+            )
+            continue
+        seen.add(key)
+        yield target
+
+
 def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
     """Fire due targets — remotes first, locals only once all remotes are sent."""
-    enabled = [t for t in ups.shutdown_targets if t.enabled]
-    remotes = [t for t in enabled if not t.is_local]
+    projected = _machine_targets(ups, deps.monitored_machines, deps)
+    enabled = [t for t in (*ups.shutdown_targets, *projected) if t.effective_enabled]
+    # Serial is network-independent; ssh dies with the switch. Fire serial first so a
+    # collapsing network can't strand a shutdown. The sort is stable, so declared
+    # order still holds within each transport.
+    remotes = sorted((t for t in enabled if not t.is_local), key=lambda t: not t.is_serial)
     locals_ = [t for t in enabled if t.is_local]
 
     for t in remotes:
@@ -501,7 +801,22 @@ def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: Ups
 
     # Local hosts die last: hold until every enabled remote has been triggered.
     active_remotes = [t for t in remotes if _target_group(ups, t).enabled]
-    if any(t.name not in state.shutdowns_sent for t in active_remotes):
+    pending = [t.name for t in active_remotes if t.name not in state.shutdowns_sent]
+    if pending:
+        # LO-03: this returned silently, so a held local target produced no
+        # `shutdown_target_blocked` event and no other trace — the ONE non-firing
+        # decision in this module that logged nothing. An operator reading the event
+        # log saw the watcher host simply not appear.
+        for t in locals_:
+            if t.name not in state.shutdowns_sent:
+                _log_event(
+                    deps,
+                    "shutdown_target_blocked",
+                    ups,
+                    snap,
+                    "Local target held until every enabled remote has been sent.",
+                    {"target": t.name, "reason": f"waiting on remote(s): {', '.join(pending)}"},
+                )
         return
     for t in locals_:
         should_fire, reason = _target_should_fire(ups, state, deps, t, snap)

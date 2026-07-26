@@ -1,4 +1,15 @@
-# Shutdown Targets
+# Shutdown Targets (LEGACY, back-compat only)
+
+!!! warning "This per-UPS `shutdown_targets[]` array is LEGACY"
+    New enrollments use the per-machine `monitored_machines[].shutdown_method`
+    model (`none`/`native`/`serial`/`ssh`, via `monitor add --method ...`) —
+    see [Configuration](Configuration.md). `shutdown_targets[]` is still parsed
+    so pre-existing config files keep loading, but a new entry should not be
+    written here. `kind: "serial"` maps onto `shutdown_method: "serial"`;
+    `kind: "remote"` maps onto `shutdown_method: "ssh"`; `kind: "local"` has no
+    `monitored_machines` equivalent — the watcher host is never enrolled as a
+    machine, so a `local` target stays the only way to describe its own
+    shutdown.
 
 A shutdown target is a machine the orchestrator knows how to power down. Each
 UPS can have any number, and target entries are only transports: they say *how*
@@ -16,24 +27,11 @@ devices a UPS feeds.
     [SSH vs. native NUT](Shutdown-Mechanisms.md) for the full analysis, the
     failure modes, and when each path applies.
 
-### Where the backup sits relative to native LB
-
-The backup is a **last-resort deadman**, and where you place its threshold
-depends on whether the machine already has a native secondary:
-
-- **Machine WITH a native secondary** (e.g. mt/spark, enrolled via `monitor add`):
-  the backup must sit **strictly below** that UPS's LB point. It fires only if
-  native shutdown *didn't* while the primary was still alive — a deadman for
-  "FSD/`OB LB` didn't do its job." Placed above LB it would race the native path
-  and double-shut-down. (This is the same dual-regime conflict `monitor add`
-  refuses without `--force`.)
-- **Machine with NO native secondary** (e.g. an appliance that can't run
-  nut-client): keep an early/high threshold — the backup *is* its graceful path,
-  not a deadman, so there is nothing below LB to defer to.
-
-The backup does **not** cover the primary-dies-first (b2/c-OL) hole: it runs on
-the primary and dies with it. See
-[Deployment → Known limitation](Deployment.md).
+**Deferred:** a native-plus-deadman regime, where a legacy target fired only as
+a last resort strictly below a native secondary's own LB point, was scoped for
+this phase and **dropped** — it may return in a future phase. (It was also
+never actually implemented: `battery_below`/`runtime_below` on a target are
+parsed but not consulted at runtime — see Triggers, below.)
 
 ### Chosen defaults for the open questions
 
@@ -42,9 +40,9 @@ These were live-environment unknowns resolved to defaults, not blockers:
 - **DEADTIME 30** on secondaries (the ≥3×POLLFREQ floor for POLLFREQ 5).
 - **Per-host nft scope** — each secondary's source IP added to the dedicated
   `table inet ups_orchestrator` set, not a broad allow.
-- **Serial-cable presence unknown** → backup `kind` defaults to `remote`; switch
-  to `serial` where a console cable exists (network-independent, survives a dark
-  switch).
+- **Serial-cable presence unknown** → legacy target `kind` defaults to
+  `remote`; switch to `serial` where a console cable exists
+  (network-independent, survives a dark switch).
 - **`nut` group present** → snippet/secret files at `0640 root:nut`, with a
   `0600 root:root` fallback where the group is unavailable.
 
@@ -83,13 +81,21 @@ bypass disabled groups or the close-to-empty gate.
 
 ## Example
 
+!!! danger "Match your console's ACTUAL baud — a wrong value is silent"
+    The live rpi5 console line is **9600**. `stty` only configures the local
+    tty and returns success at essentially any recognised rate on the same
+    physical line, so a wrong `baud` here sends garbage down the wire and the
+    orchestrator reports success (rc 0) anyway — it cannot detect a far-end
+    speed mismatch, only a rejected local line configuration. Declare the real
+    speed of the console you are wiring to, not a value copied from an example.
+
 ```json
 {
   "name": "bigserver",
   "kind": "serial",
   "enabled": true,
-  "device": "/dev/ttyUSB0",
-  "baud": 115200,
+  "device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0",
+  "baud": 9600,
   "cmd": "sudo /sbin/shutdown -h now"
 }
 ```

@@ -27,6 +27,10 @@ import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+# The alias-shape rule is shared with Config.load and with the CLI's argparse
+# boundary rather than re-spelled here — one predicate, every ssh sink (BL-C1).
+from ups_orchestrator.config import valid_ssh_alias
+
 # A NUT UPS name is restricted to this charset (letters, digits, dot, dash,
 # underscore) by upsd itself. Any other byte — a space, semicolon, backtick,
 # ``$`` — cannot be a real UPS name, so a value carrying one is an injection
@@ -40,6 +44,26 @@ def valid_nut_name(name: str) -> bool:
     return bool(_NUT_NAME_RE.match(name))
 
 
+# LO-C4. `SHUTDOWNCMD "<cmd>"` is ONE directive on ONE line of the secondary's
+# /etc/nut/upsmon.conf. Only the double-quote was rejected, so a newline closed the
+# line and everything after it became a further upsmon directive of the operator's
+# choosing — e.g. `--shutdown-cmd $'sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x'`
+# installs a NOTIFYCMD on a third machine. Operator == attacker here, so this is a
+# foot-gun rather than a boundary crossing, but the check exists for exactly this
+# shape and was rejecting the narrower half of it.
+_CMD_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def valid_shutdown_cmd(cmd: str) -> bool:
+    """True iff ``cmd`` can be embedded in ``SHUTDOWNCMD "<cmd>"`` verbatim. PURE.
+
+    Rejected rather than escaped: a shutdown command is the one string on the
+    secondary that must be read exactly as written, and NUT's own parser has no
+    escape this could round-trip through.
+    """
+    return '"' not in cmd and _CMD_CTRL_RE.search(cmd) is None
+
+
 def valid_ip(value: str) -> bool:
     """True iff ``value`` is a valid IPv4/IPv6 literal. PURE."""
     try:
@@ -47,6 +71,21 @@ def valid_ip(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def valid_ipv4(value: str) -> bool:
+    """True iff ``value`` is a valid IPv**4** literal. PURE.
+
+    F2: ``ip saddr`` is nftables' IPv4 matcher — the IPv6 spelling is ``ip6
+    saddr``, and a v6 literal inside ``ip saddr { … }`` makes ``nft -f`` reject
+    the WHOLE ruleset. `valid_ip` accepts both families, so a v6 address (reachable
+    via ``monitor add --ip 2001:db8::1``, or from the ``$SSH_CONNECTION`` fallback
+    on a v6-reachable secondary) rendered a file the kernel will not load.
+    """
+    try:
+        return isinstance(ipaddress.ip_address(value.strip()), ipaddress.IPv4Address)
+    except ValueError:
+        return False
 
 
 # --- injected runner types (mirror events.Deps) -------------------------------
@@ -74,7 +113,9 @@ def _default_run_ssh(
     alias: str, command: str, stdin: str | None = None
 ) -> tuple[int, str, str]:  # pragma: no cover
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, command],
+        # BL-C1: `--` terminates OpenSSH's option parsing, so an option-shaped alias
+        # that reached here is read as a destination rather than as `-oProxyCommand=`.
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", alias, command],
         input=stdin,
         capture_output=True,
         text=True,
@@ -172,12 +213,14 @@ def render_upsmon_conf(
     The block deliberately carries no directive that would power off the UPS —
     that is primary-only (RESEARCH.md Correction #2).
 
-    ``shutdown_cmd`` is emitted inside ``SHUTDOWNCMD "<cmd>"``; a double-quote
-    would break the NUT parser or inject a second directive, so it is rejected
-    rather than escaped.
+    ``shutdown_cmd`` is emitted inside ``SHUTDOWNCMD "<cmd>"``; a double-quote or
+    any control character would break the NUT parser or inject a further directive
+    onto the secondary, so it is rejected rather than escaped (LO-C4).
     """
-    if '"' in shutdown_cmd:
-        raise ValueError("shutdown_cmd must not contain a double-quote character")
+    if not valid_shutdown_cmd(shutdown_cmd):
+        raise ValueError(
+            "shutdown_cmd must not contain a double-quote or any control character"
+        )
     lines = [
         _UPSMON_BEGIN,
         f"MONITOR {ups}@{primary} {powervalue} {user} {pw} secondary",
@@ -299,10 +342,26 @@ def render_nft_accept_rule(
     ``tcp dport <port> ip saddr { … } accept`` line at ``indent``. Empty
     ``saddrs`` → empty string (the rule is removed rather than left matching an
     empty set, which ``nft -f`` rejects).
+
+    HI-C2: every member is re-validated HERE, at the shared sink, because this
+    string is loaded by ``nft -f`` as root and a member that closes the brace can
+    append an arbitrary rule — including ``ip saddr 0.0.0.0/0 accept`` — above the
+    operator's policy drop. Refuse rather than escape: nothing but an IP literal is
+    a legitimate member.
     """
     if not saddrs:
         return ""
-    members = ", ".join(saddrs)
+    # F2: IPv4 specifically. `ip saddr` is the IPv4 matcher (the v6 spelling is
+    # `ip6 saddr`), so a v6 member does not merely fail to match — it makes
+    # `nft -f` reject the ENTIRE ruleset, which is how the operator's policy drop
+    # ends up not loading at the next boot.
+    bad = [s for s in saddrs if not valid_ipv4(s)]
+    if bad:
+        raise ValueError(
+            f"nft saddr members must be IPv4 literals (this is an 'ip saddr' set, "
+            f"not 'ip6 saddr'); got {bad!r}"
+        )
+    members = ", ".join(s.strip() for s in saddrs)
     return (
         f"{indent}{_NFT_BEGIN}\n"
         f"{indent}tcp dport {port} ip saddr {{ {members} }} accept "
@@ -471,8 +530,16 @@ def verify_secondary(
     ``ups`` and ``primary`` are interpolated into a remote shell command, so
     they are re-validated at this sink (config-sourced values reach here without
     passing the argparse boundary): a bad ``ups`` name or ``primary`` IP is
-    refused with ``(False, reason)`` rather than executed.
+    refused with ``(False, reason)`` rather than executed. BL-C1: ``alias`` is now
+    re-validated here too. The docstring used to say it was NOT, which made every
+    caller the only checkpoint — and `monitor verify`/`monitor remove` were checking
+    the other field.
     """
+    if alias.strip() and not valid_ssh_alias(alias):
+        # A BLANK alias is a different defect (there is no host to probe) and is left
+        # to the runner to fail on, exactly as it does today; this guard is about a
+        # value that ssh would read as an option.
+        return False, f"invalid ssh alias: {alias!r}"
     if not valid_nut_name(ups):
         return False, f"invalid UPS name: {ups!r}"
     if not valid_ip(primary):
@@ -539,7 +606,23 @@ def apply_nft(
     conf.write_text(new_text)
     rc, out, err = run_nft(reload_path or path)
     if rc != 0:
-        return rc, out, err
+        # F2: the write happened BEFORE `nft -f` got to judge it, so a rejected
+        # ruleset used to be left on disk permanently. `nft -f` is atomic, so the
+        # RUNNING ruleset is untouched by a failed load — but `nftables.service`
+        # reads this file at boot, so the next reboot came up with the operator's
+        # policy-drop chain not loaded at all. Roll the file back to exactly what
+        # was read, so a failed reload changes nothing anywhere.
+        try:
+            conf.write_text(text)
+        except OSError as exc:  # pragma: no cover — the read above already succeeded
+            return rc, out, (
+                f"{err}\nCRITICAL: could not restore {path} after a failed nft reload "
+                f"({exc}); that file will not load at boot — restore it by hand"
+            )
+        return rc, out, (
+            f"{err}\n{path} was restored to its previous contents; the running "
+            f"ruleset is unchanged (nft -f is atomic)"
+        )
     restart_bouncer()
     return 0, out, err
 

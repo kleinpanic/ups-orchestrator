@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
+import textwrap
 import time
 from pathlib import Path
 
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, ConfigNotice, is_disarming, safe_text
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
@@ -28,6 +30,27 @@ _GAUGE_W = 14
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
+# MED-06. Everything this module prints that came from the config is operator-authored
+# free text — a machine name, a device path, an ssh alias, a UPS label — and JSON can
+# encode any control character as \uXXXX. `_ANSI_RE` matches only SGR sequences, so
+# `_vlen` neither strips nor accounts for anything else, and a subject of
+# "mt\x1b[2J\x1b[H" clears the screen and homes the cursor: a machine name erasing the
+# degrade banner that is reporting on it. The phase already treats config as a
+# value-injection boundary (T-02-10 hardened `ssh` for exactly this), so sanitise once
+# at the render boundary rather than at each call site. ESC is included, which is what
+# neutralises every non-SGR sequence as well.
+# F5: the regex itself now lives in `config.safe_text`, at the bottom of the import
+# graph, because `config`, `cli` and `webui` all render the same strings — and three
+# copies of one rule is exactly how LO-C5 shipped, with the degrade banner sanitised
+# and the `monitor list` line four lines above it not. This name is kept as the local
+# spelling every call site in this module already uses.
+_safe = safe_text
+
+
+def _term_width() -> int:
+    """Usable terminal width, with a sane floor for a pipe or a tiny window."""
+    return max(40, shutil.get_terminal_size(fallback=(80, 24)).columns)
+
 
 def _vlen(text: str) -> int:
     """Visible length — the printable width once ANSI colour codes are stripped."""
@@ -35,8 +58,17 @@ def _vlen(text: str) -> int:
 
 
 def _panel(title: str, title_vlen: int, lines: list[str], *, use_color: bool) -> list[str]:
-    """Box a card's content lines under a titled top border, ANSI-width aware."""
+    """Box a card's content lines under a titled top border, ANSI-width aware.
+
+    MED-05: ``inner`` is capped at the terminal width. Uncapped, the box was sized to
+    its longest line — and the degrade messages are deliberately ~500 characters — so
+    an 80-column terminal wrapped every line into ~8 rows, destroying the box drawing,
+    pushing the UPS cards off screen, and desynchronising ``run(watch=True)``, which
+    assumes one logical line is one terminal row. Callers pre-wrap; the cap is the
+    backstop.
+    """
     inner = max([title_vlen, *(_vlen(x) for x in lines)]) if lines else title_vlen
+    inner = min(inner, _term_width() - 4)
     tl, tr, bl, br, h, v = (
         ("╭", "╮", "╰", "╯", "─", "│") if use_color else ("+", "+", "+", "+", "-", "|")
     )  # noqa: E501
@@ -151,6 +183,41 @@ def _card(
     return ["", *_panel(title, _vlen(title), inner, use_color=use_color)]
 
 
+def _degraded_block(degraded: tuple[ConfigNotice, ...], *, use_color: bool) -> list[str]:
+    """Render every load-time degrade notice above the per-UPS cards.
+
+    A disarmed shutdown authority is a standing condition, not a footnote — this is
+    what makes RA-01's degrade visible without opening a terminal to run
+    ``monitor list``. Returns no lines at all when ``degraded`` is empty, so a
+    healthy config's status output is unchanged.
+    """
+    if not degraded:
+        return []
+
+    def c(text: str, code: str) -> str:
+        return f"{code}{text}{_RESET}" if use_color else text
+
+    title = c("⚠ DEGRADED CONFIG", _RED)
+    # MED-05: wrap rather than widen. MED-06: sanitise the two config-authored fields
+    # before they reach the terminal.
+    width = _term_width() - 4
+    lines = []
+    for n in degraded:
+        disarming = is_disarming(n)
+        label = "ERROR" if disarming else "ADVISORY"
+        color = _RED if disarming else _YELLOW
+        text = f"{label} {_safe(n.subject)}: {_safe(n.message)}"
+        wrapped = textwrap.wrap(text, width=width, subsequent_indent="  ") or [text]
+        # Only the label is coloured, and only where it survived the wrap intact —
+        # colouring a fragment would leave an unterminated escape on the next row.
+        head, *rest = wrapped
+        if head.startswith(label):
+            head = c(label, color) + head[len(label) :]
+        lines.append(head)
+        lines.extend(rest)
+    return ["", *_panel(title, _vlen(title), lines, use_color=use_color)]
+
+
 def render(
     cfg: Config, *, color: bool = True, now: float | None = None, sample_path: Path | None = None
 ) -> str:
@@ -159,9 +226,12 @@ def render(
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
     header = f"⚡ UPS Orchestrator — {ts}"
     lines = [f"{_BOLD}{header}{_RESET}" if color else header]
+    lines.extend(_degraded_block(cfg.degraded, use_color=color))
     for name, ups in cfg.upses.items():
         snap = read_snapshot(name)
-        lines.extend(_card(ups.label, snap, _recent_watts(sample_path, name, now), use_color=color))
+        lines.extend(
+            _card(_safe(ups.label), snap, _recent_watts(sample_path, name, now), use_color=color)
+        )
     if not cfg.upses:
         lines.append(f"{_DIM}(no UPSes configured){_RESET}" if color else "(no UPSes configured)")
     return "\n".join(lines)

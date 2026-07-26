@@ -44,3 +44,9 @@ mutants/
 
 # opencode CLI runtime state (from cross-AI reviews)
 .opencode/
+
+# Agent harness scratch: `.claude/worktrees/` holds throwaway git worktrees whose
+# working copies are mid-edit by definition. Untracked but not ignored, they were
+# being walked by `ruff check .` (make lint), so an unrelated agent's half-written
+# file failed the repo's own lint gate.
+.claude/

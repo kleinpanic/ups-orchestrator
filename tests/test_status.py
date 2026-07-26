@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
+import os
+
 from conftest import make_ups
 from ups_orchestrator import status
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, ConfigNotice
 from ups_orchestrator.nut import UpsSnapshot
 
 
@@ -81,6 +84,52 @@ def test_panel_ascii_fallback_when_no_color() -> None:
     assert all("\033[" not in x for x in lines)
 
 
+def test_status_healthy_config_has_no_degraded_block(monkeypatch) -> None:
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert "DEGRADED" not in rendered
+
+
+def test_status_shows_error_and_advisory_notices(monkeypatch) -> None:
+    degraded = (
+        ConfigNotice(severity="error", subject="mt", message="no serial device — disarmed"),
+        ConfigNotice(severity="advisory", subject="spark", message="shutdown_cmd needs sudo"),
+    )
+    cfg = Config(
+        webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded
+    )
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert "DEGRADED" in rendered
+    assert "ERROR" in rendered and "mt" in rendered and "no serial device — disarmed" in rendered
+    assert "ADVISORY" in rendered and "spark" in rendered and "shutdown_cmd needs sudo" in rendered
+
+
+def test_status_degraded_block_appears_before_first_ups_card(monkeypatch) -> None:
+    degraded = (ConfigNotice(severity="error", subject="mt", message="disarmed"),)
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert rendered.index("DEGRADED") < rendered.index("Test ups1")
+
+
+def test_status_degraded_block_no_color_has_no_escape_codes(monkeypatch) -> None:
+    degraded = (
+        ConfigNotice(severity="error", subject="mt", message="disarmed"),
+        ConfigNotice(severity="advisory", subject="spark", message="needs sudo"),
+    )
+    cfg = Config(webhook_url="", upses={}, degraded=degraded)
+    rendered = status.render(cfg, color=False, now=0)
+    assert "\033[" not in rendered
+
+
 def test_battery_and_load_gauge_colors_by_threshold() -> None:
     assert status._battery_color(100) == status._GREEN
     assert status._battery_color(45) == status._YELLOW
@@ -91,3 +140,95 @@ def test_battery_and_load_gauge_colors_by_threshold() -> None:
     assert status._load_color("HIGH") == status._YELLOW
     assert status._load_color("CRIT") == status._RED
     assert status._load_color("OVER") == status._RED
+
+
+# --- MED-05 / MED-06: the degrade panel must stay readable and inert -----------
+
+
+def _force_80_columns(monkeypatch) -> None:
+    """Pin the rendered width, so the assertions do not depend on the runner's tty."""
+    monkeypatch.setattr(
+        status.shutil, "get_terminal_size", lambda fallback=(80, 24): os.terminal_size((80, 24))
+    )
+
+_LONG = (
+    "governed by BOTH shutdown regimes: declared shutdown_method='native' and also an "
+    "enabled shutdown_target 'mt' on UPS 'cyberpower'. The legacy target has been "
+    "disabled. This machine remains ARMED and is now the single surviving authority — "
+    "its own upsmon halts it on this primary's FSD and lives in that box's /etc, so no "
+    "config change here can disarm it. Run 'monitor verify mt' to check that secondary."
+)
+
+
+def test_degraded_panel_wraps_instead_of_widening(monkeypatch) -> None:
+    # MED-05. `_panel` sized the box to its longest line with no cap, and the notice
+    # messages are deliberately ~500 characters, so the block rendered 600+ columns
+    # wide: on an 80-column terminal every line wrapped into ~8 rows, the box drawing
+    # was destroyed, the UPS cards were pushed off screen, and `status --watch` — which
+    # assumes one logical line is one terminal row — ghosted every frame.
+    _force_80_columns(monkeypatch)
+    cfg = Config(
+        webhook_url="",
+        upses={},
+        degraded=(ConfigNotice(severity="error", subject="mt", message=_LONG),),
+    )
+
+    lines = status.render(cfg, color=False, now=0).split("\n")
+
+    assert max(status._vlen(x) for x in lines) <= 80
+    assert _LONG.split(". ")[0] not in "\n".join(lines)  # it was wrapped, not truncated
+    assert "monitor verify mt" in " ".join(x.strip("| ") for x in lines)  # nothing lost
+
+
+def test_degraded_panel_borders_still_align_after_wrapping(monkeypatch) -> None:
+    _force_80_columns(monkeypatch)
+    cfg = Config(
+        webhook_url="",
+        upses={},
+        degraded=(
+            ConfigNotice(severity="error", subject="mt", message=_LONG),
+            ConfigNotice(severity="advisory", subject="spark", message="short one"),
+        ),
+    )
+
+    block = [x for x in status.render(cfg, color=False, now=0).split("\n") if x.strip()]
+    boxed = [x for x in block if x.startswith(("+", "|"))]
+
+    assert len({status._vlen(x) for x in boxed}) == 1
+
+
+def test_control_characters_in_a_notice_are_neutralised() -> None:
+    # MED-06. `_ANSI_RE` matches only SGR sequences, so `_vlen` neither strips nor
+    # accounts for any other escape, and the subject/message are operator-authored:
+    # JSON can encode any control character as \uXXXX. A machine named
+    # "mt\x1b[2J\x1b[H" printed raw clears the screen and homes the cursor — a machine
+    # name erasing the degrade banner that is reporting on it.
+    cfg = Config(
+        webhook_url="",
+        upses={},
+        degraded=(
+            ConfigNotice(severity="error", subject="mt\x1b[2J\x1b[H", message="pwned\x07"),
+        ),
+    )
+
+    rendered = status.render(cfg, color=False, now=0)
+
+    assert "\x1b" not in rendered
+    assert "\x07" not in rendered
+    assert "mt?[2J?[H" in rendered  # neutralised, not silently dropped
+
+
+def test_control_characters_in_a_ups_label_are_neutralised(monkeypatch) -> None:
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    ups = make_ups("ups1")
+    cfg = Config(
+        webhook_url="",
+        upses={"ups1": dataclasses.replace(ups, label="CP\x1b[2J")},
+    )
+
+    rendered = status.render(cfg, color=False, now=0)
+
+    assert "\x1b" not in rendered
+    assert "CP?[2J" in rendered

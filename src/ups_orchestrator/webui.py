@@ -9,6 +9,7 @@ lives only in the environment).
 
 from __future__ import annotations
 
+import html
 import json
 import time
 from contextlib import suppress
@@ -49,7 +50,11 @@ def status_payload(cfg: Config, *, now: float | None = None) -> dict[str, object
                 "test_result": s.test_result,
             }
         )
-    return {"time": now, "upses": upses}
+    degraded = [
+        {"severity": n.severity, "subject": n.subject, "message": n.message}
+        for n in cfg.degraded
+    ]
+    return {"time": now, "upses": upses, "degraded": degraded}
 
 
 def history_payload(
@@ -83,7 +88,7 @@ def make_handler(cfg: Config, sample_path: Path) -> type[BaseHTTPRequestHandler]
         def do_GET(self) -> None:  # noqa: N802 — stdlib naming
             route = urlparse(self.path)
             if route.path in ("/", "/index.html"):
-                body = _INDEX_HTML.encode()
+                body = _render_page(cfg).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -119,6 +124,28 @@ def serve(
         server.server_close()
 
 
+def _degraded_banner_html(cfg: Config) -> str:
+    """Server-rendered degrade banner, empty when ``cfg.degraded`` is empty.
+
+    ``Config`` is frozen and set once at ``serve()`` startup, so this is not a live
+    view — it reflects the same load-time notices ``status.render`` shows, rendered
+    once per page fetch so the operator sees it without opening a terminal.
+    """
+    if not cfg.degraded:
+        return ""
+    items = "".join(
+        f'<div class="item"><span class="sev {html.escape(n.severity)}">{html.escape(n.severity)}'
+        f'</span><span class="subj">{html.escape(n.subject)}</span>: {html.escape(n.message)}</div>'
+        for n in cfg.degraded
+    )
+    return f'<div class="degraded" id="degraded">{items}</div>'
+
+
+def _render_page(cfg: Config) -> str:
+    """The served ``/`` page, with the degrade banner substituted for ``cfg``."""
+    return _INDEX_HTML.replace("<!--DEGRADED_BANNER-->", _degraded_banner_html(cfg))
+
+
 # All UPS-supplied strings (label/status/alarm/test_result) are HTML-escaped via
 # esc() before insertion, since NUT variables cross a trust boundary.
 _INDEX_HTML = """<!doctype html>
@@ -140,8 +167,16 @@ _INDEX_HTML = """<!doctype html>
  .alarm{color:#ef4444;font-weight:700}
  canvas{width:100%;height:260px;background:var(--panel);border:1px solid var(--grid);border-radius:12px}
  .chartwrap{padding:0 20px 24px}
+ .degraded{margin:14px 20px 0;border:1px solid #ef4444;border-radius:10px;padding:10px 14px;
+   background:#2a1015}
+ .degraded .item{font-size:12px;margin-top:4px}
+ .degraded .item:first-child{margin-top:0}
+ .degraded .sev{font-weight:700;text-transform:uppercase;margin-right:6px}
+ .degraded .sev.error{color:#ef4444} .degraded .sev.advisory{color:#fbbf24}
+ .degraded .subj{color:var(--muted)}
 </style></head><body>
 <header><h1>UPS Power</h1><div class="sub" id="sub">loading…</div></header>
+<!--DEGRADED_BANNER-->
 <div class="cards" id="cards"></div>
 <div class="chartwrap"><canvas id="chart" width="1200" height="260"></canvas></div>
 <script>
@@ -151,9 +186,33 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>ENT[c])}
 function num(v){return v==null?"—":Number(v)}
 function col(v,lo,hi){return v<=lo?"#ef4444":v<=hi?"#fbbf24":"#22c55e"}
 function fmtRt(s){if(s==null)return"—";return s>=3600?`${(s/3600|0)}h ${(s%3600/60|0)}m`:`${(s/60|0)}m`}
+// LO-07: the /api/status `degraded` payload was on the wire and never rendered — the
+// banner came only from the server-rendered `/`, so a dashboard left open across a
+// daemon restart showed one that was arbitrarily stale in either direction. Built with
+// textContent rather than a template string: these are config-authored values, and the
+// same standard MED-06 applies to the terminal applies here. The node is created and
+// removed rather than always present, so a healthy config still serves a page with no
+// banner in it at all.
+function degradedRow(n){
+ const row=document.createElement("div");row.className="item";
+ const sev=document.createElement("span");
+ sev.className="sev "+(n.severity==="error"?"error":"advisory");
+ sev.textContent=n.severity;
+ const sub=document.createElement("span");sub.className="subj";sub.textContent=n.subject;
+ row.append(sev,sub,document.createTextNode(": "+n.message));
+ return row;
+}
+function renderDegraded(items){
+ let el=document.getElementById("degraded");
+ if(!items||!items.length){if(el)el.remove();return}
+ if(!el){el=document.createElement("div");el.className="degraded";el.id="degraded";
+  const cards=document.getElementById("cards");cards.parentNode.insertBefore(el,cards)}
+ el.replaceChildren(...items.map(degradedRow));
+}
 async function refresh(){
  const st=await (await fetch("/api/status")).json();
  document.getElementById("sub").textContent=new Date(st.time*1000).toLocaleString()+" · live";
+ renderDegraded(st.degraded);
  const c=document.getElementById("cards"); c.innerHTML="";
  st.upses.forEach((u,i)=>{
   const nm=esc(u.label||u.name).split(" - ");

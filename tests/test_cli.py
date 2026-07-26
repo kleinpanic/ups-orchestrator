@@ -57,10 +57,11 @@ def test_status_command_renders(env_config, monkeypatch, capsys) -> None:
 
 
 def test_report_print_command(env_config, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(
-        "ups_orchestrator.report.read_snapshot",
-        lambda _n: UpsSnapshot("OL", 100, 600, 12, 120.0, realpower_nominal=900),
-    )
+    # LO-C3: this used to patch `report.read_snapshot`, which `build_report` bound
+    # as a DEFAULT ARGUMENT at def time — so the patch never took and the test
+    # spawned a real `upsc`. The armed tripwire is what surfaced it. Patch the
+    # snapshot source itself, which no default argument can capture around.
+    _fake_ups(monkeypatch, "OL", 100, 600)
     assert cli.main(["report", "--print"]) == 0
     assert "UPS load and runtime report" in capsys.readouterr().out
 
@@ -84,13 +85,13 @@ def test_boot_audit_command(env_config, monkeypatch) -> None:
 
 
 def test_notify_test_print(env_config, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("ups_orchestrator.report.read_snapshot", lambda _n: _SNAP)
+    _fake_ups(monkeypatch, "OL", 100, 600)  # see test_report_print_command (LO-C3)
     assert cli.main(["notify-test", "--print"]) == 0
     assert "delivery test" in capsys.readouterr().out.lower()
 
 
 def test_notify_test_send_without_webhook_returns_one(env_config, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("ups_orchestrator.report.read_snapshot", lambda _n: _SNAP)
+    _fake_ups(monkeypatch, "OL", 100, 600)  # see test_report_print_command (LO-C3)
     rc = cli.main(["notify-test"])  # empty webhook → NullNotifier → ok=False
     assert "configured=False" in capsys.readouterr().out
     assert rc == 1
@@ -311,3 +312,1010 @@ def test_send_dashboard_swallows_render_error(env_config, monkeypatch) -> None:
     cfg = climod._load_config()
     ok, status = climod._send_dashboard(cfg, hours=24)
     assert ok is False and status == 0  # degrades, never raises
+
+
+# =============================================================================
+# 02-03 Task 3 — `remote-shutdown [ups] [--dry-run]` and `shutdown rehearse`
+# (A-2 decisions 1 and 2; T-02-13, T-02-24, IW-07)
+#
+# Nothing here contacts a host, opens a device or writes outside tmp_path: every
+# transport is a closure on the injected `Deps` runners.
+# =============================================================================
+
+from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap  # noqa: E402
+
+_REHEARSAL = "logger -t ups-orchestrator PHASE2_REHEARSAL"
+
+
+def _dry_run_config(
+    cfg: Path,
+    *,
+    policy_enabled: bool = True,
+    require_outage: bool = False,
+    machines: list[dict] | None = None,
+    second_ups: bool = False,
+) -> None:
+    upses: dict[str, object] = {
+        "ups1": {
+            "label": "U1",
+            "shutdown_targets": [
+                {
+                    "name": "mt",
+                    "kind": "remote",
+                    "enabled": True,
+                    "host": "mt",
+                    "cmd": "sudo /sbin/shutdown -h now",
+                }
+            ],
+        }
+    }
+    if second_ups:
+        # HI-C1 needs two UPSes to tell "scoped to one" apart from "swept them all".
+        upses["ups2"] = {"label": "U2"}
+    cfg.write_text(
+        json.dumps(
+            {
+                "upses": upses,
+                "shutdown": {
+                    "enabled": policy_enabled,
+                    "require_power_outage": require_outage,
+                    "min_on_battery_seconds": 0,
+                    "external": {"enabled": True, "battery_below": 15, "runtime_below": 300},
+                    "internal": {"enabled": True, "battery_below": 10, "runtime_below": 120},
+                },
+                "monitored_machines": machines or [],
+            }
+        )
+    )
+
+
+def _fake_ups(monkeypatch, status: str, charge: int, runtime: int) -> None:
+    monkeypatch.setattr(
+        "ups_orchestrator.nut.upsc_vars",
+        lambda _n: {
+            "ups.status": status,
+            "battery.charge": str(charge),
+            "battery.runtime": str(runtime),
+        },
+    )
+
+
+# --- the _fire_target guard: the dry-run returns at the TOP (T-02-13) ---------
+
+
+def test_fire_target_dry_run_returns_before_every_side_effect() -> None:
+    from ups_orchestrator.config import ShutdownTarget
+    from ups_orchestrator.events import _fire_target
+    from ups_orchestrator.state import UpsState
+
+    logged: list[str] = []
+    target = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt", cmd="/sbin/poweroff")
+    ups = make_ups("ups1", targets=(target,), shutdown_policy=shutdown_policy())
+    notifier = FakeNotifier()
+    s = snap("OB LB", charge=5, runtime=60)
+    deps, calls = make_deps(notifier, s)
+    deps.dry_run = True
+    deps.event_log = lambda event, *_a: logged.append(event)
+    state = UpsState(onbatt_since=900)
+
+    _fire_target(ups, state, deps, target, s, "external shutdown allowed")
+
+    assert calls == []  # no runner
+    assert state.shutdowns_sent == []  # the dedupe key is not poisoned
+    assert notifier.sent == []  # no real notification
+    assert logged == []  # no event-log line
+
+
+def test_fire_target_without_dry_run_still_fires() -> None:
+    # The guard must be the flag, not an accident of the call site.
+    from ups_orchestrator.config import ShutdownTarget
+    from ups_orchestrator.events import _fire_target
+    from ups_orchestrator.state import UpsState
+
+    target = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt", cmd="/sbin/poweroff")
+    ups = make_ups("ups1", targets=(target,), shutdown_policy=shutdown_policy())
+    s = snap("OB LB", charge=5, runtime=60)
+    deps, calls = make_deps(FakeNotifier(), s)
+    state = UpsState(onbatt_since=900)
+    _fire_target(ups, state, deps, target, s, "external shutdown allowed")
+    assert calls == ["mt"] and state.shutdowns_sent == ["mt"]
+
+
+# --- remote-shutdown --dry-run: reports the gate, bypasses nothing ------------
+
+
+def test_remote_shutdown_dry_run_lists_targets_and_touches_nothing(
+    env_config, monkeypatch, capsys, tmp_path
+) -> None:
+    _dry_run_config(env_config)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    rec = _patch_recorder(monkeypatch)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "mt" in out and "ssh" in out and "sudo /sbin/shutdown -h now" in out
+    assert "would fire: yes" in out
+    assert rec.sent == []
+    assert not (tmp_path / "events.jsonl").exists()
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_remote_shutdown_dry_run_against_an_online_ups_still_lists_every_target(
+    env_config, monkeypatch, capsys
+) -> None:
+    # The old bug was a blank screen; the alternative lie was a preview implying it
+    # would fire. Neither: a FULL listing annotated with the concrete reason.
+    _dry_run_config(env_config, require_outage=True)
+    _fake_ups(monkeypatch, "OL", 100, 3600)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "mt" in out
+    assert "would fire: no" in out and "not on battery" in out
+
+
+def test_remote_shutdown_dry_run_reports_a_disabled_global_policy(
+    env_config, monkeypatch, capsys
+) -> None:
+    # The live probe found shutdown.enabled false and the docs never explaining it.
+    # This makes the disabled flag VISIBLE at the moment the operator asks.
+    _dry_run_config(env_config, policy_enabled=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "mt" in out
+    assert "would fire: no" in out and "shutdown policy disabled" in out
+
+
+def test_remote_shutdown_dry_run_lists_projected_machines(
+    env_config, monkeypatch, capsys
+) -> None:
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 9600,
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "spark" in out and "/dev/ttyUSB0" in out
+
+
+def test_remote_shutdown_appears_in_the_usage_string(capsys, caplog) -> None:
+    with caplog.at_level("ERROR"):
+        assert cli.main([]) == 0
+    assert "remote-shutdown" in caplog.text
+
+
+# --- shutdown rehearse: non-destructive BY CONSTRUCTION (T-02-24) -------------
+
+
+def _rehearse_config(cfg: Path) -> None:
+    cfg.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "pi",
+                                "kind": "local",
+                                "enabled": True,
+                                "cmd": "/sbin/poweroff",
+                            }
+                        ],
+                    }
+                },
+                # Deliberately the production state: rehearsal must work here.
+                "shutdown": {"enabled": False},
+                "monitored_machines": [
+                    {
+                        "name": "spark",
+                        "ups": "ups1",
+                        "shutdown_method": "serial",
+                        "serial_device": "/dev/ttyUSB0",
+                        "serial_baud": 9600,
+                        "shutdown_cmd": "sudo /sbin/shutdown -h now -REALHALT",
+                    },
+                    {
+                        "name": "mt",
+                        "ups": "ups1",
+                        "ssh": "mt",
+                        "shutdown_method": "ssh",
+                        "shutdown_cmd": "sudo /sbin/shutdown -h now -REALHALT",
+                    },
+                ],
+            }
+        )
+    )
+
+
+def _capture_runners(monkeypatch) -> list:
+    """Replace Deps' transport defaults with recorders, via _build_deps."""
+    seen: list = []
+    real_build = cli._build_deps
+
+    def _build(cfg, **kw):  # noqa: ANN001
+        deps = real_build(cfg, **kw)
+        deps.serial_shutdown = lambda t: (seen.append(("serial", t)), (0, "", ""))[1]
+        deps.ssh_shutdown = lambda t: (seen.append(("ssh", t)), (0, "", ""))[1]
+        deps.local_shutdown = lambda c: (seen.append(("local", c)), (0, "", ""))[1]
+        return deps
+
+    monkeypatch.setattr(cli, "_build_deps", _build)
+    return seen
+
+
+def test_rehearse_sends_the_hardcoded_logger_command_over_serial(
+    env_config, monkeypatch, capsys, tmp_path
+) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 0
+    assert len(seen) == 1
+    kind, target = seen[0]
+    assert kind == "serial"
+    assert target.cmd == _REHEARSAL
+    assert '"' not in target.cmd  # quote-free, like _monitor_add demands
+    assert target.device == "/dev/ttyUSB0" and target.baud == 9600
+    out = capsys.readouterr().out
+    assert "/dev/ttyUSB0" in out and "9600" in out
+    assert "REALHALT" not in out  # the persisted shutdown_cmd is never read
+    assert not (tmp_path / "state.json").exists()  # persists NOTHING
+
+
+def test_rehearse_never_carries_the_persisted_shutdown_cmd(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 0
+    _kind, target = seen[0]
+    assert target.cmd == _REHEARSAL
+    assert "REALHALT" not in target.cmd
+
+
+def test_rehearse_works_with_the_global_shutdown_policy_disabled(env_config, monkeypatch) -> None:
+    # A-2 decision 2: gating this on `shutdown.enabled` would make it unusable in
+    # exactly the state production is in — which is the state it exists to be used
+    # in. Its safety is that the command cannot halt anything, not a policy flag.
+    _rehearse_config(env_config)
+    assert json.loads(env_config.read_text())["shutdown"]["enabled"] is False
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 0
+    assert seen
+
+
+def test_rehearse_refuses_a_local_target(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "pi"]) == 2
+    assert seen == []
+
+
+def test_rehearse_requires_an_explicit_machine_name(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["shutdown", "rehearse"])  # never a sweep
+    assert seen == []
+
+
+def test_rehearse_refuses_an_unknown_machine(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "ghost"]) == 2
+
+
+def test_rehearse_refuses_a_machine_with_no_push_transport(env_config, monkeypatch) -> None:
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {"ups1": {"label": "U1"}},
+                "monitored_machines": [
+                    {"name": "spark", "ups": "ups1", "ssh": "spark", "shutdown_method": "native"}
+                ],
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 2
+    assert seen == []
+
+
+def test_rehearse_refuses_an_option_shaped_legacy_user(env_config, monkeypatch) -> None:
+    # HI-C3. `ssh_dest` builds f"{user}@{host}", so validating `host` alone left the
+    # argv element that actually reaches ssh unchecked. `_rehearsal_target` also
+    # force-enables the target, so a DISABLED legacy target is a live ssh sink here.
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "legacy",
+                                "kind": "remote",
+                                "enabled": False,
+                                "host": "box",
+                                "user": "-oProxyCommand=touch /tmp/pwn",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+
+    assert cli.main(["shutdown", "rehearse", "legacy"]) == 2
+    assert seen == []
+
+
+def test_rehearse_still_accepts_an_ordinary_user_at_host(env_config, monkeypatch) -> None:
+    # `_SSH_ALIAS_RE` permits the user@host shape, so the tighter check must not
+    # refuse a legitimate operator spelling.
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "legacy",
+                                "kind": "remote",
+                                "enabled": True,
+                                "host": "box",
+                                "user": "root",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+
+    assert cli.main(["shutdown", "rehearse", "legacy"]) == 0
+    assert [kind for kind, _t in seen] == ["ssh"]
+
+
+# --- IW-07: a failing projected push must not deadlock the local target -------
+
+
+def test_a_failing_projected_push_still_lets_the_local_target_fire() -> None:
+    # `local` targets are held until every enabled remote is in `shutdowns_sent`,
+    # and `_fire_target` appends REGARDLESS of rc. That append is what makes the
+    # hold undeadlockable — pinned here so nobody later "fixes" the ordering by
+    # removing it and starves the watcher Pi's own poweroff behind a dead cable.
+    from ups_orchestrator.config import MonitoredMachine, ShutdownTarget
+    from ups_orchestrator.events import _run_shutdown_targets
+    from ups_orchestrator.state import UpsState
+
+    machine = MonitoredMachine(
+        name="spark",
+        ups="ups1",
+        shutdown_method="serial",
+        serial_device="/dev/ttyUSB0",
+        serial_baud=9600,
+        shutdown_cmd="sudo /sbin/shutdown -h now",
+    )
+    local = ShutdownTarget(name="pi", kind="local", enabled=True, cmd="/sbin/poweroff")
+    ups = make_ups(
+        "ups1",
+        targets=(local,),
+        shutdown_policy=shutdown_policy(internal_enabled=True),
+    )
+    s = snap("OB LB", charge=5, runtime=60)
+    deps, calls = make_deps(FakeNotifier(), s, serial_rc=1, monitored_machines=(machine,))
+    state = UpsState(onbatt_since=900)
+    _run_shutdown_targets(ups, state, deps, s)
+    assert calls == ["spark", "local"], "the local target starved behind a failing push"
+
+
+# --- preview verdicts for targets the firing path would never reach -----------
+
+
+def test_preview_annotates_a_disabled_target_without_implying_a_battery_wait(
+    env_config, monkeypatch, capsys
+) -> None:
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {"name": "mt", "enabled": False, "host": "mt", "cmd": "/sbin/poweroff"}
+                        ],
+                    }
+                },
+                "shutdown": {"enabled": True, "external": {"enabled": True}},
+            }
+        )
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "would fire: no — target not enabled" in out
+
+
+def test_preview_annotates_a_target_disarmed_at_load(env_config, monkeypatch, capsys) -> None:
+    # A blank host is unfireable, so 02-06 disables the target. The preview must say
+    # so rather than reporting the UPS's charge state as the reason.
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {"name": "mt", "enabled": True, "host": "", "cmd": "/sbin/poweroff"}
+                        ],
+                    }
+                },
+                "shutdown": {"enabled": True, "external": {"enabled": True}},
+            }
+        )
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    assert "disarmed at load" in capsys.readouterr().out
+
+
+def test_preview_reports_a_ups_with_no_resolved_targets(env_config, monkeypatch, capsys) -> None:
+    _fake_ups(monkeypatch, "OL", 100, 3600)
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    assert "no shutdown targets resolved" in capsys.readouterr().out
+
+
+def test_preview_skips_an_unconfigured_ups(env_config, monkeypatch, caplog) -> None:
+    _fake_ups(monkeypatch, "OL", 100, 3600)
+    with caplog.at_level("WARNING"):
+        assert cli.main(["remote-shutdown", "ghost", "--dry-run"]) == 0
+    assert "unconfigured UPS" in caplog.text
+
+
+def test_remote_shutdown_without_dry_run_takes_the_real_event_route(
+    env_config, monkeypatch
+) -> None:
+    _dry_run_config(env_config, policy_enabled=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    rec = _patch_recorder(monkeypatch)
+    assert cli.main(["remote-shutdown", "ups1"]) == 0
+    # handle_remote_shutdown short-circuits on the disabled policy and says so.
+    assert any("skipped" in n.title for n in rec.sent)
+
+
+def test_remote_shutdown_dry_run_returns_1_when_the_config_cannot_be_loaded(
+    env_config,
+) -> None:
+    env_config.write_text("{ not json")
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 1
+
+
+# --- rehearse: the refusals ---------------------------------------------------
+
+
+def test_shutdown_verb_without_rehearse_is_rc2(env_config, caplog) -> None:
+    with caplog.at_level("ERROR"):
+        assert cli.main(["shutdown"]) == 2
+        assert cli.main(["shutdown", "now"]) == 2
+    assert "shutdown rehearse" in caplog.text
+
+
+def test_rehearse_returns_1_when_the_config_cannot_be_loaded(env_config) -> None:
+    env_config.write_text("{ not json")
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 1
+
+
+def _one_machine_config(cfg: Path, machine: dict) -> None:
+    cfg.write_text(
+        json.dumps({"upses": {"ups1": {"label": "U1"}}, "monitored_machines": [machine]})
+    )
+
+
+def test_rehearse_refuses_a_serial_record_with_no_device(env_config, monkeypatch) -> None:
+    _one_machine_config(
+        env_config,
+        {"name": "spark", "ups": "ups1", "shutdown_method": "serial", "serial_baud": 9600},
+    )
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 2
+    assert seen == []
+
+
+def test_rehearse_refuses_to_guess_a_baud(env_config, monkeypatch, caplog) -> None:
+    _one_machine_config(
+        env_config,
+        {
+            "name": "spark",
+            "ups": "ups1",
+            "shutdown_method": "serial",
+            "serial_device": "/dev/ttyUSB0",
+            "serial_baud": "fast",
+        },
+    )
+    seen = _capture_runners(monkeypatch)
+    with caplog.at_level("ERROR"):
+        assert cli.main(["shutdown", "rehearse", "spark"]) == 2
+    assert "9600" in caplog.text
+    assert seen == []
+
+
+def test_rehearse_refuses_an_option_shaped_ssh_alias(env_config, monkeypatch) -> None:
+    # The alias is config-sourced and becomes an argv element; validate at the sink.
+    _one_machine_config(
+        env_config,
+        {"name": "mt", "ups": "ups1", "ssh": "-oProxyCommand=id", "shutdown_method": "ssh"},
+    )
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 2
+    assert seen == []
+
+
+def test_rehearse_reports_a_transport_failure_as_rc1(env_config, monkeypatch, capsys) -> None:
+    _one_machine_config(
+        env_config, {"name": "mt", "ups": "ups1", "ssh": "mt", "shutdown_method": "ssh"}
+    )
+    real_build = cli._build_deps
+
+    def _build(cfg, **kw):  # noqa: ANN001
+        deps = real_build(cfg, **kw)
+        deps.ssh_shutdown = lambda _t: (255, "", "no route to host")
+        return deps
+
+    monkeypatch.setattr(cli, "_build_deps", _build)
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_rehearse_resolves_a_legacy_serial_shutdown_target(env_config, monkeypatch) -> None:
+    # Not every rehearsable transport is a monitored machine; a legacy serial
+    # target is the shape that makes the local-target refusal non-vacuous.
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "mt",
+                                "kind": "serial",
+                                "enabled": False,
+                                "device": "/dev/ttyUSB1",
+                                "baud": 9600,
+                                "cmd": "sudo /sbin/shutdown -h now -REALHALT",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 0
+    kind, target = seen[0]
+    assert kind == "serial" and target.device == "/dev/ttyUSB1"
+    assert target.cmd == _REHEARSAL and "REALHALT" not in target.cmd
+
+
+# --- HI-C1: the preview and the real command agree about SCOPE ----------------
+
+
+def test_remote_shutdown_with_no_name_is_loud_not_a_silent_success(
+    env_config, monkeypatch, caplog
+) -> None:
+    """`remote-shutdown` with no name evaluated NOTHING and returned 0.
+
+    `_cmd_event`'s `list(cfg.upses)` fallback is gated on `event == "tick"`, so the
+    manual verb resolved an empty target list, logged `No UPS name provided` and
+    reported SUCCESS — the identical "silently did nothing" bug
+    `_cmd_remote_shutdown`'s own docstring says it was written to fix, moved one
+    argument to the left. An operator who validates with `--dry-run` and then runs
+    it for real must not get a clean exit for a no-op.
+    """
+    _dry_run_config(env_config)
+    monkeypatch.delenv("UPSNAME", raising=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    with caplog.at_level("ERROR"):
+        rc = cli.main(["remote-shutdown"])
+
+    assert rc == 2
+    assert "No UPS name provided" in caplog.text
+
+
+def test_nut_event_route_with_no_name_still_exits_zero(env_config, monkeypatch, caplog) -> None:
+    """The other half: a non-zero exit on the NUT route wedges upssched's pipeline.
+
+    `deploy/upssched-cmd.sh` invokes onbatt/lowbatt/remote_shutdown, so the two
+    callers genuinely need different answers — which is why the loudness is keyed
+    on the caller and not on the event name.
+    """
+    _dry_run_config(env_config)
+    monkeypatch.delenv("UPSNAME", raising=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    with caplog.at_level("ERROR"):
+        assert cli.main(["remote_shutdown"]) == 0
+    assert "No UPS name provided" in caplog.text
+
+
+def test_remote_shutdown_dry_run_honours_upsname_like_the_real_path(
+    env_config, monkeypatch, capsys
+) -> None:
+    """The preview read `args.ups` directly and never consulted `$UPSNAME`.
+
+    Under `upssched` — the only place `$UPSNAME` is set — the preview therefore
+    reported every configured UPS while the real run touched exactly one.
+    """
+    _dry_run_config(env_config, second_ups=True)
+    monkeypatch.setenv("UPSNAME", "ups2")
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "(ups2)" in out
+    assert "(ups1)" not in out, "the preview must scope to $UPSNAME the way the real path does"
+
+
+def test_remote_shutdown_dry_run_states_that_a_real_run_would_refuse(
+    env_config, monkeypatch, capsys
+) -> None:
+    """The one remaining asymmetry is printed rather than left for the operator.
+
+    Sweeping every UPS is still the useful answer to "what is configured?", but
+    the real command with no name evaluates nothing and exits 2. Saying so is what
+    stops the preview from promising what the real command will not do.
+    """
+    _dry_run_config(env_config)
+    monkeypatch.delenv("UPSNAME", raising=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "$UPSNAME is unset" in out
+    assert "exits 2" in out
+
+
+# --- F1: a degraded config must not kill the daemon through the notifier -------
+
+
+def test_watch_survives_a_degraded_config_with_a_malformed_webhook_url(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """The whole premise of RA-01, defeated through the notification path.
+
+    `_notify_degraded` is the ONE `notifier.send` on the daemon's startup path
+    outside every guard, and it fires ONLY when the config is degraded. A
+    malformed webhook URL made `urllib.request.Request` raise ValueError — not an
+    OSError, so uncaught — so `watch` never reached its poll loop and exited 1,
+    `Restart=always` respawned it, and the box monitored NOTHING in a permanent
+    restart loop.
+
+    RA-01 replaced hard-fail with degrade-and-disarm precisely so a bad config
+    could not stop monitoring. This is the regression test for that promise.
+    """
+    secret = "TOKENabcdef0123456789"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "discord_webhook_url": f"https//discord.com/api/webhooks/1/{secret}",  # no colon
+                "upses": {"ups1": {"label": "U1"}},
+                # A serial record with a blank `ups` is disarmed at load, so
+                # `cfg.degraded` is non-empty and `_notify_degraded` fires.
+                "monitored_machines": [
+                    {
+                        "name": "spark",
+                        "ups": "",
+                        "shutdown_method": "serial",
+                        "serial_device": "/dev/ttyUSB0",
+                        "serial_baud": 9600,
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.delenv("UPS_DISCORD_WEBHOOK", raising=False)  # the file value must win
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(cfg))
+    monkeypatch.setenv("UPS_ORCH_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(tmp_path / "notify.jsonl"))
+    monkeypatch.setattr(cli, "dispatch", lambda *_a, **_k: None)
+
+    ticks = {"n": 0}
+
+    def _stop_after_one_tick(_secs: float) -> None:
+        ticks["n"] += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", _stop_after_one_tick)
+
+    with caplog.at_level("WARNING"), pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+
+    assert ticks["n"] == 1, "watch must reach its poll loop despite the degrade + bad webhook"
+    assert secret not in caplog.text, "a webhook token must never reach the journal"
+
+
+def test_watch_notification_log_never_records_the_webhook_token(monkeypatch, tmp_path) -> None:
+    """`AuditedNotifier` persists `DeliveryResult.error` to notifications.jsonl.
+
+    So an unredacted transport error puts the credential on DISK, not just in the
+    journal — and that file outlives the process.
+    """
+    secret = "TOKENabcdef0123456789"
+    url = f"https://discord.example.invalid/api/webhooks/1/{secret}"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"discord_webhook_url": url, "upses": {"ups1": {"label": "U1"}}}))
+    log = tmp_path / "notify.jsonl"
+    monkeypatch.delenv("UPS_DISCORD_WEBHOOK", raising=False)
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(cfg))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(log))
+
+    import urllib.error
+
+    import ups_orchestrator.notify as notify_mod
+
+    monkeypatch.setattr(notify_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        notify_mod.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(urllib.error.URLError(f"cannot reach {url}")),
+    )
+
+    _fake_ups(monkeypatch, "OL", 100, 600)
+    assert cli.main(["notify-test"]) == 1
+    assert secret not in log.read_text()
+
+
+# --- HI-C4: the preview must show the machines that will NOT fire -------------
+
+
+def test_dry_run_shows_a_machine_disarmed_at_load(env_config, monkeypatch, capsys) -> None:
+    """The one machine the operator is asking about was the one omitted.
+
+    `_machine_targets` reads `effective_method`, so a machine `Config.load`
+    disarmed resolves to `"none"` and hits its bare `else: continue` — no target,
+    and (unlike the baud and duplicate-name cases) no `_report_unprojectable`
+    call. `_resolved_targets` passes no `deps` either, so even the cases that DO
+    report are reduced to a `LOG.error` this command never shows. The machine
+    appeared nowhere: not as a line, not as a verdict, not on stderr.
+    """
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": "fast",  # unparseable -> disarmed at load
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "spark" in out
+    assert "would fire: no" in out
+    assert "disarmed at load" in out
+    assert "monitor verify spark" in out
+
+
+def test_dry_run_carries_the_degraded_config_block(env_config, monkeypatch, capsys) -> None:
+    """RA-01: a degrade must reach the operator where the operator already looks.
+
+    `monitor list` renders this block. The command built to answer "what will
+    happen?" did not, so the preview's answer and the degrade explaining it lived
+    in two different commands.
+    """
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": "fast",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    assert "DEGRADED CONFIG" in capsys.readouterr().out
+
+
+def test_dry_run_distinguishes_declared_none_from_disarmed(env_config, monkeypatch, capsys) -> None:
+    """T-02-46: the same effect, two very different meanings.
+
+    A machine an operator deliberately opted out of must not read the same as one
+    a load degrade took away — which is what a bare omission made them.
+    """
+    _dry_run_config(
+        env_config,
+        machines=[
+            {"name": "optedout", "ups": "ups1", "shutdown_method": "none"},
+            {
+                "name": "broken",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": "fast",
+            },
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "optedout" in out and "carries no shutdown authority" in out
+    assert "broken" in out and "disarmed at load" in out
+
+
+def test_dry_run_explains_why_a_native_machine_is_never_pushed(
+    env_config, monkeypatch, capsys
+) -> None:
+    """`native` is a deliberate omission, and silence made it look like an oversight."""
+    _dry_run_config(
+        env_config,
+        machines=[
+            {"name": "mtnative", "ups": "ups1", "shutdown_method": "native", "ssh": "mtnative"}
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "mtnative" in out
+    assert "declared native" in out and "FSD" in out
+
+
+def test_dry_run_does_not_double_list_a_machine_that_did_project(
+    env_config, monkeypatch, capsys
+) -> None:
+    """A projected machine has a real verdict line; it must not also get a stub."""
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 9600,
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert out.count("spark") == 1
+    assert "(no target)" not in out
+
+
+# --- F5: the preview and the rehearsal are terminals too ----------------------
+
+_HOSTILE = "spark\x1b[2J\x1b[H\x07\x00"
+
+
+def test_dry_run_preview_is_sanitised(env_config, monkeypatch, capsys) -> None:
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": _HOSTILE,
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0\x1b[2J",
+                "serial_baud": 9600,
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out and "\x07" not in out and "\x00" not in out
+    assert "spark" in out  # ...and it is still identifiable
+
+
+def test_shutdown_rehearse_output_is_sanitised(env_config, monkeypatch, capsys) -> None:
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": _HOSTILE,
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0\x1b[2J",
+                "serial_baud": 9600,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "ups_orchestrator.events._default_serial_shutdown", lambda _t: (0, "", "")
+    )
+
+    cli.main(["shutdown", "rehearse", _HOSTILE])
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out and "\x07" not in out and "\x00" not in out
+
+
+# --- F6: rehearse must not dispatch an unknown target kind --------------------
+
+
+def test_rehearse_refuses_a_target_with_an_unknown_kind(env_config, monkeypatch, caplog) -> None:
+    """`validate_legacy_targets` disarms an unknown kind for a specific reason.
+
+    Its own docstring: "dispatch treats anything not local and not serial as SSH,
+    so an unknown kind becomes a silent ssh attempt against whatever `host`
+    happens to hold." `_rehearsal_target` force-enables the target, so this verb
+    reached exactly the dispatch that rule exists to prevent.
+
+    The rehearsal command cannot halt a box — but it can still open a connection
+    to whatever is in `host`, and a rule that holds everywhere except from one
+    verb is not a rule.
+    """
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "weird",
+                                "kind": "smtp",  # none of remote/serial/local
+                                "enabled": False,
+                                "host": "attacker.example",
+                                "cmd": "sudo /sbin/shutdown -h now",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        rc = cli.main(["shutdown", "rehearse", "weird"])
+
+    assert rc == 2
+    assert seen == [], "an unknown kind must not be dispatched as ssh"
+    assert "none of remote/serial/local" in caplog.text
+
+
+def test_rehearse_still_works_for_a_known_remote_kind(env_config, monkeypatch, capsys) -> None:
+    """Guard on the F6 fix: the legitimate legacy path is untouched."""
+    _dry_run_config(env_config)
+    seen = _capture_runners(monkeypatch)
+
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 0
+    assert [kind for kind, _t in seen] == ["ssh"]
+    assert seen[0][1].cmd == _REHEARSAL
+    assert "PHASE2_REHEARSAL" in capsys.readouterr().out
