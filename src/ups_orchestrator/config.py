@@ -1166,13 +1166,27 @@ def dual_regime_pairs(
     Fail-closed — a typo must widen the scan, never silence it. Matching is
     case-insensitive on the machine name and canonicalised on the UPS name (HI-03).
     It raises nothing.
+
+    The scope rule, and why it is not uniform. A ``serial``/``ssh`` push is projected by
+    ``events._machine_targets`` only onto the UPS the machine names, so it IS keyed to a
+    power domain: a same-named enabled target on a DIFFERENT UPS fires on a different
+    outage and is genuinely not a second authority over the same event. A ``native``
+    authority is the opposite — it lives in the remote box's own ``upsmon`` and fires on
+    THIS primary's FSD, so it is keyed to no UPS in this file at all. Scoping a native
+    machine to its declared ``ups`` therefore hides a real double-shutdown: the legacy
+    target pushes on UPS-A's outage while the remote secondary independently self-halts.
+    A declared-``native`` machine is scanned against EVERY configured UPS for that
+    reason; the push case keeps the narrow, correct scope.
     """
     index, _collisions = canonical_ups_index(upses)
     pairs: list[tuple[str, str, str]] = []
     for m in monitored_machines:
         key = canonical_ups_key(m.ups)
         match = index.get(key) if key else None
-        scope: tuple[UpsConfig, ...] = (match,) if match is not None else tuple(upses.values())
+        native = m.shutdown_method.strip().lower() == "native"
+        scope: tuple[UpsConfig, ...] = (
+            (match,) if match is not None and not native else tuple(upses.values())
+        )
         name_key = m.name.strip().casefold()
         for ups in scope:
             for t in ups.shutdown_targets:
@@ -1240,7 +1254,8 @@ def dual_regime_conflicts(
     Matching is case-insensitive on the machine name AND canonicalised on the UPS name
     (the earlier docstring advertised the former and was silent about the latter, which
     is exactly the gap HI-03 exploited). A machine whose ``ups`` is blank or
-    unresolvable is scanned against every UPS rather than skipped (BL-01).
+    unresolvable is scanned against every UPS rather than skipped (BL-01), and so is a
+    machine declaring ``native``, whose authority is not keyed to any UPS in this file.
     """
     seen: dict[str, None] = {}
     for machine_name, _ups_key, _target_name in dual_regime_pairs(monitored_machines, upses):
@@ -1387,9 +1402,29 @@ def _apply_degrades(
             # produced the mirror of this phase's target failure: an operator told a
             # still-protected box is unprotected, plus a cosmetic "none" that would have
             # let 02-03's guard permit a native->push switch over a live remote upsmon.
+            declared_ups = working[hits[0]].ups
+            # A blank/unresolvable ups is BL-01's widening, not a cross-UPS finding —
+            # there is no "different UPS" to name, so say nothing extra.
+            cross = bool(declared_ups.strip()) and canonical_ups_key(
+                declared_ups
+            ) != canonical_ups_key(ups_key)
+            # The operator's first reaction to a cross-UPS finding is "but that is a
+            # different UPS" — the same reasoning that used to suppress this detection
+            # entirely. Answer it inline, on the one screen that reports it.
+            elsewhere = (
+                f" That target is on a DIFFERENT UPS from this machine's declared "
+                f"ups {declared_ups!r}, which does NOT separate the two: a native "
+                f"authority is not keyed to any UPS in this file — it is the remote "
+                f"box's own upsmon firing on this primary's FSD — so the target would "
+                f"push on {ups_key!r}'s outage while that secondary independently "
+                f"halts itself."
+                if cross
+                else ""
+            )
             message = (
                 f"governed by BOTH shutdown regimes: declared shutdown_method='native' and "
-                f"also an enabled shutdown_target {target_name!r} on UPS {ups_key!r}. The "
+                f"also an enabled shutdown_target {target_name!r} on UPS {ups_key!r}.{elsewhere} "
+                f"The "
                 f"legacy target has been disabled. This machine remains ARMED and is now the "
                 f"single surviving authority — its own upsmon halts it on this primary's FSD "
                 f"and lives in that box's /etc, so no config change here can disarm it. Run "

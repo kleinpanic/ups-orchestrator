@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import stat
@@ -11,7 +12,12 @@ import pytest
 
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator import events as events_mod
-from ups_orchestrator.config import ConfigNotice, MonitoredMachine, ShutdownTarget
+from ups_orchestrator.config import (
+    ConfigNotice,
+    MonitoredMachine,
+    ShutdownTarget,
+    is_disarming,
+)
 from ups_orchestrator.events import (
     _default_local_shutdown,
     _default_serial_shutdown,
@@ -1506,3 +1512,92 @@ def test_a_held_local_target_logs_why_it_is_waiting() -> None:
     ]
     assert held, "the held local target left no trace"
     assert "srv" in str(held[-1]["reason"])
+
+
+def _cross_ups_config(tmp_path, *, method: str) -> dict:
+    """The exact shape the final verification executed, parameterised by method."""
+    return {
+        "upses": {
+            "cyberpower": {
+                "label": "CP",
+                "shutdown_targets": [
+                    {"name": "spark", "kind": "remote", "enabled": True, "host": "spark"}
+                ],
+            },
+            "cyberpower3": {"label": "CP3", "shutdown_targets": []},
+        },
+        "monitored_machines": [
+            {"name": "spark", "ssh": "spark", "ups": "cyberpower3", "shutdown_method": method}
+        ],
+        "shutdown": {
+            "enabled": True,
+            "require_power_outage": True,
+            "min_on_battery_seconds": 0,
+            "external": {"enabled": True, "battery_below": 15, "runtime_below": 300},
+        },
+    }
+
+
+def _fire_every_ups(cfg) -> list[str]:
+    """Run one on-battery-and-low tick per configured UPS; return what fired, in order."""
+    fired: list[str] = []
+    for ups in cfg.upses.values():
+        notifier = FakeNotifier()
+        deps, calls = make_deps(
+            notifier,
+            _low(),
+            countdown_every=0,
+            monitored_machines=cfg.monitored_machines,
+        )
+        dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+        fired.extend(calls)
+    return fired
+
+
+def test_cross_ups_native_collision_cannot_fire_two_authorities(tmp_path) -> None:
+    """The surviving double-shutdown the final verification reproduced.
+
+    spark declares `native` on cyberpower3 AND has an enabled legacy target on
+    cyberpower. Before the fix: `degraded notices: 0`, a cyberpower tick fired
+    `ssh:spark`, and spark ALSO self-halts on cyberpower3's FSD — two live
+    authorities with zero operator surface. `native` is the one authority config
+    cannot disarm, so the ONLY correct outcome is that this daemon pushes nothing.
+    """
+    from ups_orchestrator.config import Config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(_cross_ups_config(tmp_path, method="native")))
+    cfg = Config.load(p, env={})
+
+    # The push is gone: no tick on any UPS reaches a transport.
+    assert _fire_every_ups(cfg) == []
+
+    # The native authority is untouched (INV-DECLARED) and is the single survivor.
+    (spark,) = cfg.monitored_machines
+    assert (spark.disarmed, spark.effective_method) == (False, "native")
+
+    # ...and the operator was told, which is the half that was entirely missing.
+    assert [n.subject for n in cfg.degraded if is_disarming(n)], "silent again"
+    assert any("spark" in n.message for n in cfg.degraded)
+
+
+def test_cross_ups_PUSH_collision_still_fires_both_independently(tmp_path) -> None:
+    """The behaviour deliberately preserved, pinned so the fix cannot over-reach.
+
+    Two pushes keyed to two different UPSes ARE two power domains: each fires on
+    its own outage, and neither is a double-shutdown of one event. Nothing is
+    disarmed and both still fire — one per tick, never both on the same tick.
+    """
+    from ups_orchestrator.config import Config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(_cross_ups_config(tmp_path, method="ssh")))
+    cfg = Config.load(p, env={})
+
+    (spark,) = cfg.monitored_machines
+    assert (spark.disarmed, spark.effective_method) == (False, "ssh")
+    assert [n for n in cfg.degraded if is_disarming(n)] == []
+
+    # One firing per UPS tick: the legacy target on cyberpower, the projected push
+    # on cyberpower3. Two events, two authorities, never the same event twice.
+    assert _fire_every_ups(cfg) == ["spark", "spark"]

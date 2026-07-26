@@ -462,6 +462,70 @@ def test_add_dual_regime_refused_without_force_rc2(cfg_path, monkeypatch) -> Non
     assert rc == 2
 
 
+def test_add_native_dual_regime_refused_across_a_DIFFERENT_ups(cfg_path, monkeypatch) -> None:
+    # The CLI half of the cross-UPS blocker. `--method native --ups cyberpower3` with an
+    # enabled `mt` target on cyberpower used to call a narrowed `dual_regime_conflicts`,
+    # find nothing, and write silently. A native authority is keyed to no UPS in this
+    # file, so the gate must fire wherever the colliding target lives.
+    _write_config(
+        cfg_path,
+        extra={
+            "upses": {
+                "cyberpower": {
+                    "label": "CyberPower",
+                    "shutdown_targets": [{"name": "mt", "enabled": True, "host": "mt"}],
+                },
+                "cyberpower3": {"label": "CyberPower3"},
+            }
+        },
+    )
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--ssh",
+            "mt",
+            "--ups",
+            "cyberpower3",
+            "--method",
+            "native",
+            "--ip",
+            "1.2.3.4",
+        ]
+    )
+    assert rc == 2
+    # The config was not written: no record was enrolled behind the operator's back.
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
+
+
+def test_add_PUSH_dual_regime_still_allowed_across_a_different_ups(cfg_path, monkeypatch) -> None:
+    # The preserved carve-out, pinned so the fix above cannot over-reach: an `ssh` push
+    # on cyberpower3 fires only on cyberpower3's outage, so a same-named target on
+    # cyberpower is a different power domain and the gate must stay silent. rc 3 is the
+    # LATER remote-config guard, which is what proves the dual-regime gate did not fire.
+    _write_config(
+        cfg_path,
+        extra={
+            "upses": {
+                "cyberpower": {
+                    "label": "CyberPower",
+                    "shutdown_targets": [{"name": "mt", "enabled": True, "host": "mt"}],
+                },
+                "cyberpower3": {"label": "CyberPower3"},
+            }
+        },
+    )
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    rc = cli.main(
+        ["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower3", "--method", "ssh"]
+    )
+    assert rc == 0
+    (rec,) = json.loads(cfg_path.read_text())["monitored_machines"]
+    assert (rec["name"], rec["shutdown_method"], rec["ups"]) == ("mt", "ssh", "cyberpower3")
+
+
 def test_add_dual_regime_allowed_with_force(cfg_path, add_env, monkeypatch) -> None:
     _write_config(
         cfg_path,
