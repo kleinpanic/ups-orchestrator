@@ -311,3 +311,357 @@ def test_send_dashboard_swallows_render_error(env_config, monkeypatch) -> None:
     cfg = climod._load_config()
     ok, status = climod._send_dashboard(cfg, hours=24)
     assert ok is False and status == 0  # degrades, never raises
+
+
+# =============================================================================
+# 02-03 Task 3 — `remote-shutdown [ups] [--dry-run]` and `shutdown rehearse`
+# (A-2 decisions 1 and 2; T-02-13, T-02-24, IW-07)
+#
+# Nothing here contacts a host, opens a device or writes outside tmp_path: every
+# transport is a closure on the injected `Deps` runners.
+# =============================================================================
+
+from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap  # noqa: E402
+
+_REHEARSAL = "logger -t ups-orchestrator PHASE2_REHEARSAL"
+
+
+def _dry_run_config(
+    cfg: Path,
+    *,
+    policy_enabled: bool = True,
+    require_outage: bool = False,
+    machines: list[dict] | None = None,
+) -> None:
+    cfg.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {
+                                "name": "mt",
+                                "kind": "remote",
+                                "enabled": True,
+                                "host": "mt",
+                                "cmd": "sudo /sbin/shutdown -h now",
+                            }
+                        ],
+                    }
+                },
+                "shutdown": {
+                    "enabled": policy_enabled,
+                    "require_power_outage": require_outage,
+                    "min_on_battery_seconds": 0,
+                    "external": {"enabled": True, "battery_below": 15, "runtime_below": 300},
+                    "internal": {"enabled": True, "battery_below": 10, "runtime_below": 120},
+                },
+                "monitored_machines": machines or [],
+            }
+        )
+    )
+
+
+def _fake_ups(monkeypatch, status: str, charge: int, runtime: int) -> None:
+    monkeypatch.setattr(
+        "ups_orchestrator.nut.upsc_vars",
+        lambda _n: {
+            "ups.status": status,
+            "battery.charge": str(charge),
+            "battery.runtime": str(runtime),
+        },
+    )
+
+
+def _no_transports(monkeypatch) -> list[str]:
+    """Any real transport reaching argv is a bug; record instead of executing."""
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "subprocess.run", lambda *a, **k: ran.append(str(a)) or (_ for _ in ()).throw(AssertionError)
+    )
+    return ran
+
+
+# --- the _fire_target guard: the dry-run returns at the TOP (T-02-13) ---------
+
+
+def test_fire_target_dry_run_returns_before_every_side_effect() -> None:
+    from ups_orchestrator.config import ShutdownTarget
+    from ups_orchestrator.events import _fire_target
+    from ups_orchestrator.state import UpsState
+
+    logged: list[str] = []
+    target = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt", cmd="/sbin/poweroff")
+    ups = make_ups("ups1", targets=(target,), shutdown_policy=shutdown_policy())
+    notifier = FakeNotifier()
+    s = snap("OB LB", charge=5, runtime=60)
+    deps, calls = make_deps(notifier, s)
+    deps.dry_run = True
+    deps.event_log = lambda event, *_a: logged.append(event)
+    state = UpsState(onbatt_since=900)
+
+    _fire_target(ups, state, deps, target, s, "external shutdown allowed")
+
+    assert calls == []  # no runner
+    assert state.shutdowns_sent == []  # the dedupe key is not poisoned
+    assert notifier.sent == []  # no real notification
+    assert logged == []  # no event-log line
+
+
+def test_fire_target_without_dry_run_still_fires() -> None:
+    # The guard must be the flag, not an accident of the call site.
+    from ups_orchestrator.config import ShutdownTarget
+    from ups_orchestrator.events import _fire_target
+    from ups_orchestrator.state import UpsState
+
+    target = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt", cmd="/sbin/poweroff")
+    ups = make_ups("ups1", targets=(target,), shutdown_policy=shutdown_policy())
+    s = snap("OB LB", charge=5, runtime=60)
+    deps, calls = make_deps(FakeNotifier(), s)
+    state = UpsState(onbatt_since=900)
+    _fire_target(ups, state, deps, target, s, "external shutdown allowed")
+    assert calls == ["mt"] and state.shutdowns_sent == ["mt"]
+
+
+# --- remote-shutdown --dry-run: reports the gate, bypasses nothing ------------
+
+
+def test_remote_shutdown_dry_run_lists_targets_and_touches_nothing(
+    env_config, monkeypatch, capsys, tmp_path
+) -> None:
+    _dry_run_config(env_config)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    _no_transports(monkeypatch)
+    rec = _patch_recorder(monkeypatch)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "mt" in out and "ssh" in out and "sudo /sbin/shutdown -h now" in out
+    assert "would fire: yes" in out
+    assert rec.sent == []
+    assert not (tmp_path / "events.jsonl").exists()
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_remote_shutdown_dry_run_against_an_online_ups_still_lists_every_target(
+    env_config, monkeypatch, capsys
+) -> None:
+    # The old bug was a blank screen; the alternative lie was a preview implying it
+    # would fire. Neither: a FULL listing annotated with the concrete reason.
+    _dry_run_config(env_config, require_outage=True)
+    _fake_ups(monkeypatch, "OL", 100, 3600)
+    _no_transports(monkeypatch)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "mt" in out
+    assert "would fire: no" in out and "not on battery" in out
+
+
+def test_remote_shutdown_dry_run_reports_a_disabled_global_policy(
+    env_config, monkeypatch, capsys
+) -> None:
+    # The live probe found shutdown.enabled false and the docs never explaining it.
+    # This makes the disabled flag VISIBLE at the moment the operator asks.
+    _dry_run_config(env_config, policy_enabled=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    _no_transports(monkeypatch)
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "mt" in out
+    assert "would fire: no" in out and "shutdown policy disabled" in out
+
+
+def test_remote_shutdown_dry_run_lists_projected_machines(
+    env_config, monkeypatch, capsys
+) -> None:
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 9600,
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+    _no_transports(monkeypatch)
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "spark" in out and "/dev/ttyUSB0" in out
+
+
+def test_remote_shutdown_appears_in_the_usage_string(capsys, caplog) -> None:
+    with caplog.at_level("ERROR"):
+        assert cli.main([]) == 0
+    assert "remote-shutdown" in caplog.text
+
+
+# --- shutdown rehearse: non-destructive BY CONSTRUCTION (T-02-24) -------------
+
+
+def _rehearse_config(cfg: Path) -> None:
+    cfg.write_text(
+        json.dumps(
+            {
+                "upses": {
+                    "ups1": {
+                        "label": "U1",
+                        "shutdown_targets": [
+                            {"name": "pi", "kind": "local", "enabled": True, "cmd": "/sbin/poweroff"}
+                        ],
+                    }
+                },
+                # Deliberately the production state: rehearsal must work here.
+                "shutdown": {"enabled": False},
+                "monitored_machines": [
+                    {
+                        "name": "spark",
+                        "ups": "ups1",
+                        "shutdown_method": "serial",
+                        "serial_device": "/dev/ttyUSB0",
+                        "serial_baud": 9600,
+                        "shutdown_cmd": "sudo /sbin/shutdown -h now -REALHALT",
+                    },
+                    {
+                        "name": "mt",
+                        "ups": "ups1",
+                        "ssh": "mt",
+                        "shutdown_method": "ssh",
+                        "shutdown_cmd": "sudo /sbin/shutdown -h now -REALHALT",
+                    },
+                ],
+            }
+        )
+    )
+
+
+def _capture_runners(monkeypatch) -> list:
+    """Replace Deps' transport defaults with recorders, via _build_deps."""
+    seen: list = []
+    real_build = cli._build_deps
+
+    def _build(cfg, **kw):  # noqa: ANN001
+        deps = real_build(cfg, **kw)
+        deps.serial_shutdown = lambda t: (seen.append(("serial", t)), (0, "", ""))[1]
+        deps.ssh_shutdown = lambda t: (seen.append(("ssh", t)), (0, "", ""))[1]
+        deps.local_shutdown = lambda c: (seen.append(("local", c)), (0, "", ""))[1]
+        return deps
+
+    monkeypatch.setattr(cli, "_build_deps", _build)
+    return seen
+
+
+def test_rehearse_sends_the_hardcoded_logger_command_over_serial(
+    env_config, monkeypatch, capsys, tmp_path
+) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    _no_transports(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 0
+    assert len(seen) == 1
+    kind, target = seen[0]
+    assert kind == "serial"
+    assert target.cmd == _REHEARSAL
+    assert '"' not in target.cmd  # quote-free, like _monitor_add demands
+    assert target.device == "/dev/ttyUSB0" and target.baud == 9600
+    out = capsys.readouterr().out
+    assert "/dev/ttyUSB0" in out and "9600" in out
+    assert "REALHALT" not in out  # the persisted shutdown_cmd is never read
+    assert not (tmp_path / "state.json").exists()  # persists NOTHING
+
+
+def test_rehearse_never_carries_the_persisted_shutdown_cmd(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    _no_transports(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "mt"]) == 0
+    _kind, target = seen[0]
+    assert target.cmd == _REHEARSAL
+    assert "REALHALT" not in target.cmd
+
+
+def test_rehearse_works_with_the_global_shutdown_policy_disabled(env_config, monkeypatch) -> None:
+    # A-2 decision 2: gating this on `shutdown.enabled` would make it unusable in
+    # exactly the state production is in — which is the state it exists to be used
+    # in. Its safety is that the command cannot halt anything, not a policy flag.
+    _rehearse_config(env_config)
+    assert json.loads(env_config.read_text())["shutdown"]["enabled"] is False
+    seen = _capture_runners(monkeypatch)
+    _no_transports(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 0
+    assert seen
+
+
+def test_rehearse_refuses_a_local_target(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    _no_transports(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "pi"]) == 2
+    assert seen == []
+
+
+def test_rehearse_requires_an_explicit_machine_name(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    seen = _capture_runners(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["shutdown", "rehearse"])  # never a sweep
+    assert seen == []
+
+
+def test_rehearse_refuses_an_unknown_machine(env_config, monkeypatch) -> None:
+    _rehearse_config(env_config)
+    _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "ghost"]) == 2
+
+
+def test_rehearse_refuses_a_machine_with_no_push_transport(env_config, monkeypatch) -> None:
+    env_config.write_text(
+        json.dumps(
+            {
+                "upses": {"ups1": {"label": "U1"}},
+                "monitored_machines": [
+                    {"name": "spark", "ups": "ups1", "ssh": "spark", "shutdown_method": "native"}
+                ],
+            }
+        )
+    )
+    seen = _capture_runners(monkeypatch)
+    assert cli.main(["shutdown", "rehearse", "spark"]) == 2
+    assert seen == []
+
+
+# --- IW-07: a failing projected push must not deadlock the local target -------
+
+
+def test_a_failing_projected_push_still_lets_the_local_target_fire() -> None:
+    # `local` targets are held until every enabled remote is in `shutdowns_sent`,
+    # and `_fire_target` appends REGARDLESS of rc. That append is what makes the
+    # hold undeadlockable — pinned here so nobody later "fixes" the ordering by
+    # removing it and starves the watcher Pi's own poweroff behind a dead cable.
+    from ups_orchestrator.config import MonitoredMachine, ShutdownTarget
+    from ups_orchestrator.events import _run_shutdown_targets
+    from ups_orchestrator.state import UpsState
+
+    machine = MonitoredMachine(
+        name="spark",
+        ups="ups1",
+        shutdown_method="serial",
+        serial_device="/dev/ttyUSB0",
+        serial_baud=9600,
+        shutdown_cmd="sudo /sbin/shutdown -h now",
+    )
+    local = ShutdownTarget(name="pi", kind="local", enabled=True, cmd="/sbin/poweroff")
+    ups = make_ups(
+        "ups1",
+        targets=(local,),
+        shutdown_policy=shutdown_policy(internal_enabled=True),
+    )
+    s = snap("OB LB", charge=5, runtime=60)
+    deps, calls = make_deps(FakeNotifier(), s, serial_rc=1, monitored_machines=(machine,))
+    state = UpsState(onbatt_since=900)
+    _run_shutdown_targets(ups, state, deps, s)
+    assert calls == ["spark", "local"], "the local target starved behind a failing push"
