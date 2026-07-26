@@ -210,6 +210,25 @@ def test_upsmon_rejects_quote_in_shutdown_cmd():
         _upsmon(shutdown_cmd='/sbin/shutdown -h now"; rm -rf /')
 
 
+def test_upsmon_rejects_a_newline_in_shutdown_cmd():
+    """LO-C4: the quote was rejected and the NEWLINE was not.
+
+    `SHUTDOWNCMD "<cmd>"` is one directive on one line, so a newline ends it and
+    everything after becomes a further upsmon directive in the SECONDARY's
+    /etc/nut/upsmon.conf — a third machine's config, written by us.
+    """
+    with pytest.raises(ValueError, match="control character"):
+        _upsmon(shutdown_cmd="sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x")
+
+
+def test_valid_shutdown_cmd_is_the_one_predicate_for_both_sinks():
+    assert nutclient.valid_shutdown_cmd("sudo /sbin/shutdown -h now")
+    assert not nutclient.valid_shutdown_cmd('halt"')
+    assert not nutclient.valid_shutdown_cmd("halt\nNOTIFYCMD /tmp/x")
+    assert not nutclient.valid_shutdown_cmd("halt\rNOTIFYCMD /tmp/x")
+    assert not nutclient.valid_shutdown_cmd("halt\x00")
+
+
 # --- render_upsd_* snippets (pure) --------------------------------------------
 
 

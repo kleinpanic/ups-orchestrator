@@ -2257,3 +2257,45 @@ def test_force_help_text_names_only_the_dual_regime_refusal(cfg_path, capsys) ->
     assert "refuse-on-existing guards" not in out
     # ...and the other half is still described as the separate authorisation it is.
     assert "--force-remote-config" in out
+
+
+# --- LO-C4: --shutdown-cmd rejects a newline, not only a double-quote ----------
+
+
+def test_add_refuses_a_newline_in_shutdown_cmd(cfg_path, monkeypatch, caplog) -> None:
+    """The guard mirrored `render_upsmon_conf` and both rejected only the quote.
+
+    `SHUTDOWNCMD "<cmd>"` is one directive on one line, so the newline ends it and
+    `NOTIFYCMD /tmp/x` becomes a further upsmon directive in the SECONDARY's
+    /etc/nut/upsmon.conf. Refused at the argparse boundary, before any record is
+    written and before anything is sent to that machine.
+    """
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    before = cfg_path.read_text()
+
+    with caplog.at_level("ERROR"):
+        rc = cli.main(
+            [
+                "monitor", "add", "mt",
+                "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower",
+                "--shutdown-cmd", "sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x",
+            ]
+        )
+
+    assert rc == 2
+    assert "control character" in caplog.text
+    assert cfg_path.read_text() == before
+    assert ssh.calls == []
+
+
+def test_add_still_refuses_a_double_quote_in_shutdown_cmd(cfg_path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    rc = cli.main(
+        [
+            "monitor", "add", "mt",
+            "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower",
+            "--shutdown-cmd", '/sbin/shutdown -h now"; rm -rf /',
+        ]
+    )
+    assert rc == 2

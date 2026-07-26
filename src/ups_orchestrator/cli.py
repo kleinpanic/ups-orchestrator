@@ -1391,8 +1391,19 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     shutdown_cmd = _resolve_shutdown_cmd(method, args.shutdown_cmd)
 
     # 1. up-front arg validation (rc 2), method-independent first.
-    if '"' in shutdown_cmd:
-        LOG.error("monitor add: --shutdown-cmd must not contain a double-quote")
+    # LO-C4: shares `render_upsmon_conf`'s own predicate rather than re-spelling half
+    # of it. The old `'"' in shutdown_cmd` rejected the quote and passed a NEWLINE, so
+    # `--shutdown-cmd $'sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x'` closed the
+    # SHUTDOWNCMD line and installed a second directive in the SECONDARY's
+    # /etc/nut/upsmon.conf. One predicate, every sink — as with `valid_ssh_alias`.
+    if not nutclient.valid_shutdown_cmd(shutdown_cmd):
+        LOG.error(
+            "monitor add: --shutdown-cmd %r must not contain a double-quote or any "
+            "control character. It is emitted as a single SHUTDOWNCMD \"<cmd>\" line in "
+            "the secondary's /etc/nut/upsmon.conf, so a newline ends that directive and "
+            "everything after it becomes a further upsmon directive on that machine.",
+            shutdown_cmd,
+        )
         return 2
     if args.ip and not _valid_ip(args.ip):
         LOG.error("monitor add: --ip %r is not a valid IP literal", args.ip)

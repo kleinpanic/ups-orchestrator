@@ -44,6 +44,26 @@ def valid_nut_name(name: str) -> bool:
     return bool(_NUT_NAME_RE.match(name))
 
 
+# LO-C4. `SHUTDOWNCMD "<cmd>"` is ONE directive on ONE line of the secondary's
+# /etc/nut/upsmon.conf. Only the double-quote was rejected, so a newline closed the
+# line and everything after it became a further upsmon directive of the operator's
+# choosing — e.g. `--shutdown-cmd $'sudo /sbin/shutdown -h now\nNOTIFYCMD /tmp/x'`
+# installs a NOTIFYCMD on a third machine. Operator == attacker here, so this is a
+# foot-gun rather than a boundary crossing, but the check exists for exactly this
+# shape and was rejecting the narrower half of it.
+_CMD_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def valid_shutdown_cmd(cmd: str) -> bool:
+    """True iff ``cmd`` can be embedded in ``SHUTDOWNCMD "<cmd>"`` verbatim. PURE.
+
+    Rejected rather than escaped: a shutdown command is the one string on the
+    secondary that must be read exactly as written, and NUT's own parser has no
+    escape this could round-trip through.
+    """
+    return '"' not in cmd and _CMD_CTRL_RE.search(cmd) is None
+
+
 def valid_ip(value: str) -> bool:
     """True iff ``value`` is a valid IPv4/IPv6 literal. PURE."""
     try:
@@ -178,12 +198,14 @@ def render_upsmon_conf(
     The block deliberately carries no directive that would power off the UPS —
     that is primary-only (RESEARCH.md Correction #2).
 
-    ``shutdown_cmd`` is emitted inside ``SHUTDOWNCMD "<cmd>"``; a double-quote
-    would break the NUT parser or inject a second directive, so it is rejected
-    rather than escaped.
+    ``shutdown_cmd`` is emitted inside ``SHUTDOWNCMD "<cmd>"``; a double-quote or
+    any control character would break the NUT parser or inject a further directive
+    onto the secondary, so it is rejected rather than escaped (LO-C4).
     """
-    if '"' in shutdown_cmd:
-        raise ValueError("shutdown_cmd must not contain a double-quote character")
+    if not valid_shutdown_cmd(shutdown_cmd):
+        raise ValueError(
+            "shutdown_cmd must not contain a double-quote or any control character"
+        )
     lines = [
         _UPSMON_BEGIN,
         f"MONITOR {ups}@{primary} {powervalue} {user} {pw} secondary",
