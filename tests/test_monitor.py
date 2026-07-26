@@ -1844,7 +1844,15 @@ def test_remove_non_native_skips_the_nut_disarm_and_the_nft_rewrite(
 
 
 def test_remove_native_still_disarms_and_rewrites_the_firewall(cfg_path, monkeypatch) -> None:
-    _write_config(cfg_path, machines=[_machine_entry("mt", method="native", ssh="mt", ip="1.2.3.4")])
+    # A native survivor keeps the managed saddr set non-empty, so `apply_nft` has a
+    # real rewrite to do (an empty set with no managed block is a legitimate no-op).
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="native", ssh="mt", ip="1.2.3.4"),
+            _machine_entry("spark", method="native", ssh="spark", ip="192.168.1.120"),
+        ],
+    )
     ssh, nft = FakeSSH(), FakeNft()
     monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
     monkeypatch.setattr(cli, "_monitor_run_nft", nft)

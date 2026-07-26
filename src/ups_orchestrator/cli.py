@@ -19,8 +19,11 @@ Modes::
     ups-orchestrator logs                # tail local JSONL logs
 
 NUT exposes the active UPS to event handlers via the ``UPSNAME`` environment
-variable. The process **always exits 0** on the event path so a misbehaving
-handler never wedges NUT's pipeline; failures are logged.
+variable. A misbehaving *handler* never wedges NUT's pipeline — every dispatch is
+caught and logged, and the event path still exits 0. The one exception is a config
+that cannot be LOADED (IW-06): that returns non-zero from both the event and the
+watch entry points, because a silent successful no-op on `onbatt`/`lowbatt` is
+worse than a loud failure at the moment the daemon exists for.
 """
 
 from __future__ import annotations
@@ -32,10 +35,11 @@ import logging
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import FrameType
 
@@ -175,10 +179,56 @@ def _resolve_ups_name(cli_value: str | None) -> str | None:
     return os.environ.get("UPSNAME", "").strip() or None
 
 
+def _notify_degraded(cfg: Config, deps: Deps) -> None:
+    """Log every load-time notice and send ONE aggregated notification.
+
+    ``Config.load`` runs before ``_build_deps`` constructs the notifier, so the
+    load itself cannot notify — this is the first point at which one exists. It is
+    a STARTUP surface only: ``tick`` runs every poll and must not page repeatedly.
+    Exactly one notification, never one per notice, and nothing at all when the
+    tuple is empty.
+    """
+    if not cfg.degraded:
+        return
+    from ups_orchestrator.notify import Level, Notification
+
+    for n in cfg.degraded:
+        if n.severity == "error":
+            LOG.error("config degrade: %s", n)
+        else:
+            LOG.warning("config advisory: %s", n)
+    errors = [n for n in cfg.degraded if n.severity == "error"]
+    advisories = [n for n in cfg.degraded if n.severity != "error"]
+    # Discord caps an embed at 25 fields; the overflow is still in the journal and
+    # in `monitor list`, so truncating here loses nothing an operator cannot reach.
+    shown = list(cfg.degraded)[:20]
+    overflow = len(cfg.degraded) - len(shown)
+    body = (
+        f"{len(errors)} shutdown authority/ies disarmed, {len(advisories)} advisory. "
+        f"Run 'ups-orchestrator monitor list' for the full set and "
+        f"'ups-orchestrator monitor verify <machine>' per machine."
+    )
+    if overflow:
+        body += f" ({overflow} further notice(s) not shown.)"
+    deps.notifier.send(
+        Notification(
+            title=f"⚠️ Config degraded at startup — {len(cfg.degraded)} notice(s)",
+            body=body,
+            level=Level.CRITICAL if errors else Level.WARNING,
+            fields=[(n.subject, f"[{n.severity}] {n.message}") for n in shown],
+        )
+    )
+
+
 def _cmd_event(event: str, ups_name: str | None) -> int:
     cfg = _load_config()
     if cfg is None:
-        return 0
+        # IW-06: this returned 0. `deploy/upssched-cmd.sh` invokes it for onbatt,
+        # lowbatt and remote_shutdown, so a config that cannot be loaded turned
+        # every real NUT power event into a silent no-op that reported SUCCESS —
+        # at the exact moment the daemon exists for. After 02-06's RA-01 only the
+        # seven fatal classes reach here, so it fires rarely and correctly.
+        return 1
     deps = _build_deps(cfg)
     store = StateStore(_state_path())
 
@@ -208,8 +258,12 @@ def _cmd_event(event: str, ups_name: str | None) -> int:
 def _cmd_watch() -> int:
     cfg = _load_config()
     if cfg is None:
-        return 0
+        # IW-06: this returned 0, so systemd saw a clean exit and Restart= never
+        # fired. A watch unit with a restart policy will now enter a restart loop
+        # on an unparseable config — the intended louder failure.
+        return 1
     deps = _build_deps(cfg)
+    _notify_degraded(cfg, deps)
     store = StateStore(_state_path())
     interval = max(5, cfg.poll_seconds)
 
@@ -827,17 +881,131 @@ _REMOTE_DISARM = (
 )
 
 
+def _print_degraded(cfg: Config) -> None:
+    """Render every load-time notice under a marked heading, or nothing at all.
+
+    RA-01's own argument is that a journal line is an insufficient operator
+    surface, so ``Config.degraded`` has to reach the operator wherever the
+    operator already looks. This is the ``monitor`` half; ``status`` and the web
+    UI carry the same tuple.
+    """
+    if not cfg.degraded:
+        return
+    print("")
+    print("⚠ DEGRADED CONFIG — a shutdown authority was disarmed or flagged at load:")
+    for n in cfg.degraded:
+        label = "ERROR" if n.severity == "error" else "ADVISORY"
+        print(f"  {label} {n.subject}: {n.message}")
+
+
+def _method_field(m: MonitoredMachine) -> str:
+    """``method=<declared>`` plus the EFFECT only when the two differ.
+
+    The declaration comes first because it is what every gate reads and what the
+    operator authored; the effect is annotated only when a load-time degrade has
+    taken the declaration away (INV-DECLARED / INV-DEGRADE).
+    """
+    if m.effective_method == m.shutdown_method:
+        return f"method={m.shutdown_method}"
+    return f"method={m.shutdown_method}(effective:{m.effective_method})"
+
+
 def _monitor_list(cfg: Config) -> int:
     if not cfg.monitored_machines:
+        # Still falls through to the notices: a config can carry zero machines and
+        # a disabled legacy target.
         print("no machines enrolled")
-        return 0
     for m in cfg.monitored_machines:
         backup = "backup:on" if m.backup.enabled else "backup:off"
-        print(f"{m.name}\tssh={m.ssh}\tups={m.ups}\tos={m.os}\tip={m.ip or '-'}\t{backup}")
+        print(
+            f"{m.name}\tssh={m.ssh}\tups={m.ups}\tos={m.os}\tip={m.ip or '-'}\t"
+            f"{_method_field(m)}\t{backup}"
+        )
+    _print_degraded(cfg)
     return 0
 
 
-def _monitor_verify(cfg: Config, argv: list[str]) -> int:
+def _probe_secondary_reason(m: MonitoredMachine) -> str | None:
+    """Why ``monitor verify`` must go looking for a live remote NUT secondary.
+
+    The RULE rather than a list of methods to remember: probe ANY record that could
+    plausibly have one, because that probe is the only evidence available on THIS
+    box about an authority that lives on another one.
+
+    * declared ``native`` — the remote ``upsmon`` IS the authority, and config can
+      never disarm it, so verify must go and look;
+    * declared ``none`` carrying a ``ups`` — BL-02's exact signature. ``none`` does
+      not disarm an already-enrolled secondary, and answering "no active authority"
+      would falsely reassure the operator who most needs the truth;
+    * a push declaration carrying an ``ip`` — IW-05. ``ip`` is written only by the
+      native enrollment path, so this is a probable hand-edited former secondary
+      whose remote ``upsmon`` was never torn down.
+
+    Reads the DECLARATION throughout (INV-DECLARED).
+    """
+    declared = m.shutdown_method.strip().lower()
+    if declared == "native":
+        return "native"
+    if declared == "none" and m.ups.strip():
+        return "none-with-ups"
+    if declared in ("serial", "ssh") and m.ip.strip():
+        return "push-with-enrollment-ip"
+    return None
+
+
+def _verify_serial(m: MonitoredMachine, stat_fn: Callable[[str], os.stat_result]) -> int:
+    """Device presence and a declared baud, through an INJECTED stat.
+
+    The stat is injected so a unit test never reaches for a real ``/dev`` node.
+    """
+    device = m.serial_device.strip()
+    if not device:
+        print(f"{m.name}: FAIL — declares serial with no serial_device")
+        return 1
+    try:
+        mode = stat_fn(device).st_mode
+    except OSError as exc:
+        print(f"{m.name}: FAIL — serial device {device} is not present ({exc})")
+        return 1
+    if not stat.S_ISCHR(mode):
+        print(f"{m.name}: FAIL — {device} is not a character device ({stat.filemode(mode)})")
+        return 1
+    if m.serial_baud is None or m.serial_baud <= 0:
+        print(f"{m.name}: FAIL — no usable declared serial_baud (the live console here is 9600)")
+        return 1
+    print(f"{m.name}: OK — serial {device} present at a declared {m.serial_baud} baud")
+    return 0
+
+
+def _verify_ssh_alias(m: MonitoredMachine) -> int:
+    """Reachability of the recorded alias. No NUT secondary check — there is none."""
+    alias = m.ssh.strip()
+    if not alias:
+        print(f"{m.name}: FAIL — declares ssh with no alias")
+        return 1
+    if not _valid_ssh_alias(alias):
+        LOG.error("monitor verify: config ssh alias %r for %s is invalid", m.ssh, m.name)
+        return 2
+    rc, _out, err = _monitor_run_ssh(alias, "true", None)
+    if rc != 0:
+        print(f"{m.name}: FAIL — ssh {alias} unreachable ({err.strip() or f'rc {rc}'})")
+        return 1
+    print(f"{m.name}: OK — ssh {alias} reachable")
+    return 0
+
+
+def _monitor_verify(
+    cfg: Config,
+    argv: list[str],
+    stat_fn: Callable[[str], os.stat_result] = os.stat,
+) -> int:
+    """Answer the question an operator actually asks: *will this machine shut down?*
+
+    Every branch reads the DECLARED ``shutdown_method``. Branching on the effect
+    would render a machine a load-time degrade disarmed identically to one the
+    operator deliberately declared ``none`` — the same truth wearing two very
+    different meanings (T-02-46).
+    """
     parser = argparse.ArgumentParser(prog="ups-orchestrator monitor verify")
     parser.add_argument("name")
     parser.add_argument("--timeout", type=int, default=10, help="seconds to await a result")
@@ -852,23 +1020,67 @@ def _monitor_verify(cfg: Config, argv: list[str]) -> int:
     if args.primary_ip and not _valid_ip(args.primary_ip):
         LOG.error("monitor verify: --primary-ip %r is not a valid IP literal", args.primary_ip)
         return 2
-    # machine.ups is config-sourced (monitored_machines[].ups) and flows into a
-    # remote shell string in verify_secondary; refuse a metachar-bearing value
-    # here instead of executing it.
-    if not nutclient.valid_nut_name(machine.ups):
-        LOG.error("monitor verify: config UPS name %r for %s is invalid", machine.ups, machine.name)
-        return 2
-    primary = _monitor_primary_ip(cfg, args.primary_ip)
-    ok, detail = nutclient.verify_secondary(
-        machine.ssh,
-        machine.ups,
-        primary,
-        _monitor_run_ssh,
-        timeout=args.timeout,
-        deep=args.deep,
-    )
-    print(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
-    return 0 if ok else 1
+
+    declared = machine.shutdown_method
+    effective = machine.effective_method
+    head = f"{machine.name}: declared shutdown_method={declared}"
+    if effective != declared:
+        head += f" (effective: {effective})"
+    print(head)
+
+    rc = 0
+    if machine.disarmed:
+        for n in machine.load_notices:
+            if n.severity == "error":
+                print(f"  DISARMED (declared {declared}): {n.message}")
+        rc = 1
+    else:
+        for n in machine.load_notices:
+            print(f"  {n.severity.upper()}: {n.message}")
+
+    probe = _probe_secondary_reason(machine)
+    if probe is not None:
+        # machine.ups is config-sourced and flows into a remote shell string in
+        # verify_secondary; refuse a metachar-bearing value instead of running it.
+        if not nutclient.valid_nut_name(machine.ups):
+            LOG.error(
+                "monitor verify: config UPS name %r for %s is invalid", machine.ups, machine.name
+            )
+            return 2
+        primary = _monitor_primary_ip(cfg, args.primary_ip)
+        ok, detail = nutclient.verify_secondary(
+            machine.ssh,
+            machine.ups,
+            primary,
+            _monitor_run_ssh,
+            timeout=args.timeout,
+            deep=args.deep,
+        )
+        print(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
+        if probe == "native":
+            if machine.load_notices:
+                print(
+                    f"  the remote secondary remains the surviving authority — it lives in "
+                    f"that box's /etc and no config change here disarms it. "
+                    f"'monitor remove {machine.name}' is the only real disarm."
+                )
+            return 0 if ok else 1
+        if ok:
+            print(
+                f"  this record declares {declared!r}, and a live NUT secondary answers on "
+                f"that box. Run 'monitor remove {machine.name}' to actually disarm it."
+            )
+            rc = 1
+        return rc
+
+    if machine.disarmed:
+        return rc  # it will not fire; there is no transport left to check
+    if declared == "serial":
+        return _verify_serial(machine, stat_fn) or rc
+    if declared == "ssh":
+        return _verify_ssh_alias(machine) or rc
+    print(f"{machine.name}: no active shutdown authority")
+    return rc
 
 
 def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
@@ -882,6 +1094,21 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     parser.add_argument("--no-restart-bouncer", action="store_true", help="skip bouncer restart")
     args = parser.parse_args(argv)
 
+    # T-02-48: 02-06 KEEPS every duplicate record and disarms them all, so
+    # `_monitor_find`'s first-wins would delete an arbitrary one of them — and
+    # `_monitor_persist` rewrites the whole array, making that a real deletion.
+    lname = args.name.strip().casefold()
+    matches = [m for m in cfg.monitored_machines if m.name.strip().casefold() == lname]
+    if len(matches) > 1:
+        LOG.error(
+            "monitor remove: %d records share the name %r (case-insensitively), so which "
+            "one to remove is a guess. All of them are disarmed at load. De-duplicate "
+            "monitored_machines by hand, then re-run this command.",
+            len(matches),
+            args.name,
+        )
+        return 2
+
     machine = _monitor_find(cfg, args.name)
     if machine is None:
         LOG.error("monitor remove: unknown machine %r", args.name)
@@ -889,24 +1116,33 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
     survivors = tuple(m for m in cfg.monitored_machines if m is not machine)
     saddrs = _survivor_saddrs(survivors)
+    # The remote NUT teardown and the nft rewrite exist for a native enrollment and
+    # only for one. A serial/ssh/none record has no remote upsmon to disable and no
+    # upsd accept of its own; running either would touch a box this record never
+    # enrolled. Keyed on the DECLARED method (INV-DECLARED).
+    is_native = machine.shutdown_method.strip().lower() == "native"
 
     if args.dry_run:
-        disarm = "skip (--keep-remote)" if args.keep_remote else machine.ssh
-        fw = "skip (--no-firewall)" if args.no_firewall else saddrs
-        print(f"[dry-run] disarm remote: {disarm}")
-        print(f"[dry-run] firewall: {fw}")
+        if not is_native:
+            print(f"[dry-run] disarm remote: skip (declared {machine.shutdown_method})")
+            print(f"[dry-run] firewall: skip (declared {machine.shutdown_method})")
+        else:
+            disarm = "skip (--keep-remote)" if args.keep_remote else machine.ssh
+            fw = "skip (--no-firewall)" if args.no_firewall else saddrs
+            print(f"[dry-run] disarm remote: {disarm}")
+            print(f"[dry-run] firewall: {fw}")
         print(f"[dry-run] persist: drop {machine.name} (config written LAST)")
         return 0
 
-    # 1) disarm remote (unless --keep-remote)
-    if not args.keep_remote:
+    # 1) disarm remote (unless --keep-remote, or the record is not native)
+    if is_native and not args.keep_remote:
         rc, _out, err = _monitor_run_ssh(machine.ssh, _REMOTE_DISARM, None)
         if rc != 0:
             LOG.error("monitor remove: remote disarm failed: %s", err)
             return 3
 
     # 2) firewall: rewrite the saddr set from survivors (unless --no-firewall)
-    if not args.no_firewall:
+    if is_native and not args.no_firewall:
         restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
         rc, _out, err = nutclient.apply_nft(
             _NFT_PATH, saddrs, _monitor_run_nft, restart, reload_path=_NFT_RELOAD_PATH
