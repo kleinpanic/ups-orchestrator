@@ -333,24 +333,29 @@ def _dry_run_config(
     policy_enabled: bool = True,
     require_outage: bool = False,
     machines: list[dict] | None = None,
+    second_ups: bool = False,
 ) -> None:
+    upses: dict[str, object] = {
+        "ups1": {
+            "label": "U1",
+            "shutdown_targets": [
+                {
+                    "name": "mt",
+                    "kind": "remote",
+                    "enabled": True,
+                    "host": "mt",
+                    "cmd": "sudo /sbin/shutdown -h now",
+                }
+            ],
+        }
+    }
+    if second_ups:
+        # HI-C1 needs two UPSes to tell "scoped to one" apart from "swept them all".
+        upses["ups2"] = {"label": "U2"}
     cfg.write_text(
         json.dumps(
             {
-                "upses": {
-                    "ups1": {
-                        "label": "U1",
-                        "shutdown_targets": [
-                            {
-                                "name": "mt",
-                                "kind": "remote",
-                                "enabled": True,
-                                "host": "mt",
-                                "cmd": "sudo /sbin/shutdown -h now",
-                            }
-                        ],
-                    }
-                },
+                "upses": upses,
                 "shutdown": {
                     "enabled": policy_enabled,
                     "require_power_outage": require_outage,
@@ -901,3 +906,84 @@ def test_rehearse_resolves_a_legacy_serial_shutdown_target(env_config, monkeypat
     kind, target = seen[0]
     assert kind == "serial" and target.device == "/dev/ttyUSB1"
     assert target.cmd == _REHEARSAL and "REALHALT" not in target.cmd
+
+
+# --- HI-C1: the preview and the real command agree about SCOPE ----------------
+
+
+def test_remote_shutdown_with_no_name_is_loud_not_a_silent_success(
+    env_config, monkeypatch, caplog
+) -> None:
+    """`remote-shutdown` with no name evaluated NOTHING and returned 0.
+
+    `_cmd_event`'s `list(cfg.upses)` fallback is gated on `event == "tick"`, so the
+    manual verb resolved an empty target list, logged `No UPS name provided` and
+    reported SUCCESS — the identical "silently did nothing" bug
+    `_cmd_remote_shutdown`'s own docstring says it was written to fix, moved one
+    argument to the left. An operator who validates with `--dry-run` and then runs
+    it for real must not get a clean exit for a no-op.
+    """
+    _dry_run_config(env_config)
+    monkeypatch.delenv("UPSNAME", raising=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    with caplog.at_level("ERROR"):
+        rc = cli.main(["remote-shutdown"])
+
+    assert rc == 2
+    assert "No UPS name provided" in caplog.text
+
+
+def test_nut_event_route_with_no_name_still_exits_zero(env_config, monkeypatch, caplog) -> None:
+    """The other half: a non-zero exit on the NUT route wedges upssched's pipeline.
+
+    `deploy/upssched-cmd.sh` invokes onbatt/lowbatt/remote_shutdown, so the two
+    callers genuinely need different answers — which is why the loudness is keyed
+    on the caller and not on the event name.
+    """
+    _dry_run_config(env_config)
+    monkeypatch.delenv("UPSNAME", raising=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    with caplog.at_level("ERROR"):
+        assert cli.main(["remote_shutdown"]) == 0
+    assert "No UPS name provided" in caplog.text
+
+
+def test_remote_shutdown_dry_run_honours_upsname_like_the_real_path(
+    env_config, monkeypatch, capsys
+) -> None:
+    """The preview read `args.ups` directly and never consulted `$UPSNAME`.
+
+    Under `upssched` — the only place `$UPSNAME` is set — the preview therefore
+    reported every configured UPS while the real run touched exactly one.
+    """
+    _dry_run_config(env_config, second_ups=True)
+    monkeypatch.setenv("UPSNAME", "ups2")
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "(ups2)" in out
+    assert "(ups1)" not in out, "the preview must scope to $UPSNAME the way the real path does"
+
+
+def test_remote_shutdown_dry_run_states_that_a_real_run_would_refuse(
+    env_config, monkeypatch, capsys
+) -> None:
+    """The one remaining asymmetry is printed rather than left for the operator.
+
+    Sweeping every UPS is still the useful answer to "what is configured?", but
+    the real command with no name evaluates nothing and exits 2. Saying so is what
+    stops the preview from promising what the real command will not do.
+    """
+    _dry_run_config(env_config)
+    monkeypatch.delenv("UPSNAME", raising=False)
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "$UPSNAME is unset" in out
+    assert "exits 2" in out

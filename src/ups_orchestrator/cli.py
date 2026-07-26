@@ -241,7 +241,16 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
     )
 
 
-def _cmd_event(event: str, ups_name: str | None) -> int:
+def _cmd_event(event: str, ups_name: str | None, *, manual: bool = False) -> int:
+    """Dispatch one NUT event. ``manual`` marks an operator-typed top-level verb.
+
+    HI-C1: the two callers need different answers to "no UPS resolved". On the NUT
+    event route (``manual=False``) a non-zero exit wedges ``upssched``'s pipeline,
+    which is worse than the miss, so it stays 0. For a verb an operator typed
+    (``remote-shutdown``), returning 0 having done nothing is the exact
+    "silently did nothing" failure ``_cmd_remote_shutdown`` was written to fix,
+    moved one argument to the left — so that case is loud.
+    """
     cfg = _load_config()
     if cfg is None:
         # IW-06: this returned 0. `deploy/upssched-cmd.sh` invokes it for onbatt,
@@ -256,8 +265,12 @@ def _cmd_event(event: str, ups_name: str | None) -> int:
     # `tick` with no UPS name sweeps every configured UPS.
     targets = [ups_name] if ups_name else (list(cfg.upses) if event == "tick" else [])
     if not targets:
-        LOG.error("No UPS name provided for event %r (set arg or $UPSNAME)", event)
-        return 0
+        LOG.error(
+            "No UPS name provided for event %r (set arg or $UPSNAME); nothing was "
+            "evaluated and no target was fired",
+            event,
+        )
+        return 2 if manual else 0
 
     for name in targets:
         ups = cfg.ups(name) if name else None
@@ -1892,14 +1905,29 @@ def _cmd_remote_shutdown(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     if not args.dry_run:
-        return _cmd_event("remote_shutdown", _resolve_ups_name(args.ups))
+        return _cmd_event("remote_shutdown", _resolve_ups_name(args.ups), manual=True)
 
     cfg = _load_config()
     if cfg is None:
         return 1
     deps = _build_deps(cfg, dry_run=True)
     store = StateStore(_state_path())
-    names = [args.ups] if args.ups else list(cfg.upses)
+    # HI-C1: the SAME resolver the real path uses. The preview read `args.ups`
+    # directly, so it ignored `$UPSNAME` while `_cmd_event` honours it — under
+    # `upssched` the preview reported every UPS while the real run touched one.
+    resolved = _resolve_ups_name(args.ups)
+    names = [resolved] if resolved else list(cfg.upses)
+    if not resolved:
+        # ...and the remaining, deliberate asymmetry is stated rather than hidden.
+        # A real run with no name resolves NO UPS and refuses (rc 2); it does not
+        # sweep. Sweeping here is still the useful answer to "what is configured?",
+        # but an operator who validates with the preview and then runs it for real
+        # must not be surprised — that surprise was the whole finding.
+        print(
+            f"no UPS named and $UPSNAME is unset — previewing all "
+            f"{len(cfg.upses)} configured UPS(es). A REAL 'remote-shutdown' with no "
+            f"name evaluates NOTHING and exits 2: pass a UPS name or set $UPSNAME."
+        )
     for name in names:
         ups = cfg.ups(name)
         if ups is None:
