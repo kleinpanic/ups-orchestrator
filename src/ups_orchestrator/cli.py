@@ -320,6 +320,22 @@ def _cmd_event(event: str, ups_name: str | None, *, manual: bool = False) -> int
         try:
             dispatch(event, ups, store.get(ups.name), deps)
         except Exception:  # noqa: BLE001 — never let a handler crash NUT
+            # IF-05: this is caught, logged, and the function still returns 0 —
+            # while an unloadable config a few lines above returns 1. The asymmetry
+            # is real and INTENDED, and is recorded here rather than left to be
+            # rediscovered: the ROADMAP invariant is that the event path always
+            # exits 0 so a broken handler can never wedge NUT's own shutdown logic,
+            # and it holds — `upssched` does not gate its pipe loop on CMDSCRIPT's
+            # status, and `SHUTDOWNCMD` is invoked by `upsmon` directly rather than
+            # through this path, so the rc 1 above is safe too.
+            #
+            # Worth stating plainly all the same: the LOUD failure is on the rare
+            # one (an unparseable config, already visible in `monitor list`,
+            # `status` and the webui), while a projector or transport exception at
+            # outage time — the failure that actually matters — is silent-with-rc-0.
+            # The traceback below is the only signal for that case, so
+            # `journalctl -t ups-orchestrator` is part of the shutdown-path check,
+            # not just a monitoring one.
             LOG.exception("Handler for event %r (UPS %s) raised", event, ups.name)
 
     try:
