@@ -494,6 +494,208 @@ def test_projection_keeps_local_last() -> None:
     assert calls == ["mt", "spark", "local"]
 
 
+def test_projected_serial_carries_declared_baud_verbatim() -> None:
+    # L1: the whole command, not just the target name. _default_serial_shutdown runs
+    # `stty -F <device> <baud>`, so a substituted baud writes garbage down the line
+    # and still returns rc=0 — a silent no-shutdown (P2-08).
+    notifier = FakeNotifier()
+    captured: list[tuple[str, int, str]] = []
+    deps, calls = make_deps(
+        notifier,
+        _low(),
+        countdown_every=0,
+        monitored_machines=(_mt(),),
+        serial_capture=captured,
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == ["mt"]
+    assert captured == [(MT_DEVICE, 9600, MT_CMD)]
+
+
+def test_projected_baud_override_is_not_rewritten() -> None:
+    # An operator who declares a non-default baud gets exactly that baud.
+    notifier = FakeNotifier()
+    captured: list[tuple[str, int, str]] = []
+    deps, _ = make_deps(
+        notifier,
+        _low(),
+        countdown_every=0,
+        monitored_machines=(_mt(baud=19200),),
+        serial_capture=captured,
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert captured == [(MT_DEVICE, 19200, MT_CMD)]
+
+
+def test_projected_routing_serial_and_ssh_runners() -> None:
+    notifier = FakeNotifier()
+    captured: list[tuple[str, int, str]] = []
+    deps, calls = make_deps(
+        notifier,
+        _low(),
+        countdown_every=0,
+        monitored_machines=(_mt(), _spark()),
+        serial_capture=captured,
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == ["mt", "spark"]
+    # Only the serial machine reached the serial runner; spark went out over ssh.
+    assert [device for device, _baud, _cmd in captured] == [MT_DEVICE]
+
+
+def test_native_machine_issues_no_push() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, _low(), countdown_every=0, monitored_machines=(_spark(method="native"),)
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == []  # upsmon on spark self-shuts on FSD; a push would double it
+
+
+def test_none_machine_issues_no_push() -> None:
+    notifier = FakeNotifier()
+    machines = (MonitoredMachine(name="idle", ups="ups1", ssh="idle"),)
+    deps, calls = make_deps(notifier, _low(), countdown_every=0, monitored_machines=machines)
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == []
+
+
+def test_mixed_native_and_serial_fires_only_serial() -> None:
+    # The live topology: spark is a native secondary, mt is a serial push. One UPS,
+    # two regimes — mt must be pushed and spark must be left alone.
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier,
+        _low(),
+        countdown_every=0,
+        monitored_machines=(_spark(method="native"), _mt()),
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == ["mt"]
+
+
+def test_duplicate_projected_name_does_not_swallow_other_machine() -> None:
+    # Two machines share a name (a hand-edited config). The duplicate is dropped,
+    # but a *distinct* machine's shutdown must still go out.
+    notifier = FakeNotifier()
+    machines = (_mt(), _spark(method="ssh", name="mt"), _spark())
+    deps, calls = make_deps(notifier, _low(), countdown_every=0, monitored_machines=machines)
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == ["mt", "spark"]
+
+
+def test_projected_target_blocked_when_policy_disabled() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, _low(), countdown_every=0, monitored_machines=(_mt(), _spark())
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == []
+
+
+def test_projected_target_fires_once_across_ticks() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(notifier, _low(), countdown_every=0, monitored_machines=(_mt(),))
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+    dispatch("tick", ups, state, deps)
+
+    assert calls == ["mt"]
+    assert state.shutdowns_sent == ["mt"]
+
+
+def test_projected_push_fires_without_nut_lb_at_threshold() -> None:
+    # "UPS-low" for a push is the configured close-to-empty threshold, NOT NUT's LB
+    # flag — LB drives the native secondaries, which are a separate mechanism. An
+    # on-battery snapshot at/below the threshold fires even with no LB in status.
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, snap("OB", charge=8, runtime=90), countdown_every=0, monitored_machines=(_mt(),)
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == ["mt"]
+
+
+def test_projected_push_does_not_fire_above_threshold() -> None:
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier,
+        snap("OB", charge=80, runtime=1800),
+        countdown_every=0,
+        monitored_machines=(_mt(),),
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == []
+
+
+def test_failed_projected_push_is_not_retried() -> None:
+    # Attempt-once: _fire_target records the target whatever the runner returned, so
+    # a box that failed to answer is not hammered on every remaining poll.
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, _low(), countdown_every=0, ssh_rc=1, monitored_machines=(_spark(),)
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+    dispatch("tick", ups, state, deps)
+
+    assert calls == ["spark"]
+    assert state.shutdowns_sent == ["spark"]
+    assert "shutdown FAILED" in notifier.sent[-1].title
+
+
+def test_failed_projected_serial_push_is_not_retried() -> None:
+    # Same contract over the serial transport: a short write (adapter unplugged, no
+    # getty on the far end) is reported and recorded, not retried on the next poll.
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, _low(), countdown_every=0, serial_rc=1, monitored_machines=(_mt(),)
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)
+    dispatch("tick", ups, state, deps)
+
+    assert calls == ["mt"]
+    assert state.shutdowns_sent == ["mt"]
+    assert "shutdown FAILED" in notifier.sent[-1].title
+
+
 def test_build_deps_wires_monitored_machines() -> None:
     from ups_orchestrator.cli import _build_deps
     from ups_orchestrator.config import Config
