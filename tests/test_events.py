@@ -1703,3 +1703,62 @@ def test_f3_reorder_preserves_the_shutdowns_sent_guarantee() -> None:
 
 def _raise_switch_is_dead(_target: ShutdownTarget) -> tuple[int, str, str]:
     raise RuntimeError("the switch is dead")
+
+
+# --- P2-03's unstated narrowing: the push trigger is NOT NUT's LB flag ---------
+
+
+def test_lowbatt_never_fires_a_push_even_with_a_machine_enrolled() -> None:
+    """docs/Shutdown-Mechanisms.md: NUT's LOWBATT does not reach the shutdown path.
+
+    `test_lowbatt_only_notifies` above proves the handler fires nothing, but it
+    runs with no enrolled machine and no target, so it cannot distinguish "does
+    not fire" from "had nothing to fire". This one hands `handle_lowbatt` a push
+    machine AND an enabled legacy target on a fully-armed policy.
+    """
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier,
+        snap("OB LB", charge=2, runtime=30),
+        countdown_every=0,
+        monitored_machines=(_spark(),),
+    )
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+    ups = make_ups("ups1", targets=(_remote("srv"),), shutdown_policy=shutdown_policy())
+
+    dispatch("lowbatt", ups, state, deps)
+
+    assert calls == []
+    assert state.shutdowns_sent == []
+
+
+def test_the_LB_flag_alone_does_not_open_the_push_gate() -> None:
+    """The push gate reads the configured thresholds, never `UpsSnapshot.low_battery`.
+
+    `LB` is set and the battery is under `battery_below`, but runtime is above
+    `runtime_below` — and `_close_to_empty` ANDs the two when both are configured.
+    NUT would already be halting a native secondary here; the push does not fire.
+    """
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier,
+        snap("OB LB", charge=5, runtime=1200),
+        countdown_every=0,
+        monitored_machines=(_spark(),),
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == []
+
+    # Drop runtime under the threshold — now BOTH are crossed and it fires. Same
+    # snapshot LB flag in both halves, so the flag is provably not the trigger.
+    deps2, calls2 = make_deps(
+        notifier,
+        snap("OB LB", charge=5, runtime=120),
+        countdown_every=0,
+        monitored_machines=(_spark(),),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps2)
+    assert calls2 == ["spark"]
