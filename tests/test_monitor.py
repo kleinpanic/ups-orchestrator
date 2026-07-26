@@ -2237,3 +2237,23 @@ def test_transition_guard_refuses_an_unnormalised_native_declaration(
     assert "already enrolled as a NATIVE secondary" in caplog.text
     assert cfg_path.read_text() == before  # the live native record is untouched
     assert ssh.calls == []
+
+
+# --- LO-C6: --force's help describes the authorisation it actually carries -----
+
+
+def test_force_help_text_names_only_the_dual_regime_refusal(cfg_path, capsys) -> None:
+    """Post-T-02-54 `--force` gates ONE thing; the help still said "guards" (plural).
+
+    The two flags are the phase's only anti-conflation surface an operator reads
+    before typing, so a stale plural is what makes someone reach for `--force`
+    expecting it to clear the native transition guard too.
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["monitor", "add", "--help"])
+    out = capsys.readouterr().out
+
+    assert "dual-regime" in out
+    assert "refuse-on-existing guards" not in out
+    # ...and the other half is still described as the separate authorisation it is.
+    assert "--force-remote-config" in out

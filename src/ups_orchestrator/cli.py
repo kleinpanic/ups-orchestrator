@@ -1368,7 +1368,15 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the plan, mutate nothing")
     parser.add_argument("--no-firewall", action="store_true", help="skip the nft open")
     parser.add_argument("--no-restart-bouncer", action="store_true", help="skip bouncer restart")
-    parser.add_argument("--force", action="store_true", help="override refuse-on-existing guards")
+    # LO-C6: the help used to read "override refuse-on-existing guards" (plural),
+    # describing the wider authorisation this flag carried BEFORE T-02-54 split it.
+    # It now gates exactly one thing and — deliberately — cannot open the native
+    # transition guard or authorise anything on a remote host.
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="override the LOCAL dual-regime double-shutdown refusal, and nothing else",
+    )
     # T-02-54: --force used to authorise BOTH the local guards above AND clobbering
     # a third host's /etc/nut/upsmon.conf, so an operator following the dual-regime
     # error message's own instruction also authorised the remote overwrite. Split.
