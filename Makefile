@@ -30,8 +30,12 @@ venv:
 	python3 -m venv .venv
 	$(PY) -m pip install -e ".[dev]"
 
+# CI runs BOTH `ruff check` and `ruff format --check`. This target ran only the
+# first, so a formatting-only regression passed `make check` locally and failed in
+# CI — the gap the integration audit hit. Keep the two in step.
 lint:
 	$(BASE)/.venv/bin/ruff check .
+	$(BASE)/.venv/bin/ruff format --check .
 
 type:
 	$(BASE)/.venv/bin/mypy
