@@ -65,6 +65,7 @@ from ups_orchestrator.config import (
     canonical_ups_key,
     dual_regime_conflicts,
     is_disarming,
+    safe_text,
     valid_ssh_alias,
 )
 
@@ -92,6 +93,25 @@ _VAR_SAMPLES = Path("/var/lib/ups-orchestrator/samples.jsonl")
 _VAR_EVENTS = Path("/var/lib/ups-orchestrator/events.jsonl")
 _VAR_NOTIFICATIONS = Path("/var/lib/ups-orchestrator/notifications.jsonl")
 _BOOT_AUDIT_MARKER = Path("/var/lib/ups-orchestrator/boot-audit.json")
+
+
+def _say(text: str) -> None:
+    """Print one line with config-authored control characters neutralised (F5).
+
+    Almost everything this module prints carries operator-authored free text — a
+    machine name, a device path, an ssh alias, a UPS label, a load-time notice —
+    and JSON can encode any control character as ``\\uXXXX``. ``mt\\x1b[2J\\x1b[H``
+    clears the screen and homes the cursor: a machine name that erases the report
+    naming it.
+
+    Sanitising at the ONE print boundary rather than at each of ~50 call sites is
+    the whole point. MED-06 fixed `status.py`, LO-C5 then had to fix the degrade
+    banner in this file, and `monitor list` was still printing the same raw name
+    four lines above the sanitised copy — three rounds of the same defect because
+    the rule lived at call sites. `safe_text` on a literal is the identity, so
+    routing every print through here costs nothing and cannot be forgotten.
+    """
+    print(safe_text(text))
 
 
 def _config_path() -> Path:
@@ -247,7 +267,11 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
             title=f"⚠️ Config degraded at startup — {len(cfg.degraded)} notice(s)",
             body=body,
             level=Level.CRITICAL if errors else Level.WARNING,
-            fields=[(n.subject, f"[{n.severity}] {n.message}") for n in shown],
+            # F5: Discord renders these in a code-free embed field, and the
+            # journal carries the same text — sanitise like every other sink.
+            fields=[
+                (safe_text(n.subject), f"[{n.severity}] {safe_text(n.message)}") for n in shown
+            ],
         )
     )
 
@@ -369,7 +393,7 @@ def _cmd_report(argv: list[str]) -> int:
         return 1
     note = report.build_report(cfg)
     if args.print:
-        print(report.render_text(note))
+        _say(report.render_text(note))
         return 0
     deps = _build_deps(cfg)
     result = deps.notifier.send(note)
@@ -440,7 +464,7 @@ def _cmd_power_dashboard(argv: list[str]) -> int:
         return 1
     if args.out:
         args.out.write_bytes(png)
-        print(f"wrote {args.out} ({len(png)} bytes)")
+        _say(f"wrote {args.out} ({len(png)} bytes)")
     if args.post:
         ok, status = dashboard.post_png(
             cfg.webhook_url,
@@ -468,7 +492,7 @@ def _cmd_baseline(argv: list[str]) -> int:
     from ups_orchestrator import baseline
 
     stats = baseline.compute_baselines(_sample_path(), list(cfg.upses), hours=max(1, args.hours))
-    print(baseline.render_text(cfg, stats, hours=max(1, args.hours)))
+    _say(baseline.render_text(cfg, stats, hours=max(1, args.hours)))
     return 0
 
 
@@ -520,7 +544,7 @@ def _cmd_selftest(argv: list[str]) -> int:
             read_result=lambda u: upsc_var(u, "ups.test.result"),
             timeout=max(5.0, args.timeout),
         )
-        print(f"{ups.label}: {result.outcome} — {result.detail}")
+        _say(f"{ups.label}: {result.outcome} — {result.detail}")
         if result.outcome != "skipped":
             deps.notifier.send(
                 Notification(
@@ -587,7 +611,7 @@ def _cmd_control(argv: list[str]) -> int:
         rc, out, err = upscmd(ups.name, command, user=user, password=password)
         ok = rc == 0
         detail = "OK" if ok else f"FAIL: {(err or out or 'upscmd error').splitlines()[0]}"
-        print(f"{ups.label}: {args.action} ({command}) -> {detail}")
+        _say(f"{ups.label}: {args.action} ({command}) -> {detail}")
         results.append((ups.label, ok, detail))
 
     any_fail = any(not ok for _, ok, _ in results)
@@ -652,7 +676,7 @@ def _cmd_audit(argv: list[str]) -> int:
         notification_log_path=_notification_log_path(),
         sample_path=_sample_path(),
     )
-    print(result.text)
+    _say(result.text)
     return 0
 
 
@@ -696,12 +720,12 @@ def _cmd_notify_test(argv: list[str]) -> int:
         "If this arrives, webhook auth, systemd environment, and embed rendering work."
     )
     if args.print:
-        print(report.render_text(note))
+        _say(report.render_text(note))
         return 0
 
     deps = _build_deps(cfg)
     result = deps.notifier.send(note)
-    print(
+    _say(
         "notification delivery: "
         f"ok={result.ok} configured={result.configured} attempts={result.attempts} "
         f"status={result.status_code or 'n/a'}" + (f" error={result.error}" if result.error else "")
@@ -735,9 +759,9 @@ def _cmd_logs(argv: list[str]) -> int:
         "notifications": _notification_log_path(),
         "samples": _sample_path(),
     }[args.kind]
-    print(f"{args.kind}: {path}")
+    _say(f"{args.kind}: {path}")
     for line in _tail(path, max(1, args.lines)):
-        print(line)
+        _say(line)
     return 0
 
 
@@ -985,11 +1009,11 @@ def _print_degraded(cfg: Config) -> None:
     """
     if not cfg.degraded:
         return
-    print("")
-    print("⚠ DEGRADED CONFIG — a shutdown authority was disarmed or flagged at load:")
+    _say("")
+    _say("⚠ DEGRADED CONFIG — a shutdown authority was disarmed or flagged at load:")
     for n in cfg.degraded:
         label = "ERROR" if is_disarming(n) else "ADVISORY"
-        print(f"  {label} {status_view._safe(n.subject)}: {status_view._safe(n.message)}")
+        _say(f"  {label} {n.subject}: {n.message}")  # _say sanitises (F5/LO-C5)
 
 
 def _method_field(m: MonitoredMachine) -> str:
@@ -1008,10 +1032,10 @@ def _monitor_list(cfg: Config) -> int:
     if not cfg.monitored_machines:
         # Still falls through to the notices: a config can carry zero machines and
         # a disabled legacy target.
-        print("no machines enrolled")
+        _say("no machines enrolled")
     for m in cfg.monitored_machines:
         backup = "backup:on" if m.backup.enabled else "backup:off"
-        print(
+        _say(
             f"{m.name}\tssh={m.ssh}\tups={m.ups}\tos={m.os}\tip={m.ip or '-'}\t"
             f"{_method_field(m)}\t{backup}"
         )
@@ -1054,20 +1078,20 @@ def _verify_serial(m: MonitoredMachine, stat_fn: Callable[[str], os.stat_result]
     """
     device = m.serial_device.strip()
     if not device:
-        print(f"{m.name}: FAIL — declares serial with no serial_device")
+        _say(f"{m.name}: FAIL — declares serial with no serial_device")
         return 1
     try:
         mode = stat_fn(device).st_mode
     except OSError as exc:
-        print(f"{m.name}: FAIL — serial device {device} is not present ({exc})")
+        _say(f"{m.name}: FAIL — serial device {device} is not present ({exc})")
         return 1
     if not stat.S_ISCHR(mode):
-        print(f"{m.name}: FAIL — {device} is not a character device ({stat.filemode(mode)})")
+        _say(f"{m.name}: FAIL — {device} is not a character device ({stat.filemode(mode)})")
         return 1
     if m.serial_baud is None or m.serial_baud <= 0:
-        print(f"{m.name}: FAIL — no usable declared serial_baud (the live console here is 9600)")
+        _say(f"{m.name}: FAIL — no usable declared serial_baud (the live console here is 9600)")
         return 1
-    print(f"{m.name}: OK — serial {device} present at a declared {m.serial_baud} baud")
+    _say(f"{m.name}: OK — serial {device} present at a declared {m.serial_baud} baud")
     return 0
 
 
@@ -1089,16 +1113,16 @@ def _verify_ssh_alias(m: MonitoredMachine) -> int:
     """
     alias = m.ssh.strip()
     if not alias:
-        print(f"{m.name}: FAIL — declares ssh with no alias")
+        _say(f"{m.name}: FAIL — declares ssh with no alias")
         return 1
     if not _valid_ssh_alias(alias):
         LOG.error("monitor verify: config ssh alias %r for %s is invalid", m.ssh, m.name)
         return 2
     rc, _out, err = _monitor_run_ssh(alias, "true", None)
     if rc != 0:
-        print(f"{m.name}: FAIL — ssh {alias} unreachable ({err.strip() or f'rc {rc}'})")
+        _say(f"{m.name}: FAIL — ssh {alias} unreachable ({err.strip() or f'rc {rc}'})")
         return 1
-    print(f"{m.name}: OK — ssh {alias} reachable")
+    _say(f"{m.name}: OK — ssh {alias} reachable")
     return 0
 
 
@@ -1134,17 +1158,17 @@ def _monitor_verify(
     head = f"{machine.name}: declared shutdown_method={declared}"
     if effective != declared:
         head += f" (effective: {effective})"
-    print(head)
+    _say(head)
 
     rc = 0
     if machine.disarmed:
         for n in machine.load_notices:
             if is_disarming(n):
-                print(f"  DISARMED (declared {declared}): {n.message}")
+                _say(f"  DISARMED (declared {declared}): {n.message}")
         rc = 1
     else:
         for n in machine.load_notices:
-            print(f"  {n.severity.upper()}: {n.message}")
+            _say(f"  {n.severity.upper()}: {n.message}")
 
     probe = _probe_secondary_reason(machine)
     if probe is not None:
@@ -1159,7 +1183,7 @@ def _monitor_verify(
         # be established, which is rc 1. Kept ABOVE the charset check so a blank value
         # never lands in the metachar branch — a blank alias is not an injection.
         if not machine.ups.strip():
-            print(
+            _say(
                 f"  cannot probe: this record has no 'ups', so there is no "
                 f"'upsc <ups>@<primary>' to run and nothing here can establish whether a "
                 f"secondary is armed on that box. Set 'ups' to the UPS that powers it, or "
@@ -1219,17 +1243,17 @@ def _monitor_verify(
             timeout=args.timeout,
             deep=args.deep,
         )
-        print(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
+        _say(f"{machine.name}: {'OK' if ok else 'FAIL'} — {detail}")
         if probe == "native":
             if machine.load_notices:
-                print(
+                _say(
                     f"  the remote secondary remains the surviving authority — it lives in "
                     f"that box's /etc and no config change here disarms it. "
                     f"'monitor remove {machine.name}' is the only real disarm."
                 )
             return 0 if ok else 1
         if ok:
-            print(
+            _say(
                 f"  this record declares {declared!r}, and a live NUT secondary answers on "
                 f"that box. Run 'monitor remove {machine.name}' to actually disarm it."
             )
@@ -1242,7 +1266,7 @@ def _monitor_verify(
         return _verify_serial(machine, stat_fn) or rc
     if declared == "ssh":
         return _verify_ssh_alias(machine) or rc
-    print(f"{machine.name}: no active shutdown authority")
+    _say(f"{machine.name}: no active shutdown authority")
     return rc
 
 
@@ -1306,9 +1330,9 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             else machine.ssh
         )
         fw = "skip (--no-firewall)" if args.no_firewall else saddrs
-        print(f"[dry-run] disarm remote: {disarm}")
-        print(f"[dry-run] firewall: {fw}")
-        print(f"[dry-run] persist: drop {machine.name} (config written LAST)")
+        _say(f"[dry-run] disarm remote: {disarm}")
+        _say(f"[dry-run] firewall: {fw}")
+        _say(f"[dry-run] persist: drop {machine.name} (config written LAST)")
         return 0
 
     # 1) disarm remote (unless --keep-remote, or the record is not native)
@@ -1349,7 +1373,7 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
     # 3) persist config LAST (so a firewall failure leaves config unchanged)
     _monitor_persist(cfg_path, [m.to_dict() for m in survivors])
-    print(f"removed {machine.name}")
+    _say(f"removed {machine.name}")
     return 0
 
 
@@ -1700,12 +1724,12 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
                 "ssh": f"ssh {ssh_alias}",
                 "none": "no active shutdown authority",
             }[method]
-            print(f"[dry-run] record-only add ({method}): {transport}")
-            print(f"[dry-run] shutdown_cmd: {shutdown_cmd}")
-            print("[dry-run] skipped: upsd.users, LISTEN, remote upsmon (native-only)")
+            _say(f"[dry-run] record-only add ({method}): {transport}")
+            _say(f"[dry-run] shutdown_cmd: {shutdown_cmd}")
+            _say("[dry-run] skipped: upsd.users, LISTEN, remote upsmon (native-only)")
             fw = "skip (--no-firewall)" if args.no_firewall else saddrs
-            print(f"[dry-run] firewall: {fw}   (revokes any ip this record sheds)")
-            print(f"[dry-run] persist: {args.name} (config written LAST)")
+            _say(f"[dry-run] firewall: {fw}   (revokes any ip this record sheds)")
+            _say(f"[dry-run] persist: {args.name} (config written LAST)")
             return 0
         if not args.no_firewall:
             # Never fatal here: recording the machine is the operator's actual
@@ -1715,7 +1739,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
                 saddrs, no_restart_bouncer=args.no_restart_bouncer, verb="monitor add"
             )
         _monitor_persist(cfg_path, [*(m.to_dict() for m in others), entry.to_dict()])
-        print(f"recorded {args.name} (shutdown_method={method})")
+        _say(f"recorded {args.name} (shutdown_method={method})")
         return 0
 
     # 6. password from env ONLY — never invent, never store (rc 2 if absent)
@@ -1739,15 +1763,15 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         preview_primary = args.primary_ip.strip() if args.primary_ip else ""
         unresolved = "<unresolved — the real run probes for it>"
         saddrs = _survivor_saddrs((*others, dataclasses.replace(candidate, ip=preview_ip)))
-        print(f"[dry-run] resolve ip: {preview_ip or unresolved}")
-        print(
+        _say(f"[dry-run] resolve ip: {preview_ip or unresolved}")
+        _say(
             f"[dry-run] bootstrap primary: LISTEN {preview_primary or unresolved}, "
             f"user {ns.secondary_user} (password <redacted>), nft "
             + ("skip" if args.no_firewall else str(saddrs))
         )
-        print(f"[dry-run] remote bootstrap: {ssh_alias} detect/install/write/enable")
-        print("[dry-run] verify (deep) then persist entry (no password)")
-        print("[dry-run] contacted: nothing — no ssh, no route probe, no local command")
+        _say(f"[dry-run] remote bootstrap: {ssh_alias} detect/install/write/enable")
+        _say("[dry-run] verify (deep) then persist entry (no password)")
+        _say("[dry-run] contacted: nothing — no ssh, no route probe, no local command")
         return 0
 
     # 7. resolve the remote source IP (validated literal). When --primary-ip is
@@ -1869,7 +1893,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     kept = [m.to_dict() for m in others]
     kept.append(entry.to_dict())
     _monitor_persist(cfg_path, kept)
-    print(f"enrolled {args.name} ({ip}) on {ups_name}")
+    _say(f"enrolled {args.name} ({ip}) on {ups_name}")
     return 0
 
 
@@ -1988,7 +2012,7 @@ def _cmd_remote_shutdown(argv: list[str]) -> int:
         # sweep. Sweeping here is still the useful answer to "what is configured?",
         # but an operator who validates with the preview and then runs it for real
         # must not be surprised — that surprise was the whole finding.
-        print(
+        _say(
             f"no UPS named and $UPSNAME is unset — previewing all "
             f"{len(cfg.upses)} configured UPS(es). A REAL 'remote-shutdown' with no "
             f"name evaluates NOTHING and exits 2: pass a UPS name or set $UPSNAME."
@@ -2000,22 +2024,22 @@ def _cmd_remote_shutdown(argv: list[str]) -> int:
             continue
         snap = deps.read_snapshot(ups.name)
         state = store.get(ups.name)
-        print(f"{ups.label} ({ups.name}) — status {snap.status or 'unknown'}")
+        _say(f"{ups.label} ({ups.name}) — status {snap.status or 'unknown'}")
         targets = _resolved_targets(ups, deps)
         omitted = _unprojected_machines(ups, deps, targets)
         if not targets and not omitted:
-            print("  (no shutdown targets resolved)")
+            _say("  (no shutdown targets resolved)")
             continue
         for t in targets:
             should, reason = _preview_verdict(ups, state, deps, t, snap)
-            print(
+            _say(
                 f"  {t.name}\t{_target_location(t)}\t{t.cmd}\t"
                 f"would fire: {'yes' if should else 'no'} — {reason}"
             )
         # HI-C4: a machine that will NOT fire is the thing the operator is asking
         # about, and it was the one thing the preview left out entirely.
         for name, reason in omitted:
-            print(f"  {name}\t(no target)\t—\twould fire: no — {reason}")
+            _say(f"  {name}\t(no target)\t—\twould fire: no — {reason}")
     # RA-01: a degrade must reach the operator where the operator already looks,
     # and "what will happen?" is exactly where they look. `monitor list` renders
     # this block; the command built to answer that question did not.
@@ -2127,17 +2151,17 @@ def _cmd_shutdown(argv: list[str]) -> int:
     where = _target_location(target)
     # Print the exact transport parameters BEFORE sending, so an operator can abort
     # a wrong device by reading the line rather than by reading the outcome.
-    print(f"rehearse {target.name} via {where}")
-    print(f"  command: {_REHEARSAL_CMD}   (hard-coded; the recorded shutdown_cmd is not read)")
+    _say(f"rehearse {target.name} via {where}")
+    _say(f"  command: {_REHEARSAL_CMD}   (hard-coded; the recorded shutdown_cmd is not read)")
     if target.is_serial:
-        print(f"  device:  {target.device} @ {target.baud} baud")
+        _say(f"  device:  {target.device} @ {target.baud} baud")
     rc, _out, err = (
         deps.serial_shutdown(target) if target.is_serial else deps.ssh_shutdown(target)
     )
     if rc != 0:
-        print(f"  FAIL — rc={rc} {err.strip() or '(no stderr)'}")
+        _say(f"  FAIL — rc={rc} {err.strip() or '(no stderr)'}")
         return 1
-    print(f"  OK — look for PHASE2_REHEARSAL on {target.name} "
+    _say(f"  OK — look for PHASE2_REHEARSAL on {target.name} "
           f"(journalctl -t ups-orchestrator)")
     return 0
 

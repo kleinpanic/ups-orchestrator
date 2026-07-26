@@ -33,6 +33,30 @@ def normalize_ups_name(name: str) -> str:
     return name.strip().split("@", 1)[0]
 
 
+# F5 / w34 MED-06 / LO-C5. Config-authored strings — machine names, device paths,
+# ssh aliases, UPS labels — are rendered to a terminal by `status`, `monitor
+# list`, `monitor verify`, `remote-shutdown --dry-run`, `shutdown rehearse` and
+# the web UI, and to the journal by every `logger` call that names one. A name of
+# `mt\x1b[2J\x1b[H` clears the screen and homes the cursor: it erases the very
+# report that names it. `_ANSI_RE` in `status.py` matches SGR sequences only, so
+# nothing else strips or even accounts for these.
+#
+# The predicate lives HERE, at the bottom of the import graph, because `config`,
+# `status`, `cli` and `webui` all need it and three copies of one regex is how
+# LO-C5 shipped in the first place — the degrade banner was sanitised and the
+# `monitor list` line four lines above it was not.
+#
+# ESC is included, which is what neutralises every non-SGR sequence as well. `\n`
+# and `\t` are deliberately NOT in the class: they are legitimate layout in a
+# multi-line notice message, and neither can move the cursor arbitrarily.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def safe_text(text: str) -> str:
+    """Render a config-authored string inert for a terminal or journal. PURE."""
+    return _CTRL_RE.sub("?", text)
+
+
 def _as_int(value: object, default: int) -> int:
     """Coerce an untyped JSON value to int, falling back to ``default``.
 
@@ -195,7 +219,14 @@ class ConfigNotice:
             )
 
     def __str__(self) -> str:
-        return f"[{self.severity}] {self.subject}: {self.message}"
+        # F5: sanitised HERE, not at each of the render sites, because this is the
+        # form every logger call uses (`logger.error("config degrade: %s", notice)`)
+        # and the journal is as much a terminal as a TTY is — `journalctl` pages
+        # through one. `subject` and `message` carry machine names, device paths and
+        # ssh aliases verbatim out of the config. The FIELDS are untouched
+        # (INV-DEGRADE: a notice is a value, not a rendering), so anything that
+        # wants the raw text still has it.
+        return f"[{self.severity}] {safe_text(self.subject)}: {safe_text(self.message)}"
 
 
 def is_disarming(notice: ConfigNotice) -> bool:

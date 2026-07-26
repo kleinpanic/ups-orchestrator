@@ -10,7 +10,7 @@ import textwrap
 import time
 from pathlib import Path
 
-from ups_orchestrator.config import Config, ConfigNotice, is_disarming
+from ups_orchestrator.config import Config, ConfigNotice, is_disarming, safe_text
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
@@ -39,12 +39,12 @@ _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 # value-injection boundary (T-02-10 hardened `ssh` for exactly this), so sanitise once
 # at the render boundary rather than at each call site. ESC is included, which is what
 # neutralises every non-SGR sequence as well.
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-
-
-def _safe(text: str) -> str:
-    """Render a config-authored string inert for a terminal (MED-06)."""
-    return _CTRL_RE.sub("?", text)
+# F5: the regex itself now lives in `config.safe_text`, at the bottom of the import
+# graph, because `config`, `cli` and `webui` all render the same strings — and three
+# copies of one rule is exactly how LO-C5 shipped, with the degrade banner sanitised
+# and the `monitor list` line four lines above it not. This name is kept as the local
+# spelling every call site in this module already uses.
+_safe = safe_text
 
 
 def _term_width() -> int:

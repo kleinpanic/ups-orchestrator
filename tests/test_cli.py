@@ -1212,3 +1212,54 @@ def test_dry_run_does_not_double_list_a_machine_that_did_project(
 
     assert out.count("spark") == 1
     assert "(no target)" not in out
+
+
+# --- F5: the preview and the rehearsal are terminals too ----------------------
+
+_HOSTILE = "spark\x1b[2J\x1b[H\x07\x00"
+
+
+def test_dry_run_preview_is_sanitised(env_config, monkeypatch, capsys) -> None:
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": _HOSTILE,
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0\x1b[2J",
+                "serial_baud": 9600,
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out and "\x07" not in out and "\x00" not in out
+    assert "spark" in out  # ...and it is still identifiable
+
+
+def test_shutdown_rehearse_output_is_sanitised(env_config, monkeypatch, capsys) -> None:
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": _HOSTILE,
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0\x1b[2J",
+                "serial_baud": 9600,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "ups_orchestrator.events._default_serial_shutdown", lambda _t: (0, "", "")
+    )
+
+    cli.main(["shutdown", "rehearse", _HOSTILE])
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out and "\x07" not in out and "\x00" not in out

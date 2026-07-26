@@ -2739,3 +2739,80 @@ def test_add_record_only_no_firewall_skips_the_sweep(cfg_path, monkeypatch) -> N
     rc = cli.main(["monitor", "add", "box", "--method", "none", "--no-firewall"])
 
     assert rc == 0 and nft.calls == []
+
+
+# --- F5: every config-authored surface is sanitised, not just the banner -------
+#
+# MED-06 fixed `status.py`; LO-C5 then had to fix the degrade banner in `cli.py`;
+# and `monitor list` was still printing the same raw machine name FOUR LINES ABOVE
+# the sanitised copy. Three rounds of one defect, because the rule lived at call
+# sites. It lives at the render boundary now (`cli._say`, `ConfigNotice.__str__`).
+
+_HOSTILE_NAME = "mt\x1b[2J\x1b[H\x07\x00"
+
+
+def _assert_inert(text: str, label: str) -> None:
+    for ch, name in ((("\x1b"), "ESC"), ("\x07", "BEL"), ("\x00", "NUL")):
+        assert ch not in text, f"{label} still emits a raw {name}"
+
+
+def test_monitor_list_machine_line_is_sanitised_not_just_the_banner(cfg_path, capsys) -> None:
+    """The measured defect: the raw name four lines above the sanitised one."""
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(_HOSTILE_NAME, method="serial", ups="", device="/dev/x", baud=9600)
+        ],
+    )
+    assert cli.main(["monitor", "list"]) == 0
+    _assert_inert(capsys.readouterr().out, "monitor list")
+
+
+def test_monitor_verify_output_is_sanitised(cfg_path, monkeypatch, capsys) -> None:
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry(_HOSTILE_NAME, method="native", ssh="mt", ups="cyberpower")],
+    )
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "OL\n", "")]))
+    cli.main(["monitor", "verify", _HOSTILE_NAME])
+    _assert_inert(capsys.readouterr().out, "monitor verify")
+
+
+def test_config_notice_str_is_sanitised_so_the_journal_is_too(caplog, cfg_path) -> None:
+    """`logger.error("config degrade: %s", notice)` renders through `__str__`.
+
+    `journalctl` pages the journal through a terminal, so a control sequence in a
+    log line is the same defect wearing a different hat.
+    """
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(_HOSTILE_NAME, method="serial", ups="", device="/dev/x", baud=9600)
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        assert cli.main(["monitor", "list"]) == 0
+    _assert_inert(caplog.text, "the journal")
+
+
+def test_config_notice_fields_are_left_raw(cfg_path) -> None:
+    """INV-DEGRADE: a notice is a VALUE. Sanitising is a rendering, not a mutation.
+
+    `__str__` is sanitised so every logger call is; the fields themselves keep
+    exactly what the operator wrote, so anything that needs the real name has it.
+    """
+    from ups_orchestrator.config import ConfigNotice
+
+    n = ConfigNotice(severity="error", subject=_HOSTILE_NAME, message="x\x1by")
+    assert n.subject == _HOSTILE_NAME
+    assert n.message == "x\x1by"
+    _assert_inert(str(n), "ConfigNotice.__str__")
+
+
+def test_safe_text_leaves_newline_and_tab_alone() -> None:
+    """They are legitimate layout in a multi-line notice and move no cursor."""
+    from ups_orchestrator.config import safe_text
+
+    assert safe_text("a\nb\tc") == "a\nb\tc"
+    assert safe_text("a\x1bb") == "a?b"
+    assert safe_text("a\x00b\x07c\x7fd") == "a?b?c?d"
