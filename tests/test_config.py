@@ -2092,3 +2092,91 @@ def test_every_defect_config_still_loads_and_reports_each_class(tmp_path: Path) 
     subjects = {n.subject for n in cfg.degraded}
     assert {"mt", "spark", "dup", "DUP", "unfireable", "handedited", "injected"} <= subjects
     assert {"cyberpower/no-host", "cyberpower/odd-kind", "cyberpower/bad-baud"} <= subjects
+
+
+# --- MED-04 / LO-05 / LO-06: the notice surface stays proportionate ------------
+
+
+def _dup_config(tmp_path: Path) -> Path:
+    """Two records named `mt` plus one enabled legacy target that collides with them."""
+    return _write(
+        tmp_path,
+        {
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [
+                        {"name": "mt", "kind": "remote", "enabled": True, "host": "mt"}
+                    ],
+                }
+            },
+            "monitored_machines": [
+                {"name": "mt", "ups": "cyberpower", "ssh": "mt", "shutdown_method": "ssh"},
+                {"name": "mt", "ups": "cyberpower", "ssh": "mt", "shutdown_method": "ssh"},
+            ],
+        },
+    )
+
+
+def test_duplicate_names_do_not_fan_out_the_notice_surface(tmp_path: Path) -> None:
+    # MED-04. dual_regime_pairs yields one tuple PER RECORD and _apply_degrades applied
+    # each to EVERY index sharing the name, so the product was n^2: two `mt` records
+    # produced four identical dual-regime notices, five would produce twenty-five. That
+    # tuple is not log-only — it feeds status.render, the web banner, monitor list and
+    # a Discord embed, i.e. the operator's safety surface.
+    cfg = Config.load(_dup_config(tmp_path), env={})
+
+    messages = [n.message for n in cfg.degraded]
+    assert len(messages) == len(set(messages)), messages
+    dual = [m for m in messages if "governed by BOTH shutdown regimes" in m]
+    assert len(dual) == 1
+    # ...and every record still carries the finding, so nothing was weakened.
+    for m in cfg.monitored_machines:
+        assert m.disarmed is True
+        assert sum("governed by BOTH" in n.message for n in m.load_notices) == 1
+
+
+def test_a_targets_second_distinct_disarm_reason_is_recorded(tmp_path: Path) -> None:
+    # LO-06: "first reason wins" is defensible; dropping the second WITHOUT A TRACE is
+    # not. A target disarmed for the dual-regime collision never surfaced its blank-host
+    # finding, so fixing the collision revealed a second failure the operator was never
+    # told about.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [
+                        {"name": "mt", "kind": "remote", "enabled": True, "host": ""}
+                    ],
+                }
+            },
+            "monitored_machines": [
+                {"name": "mt", "ups": "cyberpower", "ssh": "mt", "shutdown_method": "ssh"}
+            ],
+        },
+    )
+    cfg = Config.load(p, env={})
+    ups = cfg.ups("cyberpower")
+    assert ups is not None
+    (target,) = ups.shutdown_targets
+    reasons = [n.message for n in target.load_notices]
+    assert any("collides with monitored machine" in r for r in reasons)
+    assert any("blank host" in r for r in reasons)
+    assert target.effective_enabled is False
+
+
+def test_disarm_target_does_not_raise_on_a_ups_whose_name_differs_from_its_key() -> None:
+    # LO-05: ups_key comes from dual_regime_pairs (ups.name) while target_lists is keyed
+    # by the upses dict key. Config.load keeps them equal, but RA-01's whole premise is
+    # that nothing on this path may raise.
+    from ups_orchestrator.config import _apply_degrades
+
+    target = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt")
+    ups = UpsConfig(name="a-different-name", label="CP", shutdown_targets=(target,))
+    machines = _machines({"name": "mt", "ups": "", "ssh": "mt", "shutdown_method": "ssh"})
+
+    _machines_out, _upses_out, notices = _apply_degrades(machines, {"cyberpower": ups})
+
+    assert notices  # it reported rather than raising

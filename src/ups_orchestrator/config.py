@@ -1186,17 +1186,42 @@ def _apply_degrades(
     notices: list[ConfigNotice] = []
 
     def _record(notice: ConfigNotice) -> None:
+        # MED-04: the notice list is an OPERATOR SURFACE — status, the web banner,
+        # `monitor list` and a Discord embed all render it — so an identical notice
+        # repeated is noise on the one screen that must stay readable. ConfigNotice is
+        # frozen and compares by value, so this is exact-duplicate suppression, never
+        # a merge of two different findings.
+        if notice in notices:
+            return
         notices.append(notice)
         if is_disarming(notice):
             logger.error("config degrade: %s", notice)
         else:
             logger.warning("config advisory: %s", notice)
 
+    def _already_said(i: int, severity: str, message: str) -> bool:
+        """Has this exact notice already been attached to this record? (MED-04)
+
+        ``dual_regime_pairs`` yields one tuple PER MACHINE RECORD and each tuple is
+        then applied to EVERY index sharing that name, so duplicates made the fan-out
+        quadratic: two records named ``mt`` produced four identical dual-regime
+        notices on two records, five produced twenty-five. The state a notice carries
+        is idempotent — a second identical error changes no gate — so the second
+        attachment is pure noise.
+        """
+        return any(
+            n.severity == severity and n.message == message for n in working[i].load_notices
+        )
+
     def disarm_at(i: int, message: str) -> None:
+        if _already_said(i, "error", message):
+            return
         working[i] = _disarm_machine(working[i], message)
         _record(working[i].load_notices[-1])
 
     def advise_at(i: int, message: str) -> None:
+        if _already_said(i, "advisory", message):
+            return
         working[i] = _advise_machine(working[i], message)
         _record(working[i].load_notices[-1])
 
@@ -1204,11 +1229,30 @@ def _apply_degrades(
         return [i for i, m in enumerate(working) if m.name == name]
 
     def disarm_target(ups_key: str, target_name: str, message: str) -> None:
-        for j, t in enumerate(target_lists[ups_key]):
-            if t.name == target_name and not any(is_disarming(n) for n in t.load_notices):
-                target_lists[ups_key][j] = _disarm_target(ups_key, t, message)
-                _record(target_lists[ups_key][j].load_notices[-1])
+        # LO-05: ``.get`` rather than ``[]``. ``ups_key`` comes from
+        # ``dual_regime_pairs``, which returns ``ups.name``, while ``target_lists`` is
+        # keyed by the ``upses`` dict key. ``UpsConfig.from_dict`` keeps the two equal
+        # so ``Config.load`` is safe — but a directly-constructed ``UpsConfig`` whose
+        # name differs from its key would raise KeyError out of a function RA-01
+        # requires to raise nothing.
+        targets = target_lists.get(ups_key)
+        if targets is None:
+            return
+        for j, t in enumerate(targets):
+            if t.name != target_name:
+                continue
+            # LO-06: a target's SECOND, distinct disarm reason used to be dropped
+            # without a trace — the guard was "already has an error notice", so a
+            # target disarmed for a dual-regime collision never surfaced its
+            # subsequent blank-host or bad-baud finding. The state change is
+            # idempotent (a second error notice disarms nothing further), so append
+            # the reason and let the fold do what it already does. Only an exact
+            # repeat is suppressed (MED-04).
+            if any(n.severity == "error" and n.message == message for n in t.load_notices):
                 return
+            targets[j] = _disarm_target(ups_key, t, message)
+            _record(targets[j].load_notices[-1])
+            return
 
     # 1. LO-13 duplicate names. Every colliding record is KEPT — a drop is written by
     # _monitor_persist as a DELETION, since it rewrites the whole array from
