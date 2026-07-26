@@ -62,6 +62,7 @@ from ups_orchestrator.config import (
     MonitoredMachine,
     ShutdownTarget,
     UpsConfig,
+    canonical_ups_key,
     dual_regime_conflicts,
     is_disarming,
     valid_ssh_alias,
@@ -1880,6 +1881,60 @@ def _resolved_targets(ups: UpsConfig, deps: Deps) -> list[ShutdownTarget]:
     return [*ups.shutdown_targets, *_machine_targets(ups, deps.monitored_machines)]
 
 
+def _unprojected_machines(
+    ups: UpsConfig, deps: Deps, projected: list[ShutdownTarget]
+) -> list[tuple[str, str]]:
+    """``(name, reason)`` for every machine on this UPS that produced NO target.
+
+    HI-C4: the preview listed only what `_machine_targets` yielded, so a machine
+    the load disarmed — the exact machine an operator runs this command to ask
+    about — did not appear at all: not as a line, not as a verdict, not on stderr.
+    `_machine_targets` reads `effective_method`, so a disarmed machine resolves to
+    `"none"` and hits its bare `else: continue`, with no `_report_unprojectable`
+    call; and `_resolved_targets` passes no `deps`, so even the cases that DO
+    report are reduced to a `LOG.error` the preview never shows.
+
+    Answers "why not" from the same fields the firing path reads, so the reasons
+    cannot drift from the omissions. Reporting, so it may read the EFFECT — and it
+    names the DECLARATION alongside, because "disarmed at load" and "declared
+    none" are the same effect wearing two very different meanings (T-02-46).
+    """
+    ups_key = canonical_ups_key(ups.name)
+    listed = {t.name.strip().lower() for t in projected}
+    out: list[tuple[str, str]] = []
+    for m in deps.monitored_machines:
+        if not m.ups.strip() or canonical_ups_key(m.ups) != ups_key:
+            continue
+        if m.name.strip().lower() in listed:
+            continue
+        declared = m.shutdown_method.strip().lower()
+        if m.disarmed:
+            reason = (
+                f"disarmed at load (declared {declared}) — see "
+                f"'monitor verify {m.name}' and the DEGRADED CONFIG block below"
+            )
+        elif declared == "native":
+            reason = (
+                "declared native — its own upsmon halts it on this primary's FSD, "
+                "so it is deliberately never pushed to (a push as well would shut "
+                "the box down twice)"
+            )
+        elif declared == "none":
+            reason = "declared none — this record carries no shutdown authority"
+        elif declared == "serial" and m.serial_baud is None:
+            reason = (
+                "declared serial with no usable serial_baud, so it cannot be "
+                "projected; declare a positive integer baud"
+            )
+        else:
+            reason = (
+                "not projected — most likely a duplicate shutdown target name on "
+                f"this UPS; run 'monitor verify {m.name}'"
+            )
+        out.append((m.name, reason))
+    return out
+
+
 def _preview_verdict(
     ups: UpsConfig, state: UpsState, deps: Deps, target: ShutdownTarget, snap: UpsSnapshot
 ) -> tuple[bool, str]:
@@ -1947,7 +2002,8 @@ def _cmd_remote_shutdown(argv: list[str]) -> int:
         state = store.get(ups.name)
         print(f"{ups.label} ({ups.name}) — status {snap.status or 'unknown'}")
         targets = _resolved_targets(ups, deps)
-        if not targets:
+        omitted = _unprojected_machines(ups, deps, targets)
+        if not targets and not omitted:
             print("  (no shutdown targets resolved)")
             continue
         for t in targets:
@@ -1956,6 +2012,14 @@ def _cmd_remote_shutdown(argv: list[str]) -> int:
                 f"  {t.name}\t{_target_location(t)}\t{t.cmd}\t"
                 f"would fire: {'yes' if should else 'no'} — {reason}"
             )
+        # HI-C4: a machine that will NOT fire is the thing the operator is asking
+        # about, and it was the one thing the preview left out entirely.
+        for name, reason in omitted:
+            print(f"  {name}\t(no target)\t—\twould fire: no — {reason}")
+    # RA-01: a degrade must reach the operator where the operator already looks,
+    # and "what will happen?" is exactly where they look. `monitor list` renders
+    # this block; the command built to answer that question did not.
+    _print_degraded(cfg)
     # `store.save()` is deliberately NOT called: a preview reads state and writes none.
     return 0
 

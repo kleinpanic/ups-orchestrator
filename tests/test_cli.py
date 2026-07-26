@@ -1078,3 +1078,137 @@ def test_watch_notification_log_never_records_the_webhook_token(monkeypatch, tmp
     _fake_ups(monkeypatch, "OL", 100, 600)
     assert cli.main(["notify-test"]) == 1
     assert secret not in log.read_text()
+
+
+# --- HI-C4: the preview must show the machines that will NOT fire -------------
+
+
+def test_dry_run_shows_a_machine_disarmed_at_load(env_config, monkeypatch, capsys) -> None:
+    """The one machine the operator is asking about was the one omitted.
+
+    `_machine_targets` reads `effective_method`, so a machine `Config.load`
+    disarmed resolves to `"none"` and hits its bare `else: continue` — no target,
+    and (unlike the baud and duplicate-name cases) no `_report_unprojectable`
+    call. `_resolved_targets` passes no `deps` either, so even the cases that DO
+    report are reduced to a `LOG.error` this command never shows. The machine
+    appeared nowhere: not as a line, not as a verdict, not on stderr.
+    """
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": "fast",  # unparseable -> disarmed at load
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "spark" in out
+    assert "would fire: no" in out
+    assert "disarmed at load" in out
+    assert "monitor verify spark" in out
+
+
+def test_dry_run_carries_the_degraded_config_block(env_config, monkeypatch, capsys) -> None:
+    """RA-01: a degrade must reach the operator where the operator already looks.
+
+    `monitor list` renders this block. The command built to answer "what will
+    happen?" did not, so the preview's answer and the degrade explaining it lived
+    in two different commands.
+    """
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": "fast",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    assert "DEGRADED CONFIG" in capsys.readouterr().out
+
+
+def test_dry_run_distinguishes_declared_none_from_disarmed(env_config, monkeypatch, capsys) -> None:
+    """T-02-46: the same effect, two very different meanings.
+
+    A machine an operator deliberately opted out of must not read the same as one
+    a load degrade took away — which is what a bare omission made them.
+    """
+    _dry_run_config(
+        env_config,
+        machines=[
+            {"name": "optedout", "ups": "ups1", "shutdown_method": "none"},
+            {
+                "name": "broken",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": "fast",
+            },
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "optedout" in out and "carries no shutdown authority" in out
+    assert "broken" in out and "disarmed at load" in out
+
+
+def test_dry_run_explains_why_a_native_machine_is_never_pushed(
+    env_config, monkeypatch, capsys
+) -> None:
+    """`native` is a deliberate omission, and silence made it look like an oversight."""
+    _dry_run_config(
+        env_config,
+        machines=[
+            {"name": "mtnative", "ups": "ups1", "shutdown_method": "native", "ssh": "mtnative"}
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert "mtnative" in out
+    assert "declared native" in out and "FSD" in out
+
+
+def test_dry_run_does_not_double_list_a_machine_that_did_project(
+    env_config, monkeypatch, capsys
+) -> None:
+    """A projected machine has a real verdict line; it must not also get a stub."""
+    _dry_run_config(
+        env_config,
+        machines=[
+            {
+                "name": "spark",
+                "ups": "ups1",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 9600,
+                "shutdown_cmd": "sudo /sbin/shutdown -h now",
+            }
+        ],
+    )
+    _fake_ups(monkeypatch, "OB LB", 5, 60)
+
+    assert cli.main(["remote-shutdown", "ups1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+
+    assert out.count("spark") == 1
+    assert "(no target)" not in out
