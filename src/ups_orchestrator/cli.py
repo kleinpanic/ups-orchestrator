@@ -75,6 +75,7 @@ from ups_orchestrator.events import (
     _target_location,
     _target_should_fire,
     dispatch,
+    ssh_dest,
 )
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
@@ -837,15 +838,43 @@ def _resolve_primary_ip(cfg: Config, override: str | None, toward_ip: str) -> st
 
 
 def _survivor_saddrs(machines: tuple[MonitoredMachine, ...]) -> list[str]:
-    """nft saddr union from monitored machines, empty IPs filtered out.
+    """nft saddr union from the surviving NATIVE machines (validated IP literals).
 
     An empty-ip survivor would render an invalid ``ip saddr { }`` and fail
     ``nft -f``; drop it (deduplicated, order-preserving).
+
+    HI-C2, two filters, both load-bearing:
+
+    * ``_valid_ip``. The value is spliced verbatim into ``tcp dport 3493 ip saddr
+      { … } accept`` and the result is loaded by ``nft -f`` as root. ``_valid_ip``
+      guarded only the ``--ip`` argparse path, so a hand-edited record could close
+      the brace and append its own ``ip saddr 0.0.0.0/0 accept`` above the
+      operator's policy drop. A rejected value is logged, not silently dropped.
+    * ``shutdown_method == "native"`` (the DECLARED method, INV-DECLARED). Only a
+      native secondary talks to upsd; a serial/ssh/none record carrying a stale
+      enrollment ``ip`` was being granted an upsd accept on every native add.
+
+    Together the managed set becomes exactly "the IP of every surviving native
+    record", which is the invariant it was always supposed to have.
     """
     out: list[str] = []
     for m in machines:
+        if m.shutdown_method.strip().lower() != "native":
+            continue
         ip = m.ip.strip()
-        if ip and ip not in out:
+        if not ip:
+            continue
+        if not _valid_ip(ip):
+            LOG.warning(
+                "monitor: ignoring machine %r's ip %r for the nft saddr set — it is not a "
+                "valid IP literal, and this value is loaded into the ruleset by nft -f. "
+                "Fix 'ip' in the config, or re-run 'monitor add %s' to re-resolve it.",
+                m.name,
+                m.ip,
+                m.name,
+            )
+            continue
+        if ip not in out:
             out.append(ip)
     return out
 
@@ -1800,8 +1829,18 @@ def _cmd_shutdown(argv: list[str]) -> int:
                 args.name,
             )
             return 2
-    elif not target.host.strip() or not _valid_ssh_alias(target.host):
-        LOG.error("shutdown rehearse: %r has no usable ssh alias (%r)", args.name, target.host)
+    # HI-C3: validate the destination that is actually BUILT, not one of its halves.
+    # `ssh_dest` returns f"{user}@{host}" whenever user is set, so checking `host`
+    # alone left a legacy `user` of "-oProxyCommand=…" reaching the argv — and
+    # `_rehearsal_target` force-enables the target, so a DISABLED legacy target is a
+    # live ssh sink from this verb. `_SSH_ALIAS_RE` already permits the user@host
+    # shape, so this is strictly tighter with no false refusals.
+    elif not _valid_ssh_alias(ssh_dest(target)):
+        LOG.error(
+            "shutdown rehearse: %r has no usable ssh destination (%r)",
+            args.name,
+            ssh_dest(target),
+        )
         return 2
 
     deps = _build_deps(cfg)

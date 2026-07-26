@@ -2067,3 +2067,51 @@ def test_add_still_works_for_an_unambiguous_re_enrollment(cfg_path, monkeypatch)
 
     assert rc == 0
     assert _entry(cfg_path, "mt")["shutdown_method"] == "serial"
+
+
+# --- HI-C2: the nft saddr set is built from validated native IPs only ----------
+
+
+def test_survivor_saddrs_drops_a_non_literal_ip_and_a_non_native_record(caplog) -> None:
+    # `_survivor_saddrs` handed m.ip verbatim to render_nft_accept_rule, which joins
+    # the members into `ip saddr { … } accept` and hands the ruleset to `nft -f` AS
+    # ROOT. `_valid_ip` guarded only the --ip argparse path, so a hand-edited record
+    # could close the brace and append its own accept above the policy drop. Second
+    # half: only a native secondary talks to upsd, so a serial/ssh record carrying a
+    # stale enrollment ip had no business in the set.
+    from ups_orchestrator.config import MonitoredMachine
+
+    machines = (
+        MonitoredMachine(name="ok", shutdown_method="native", ip="192.168.1.120"),
+        MonitoredMachine(
+            name="evil",
+            shutdown_method="native",
+            ip='1.2.3.4 } accept comment "o"\n        ip saddr 0.0.0.0/0 accept comment "pwn',
+        ),
+        MonitoredMachine(name="pushy", shutdown_method="ssh", ssh="pushy", ip="192.168.1.121"),
+        MonitoredMachine(name="blank", shutdown_method="native", ip=""),
+    )
+
+    with caplog.at_level("WARNING"):
+        assert cli._survivor_saddrs(machines) == ["192.168.1.120"]
+    assert "evil" in caplog.text  # the drop is explained, not silent
+
+
+def test_render_nft_accept_rule_refuses_a_non_literal_member() -> None:
+    # Belt-and-braces at the shared sink: nothing but an IP literal is a legitimate
+    # member of a set that root loads.
+    from ups_orchestrator import nutclient
+
+    with pytest.raises(ValueError, match="IP literals"):
+        nutclient.render_nft_accept_rule(["1.2.3.4 } accept; ip saddr 0.0.0.0/0 accept #"])
+
+
+def test_add_does_not_grant_an_upsd_accept_to_a_non_native_record(cfg_path, monkeypatch) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower", ip="192.168.1.114"),
+            _machine_entry("spark", method="native", ssh="spark", ip="192.168.1.120"),
+        ],
+    )
+    assert cli._survivor_saddrs(cli._load_config().monitored_machines) == ["192.168.1.120"]

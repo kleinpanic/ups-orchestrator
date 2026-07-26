@@ -305,10 +305,19 @@ def render_nft_accept_rule(
     ``tcp dport <port> ip saddr { … } accept`` line at ``indent``. Empty
     ``saddrs`` → empty string (the rule is removed rather than left matching an
     empty set, which ``nft -f`` rejects).
+
+    HI-C2: every member is re-validated HERE, at the shared sink, because this
+    string is loaded by ``nft -f`` as root and a member that closes the brace can
+    append an arbitrary rule — including ``ip saddr 0.0.0.0/0 accept`` — above the
+    operator's policy drop. Refuse rather than escape: nothing but an IP literal is
+    a legitimate member.
     """
     if not saddrs:
         return ""
-    members = ", ".join(saddrs)
+    bad = [s for s in saddrs if not valid_ip(s)]
+    if bad:
+        raise ValueError(f"nft saddr members must be IP literals; got {bad!r}")
+    members = ", ".join(s.strip() for s in saddrs)
     return (
         f"{indent}{_NFT_BEGIN}\n"
         f"{indent}tcp dport {port} ip saddr {{ {members} }} accept "
