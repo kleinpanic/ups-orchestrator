@@ -2167,7 +2167,7 @@ def test_render_nft_accept_rule_refuses_a_non_literal_member() -> None:
     # member of a set that root loads.
     from ups_orchestrator import nutclient
 
-    with pytest.raises(ValueError, match="IP literals"):
+    with pytest.raises(ValueError, match="IPv4 literals"):
         nutclient.render_nft_accept_rule(["1.2.3.4 } accept; ip saddr 0.0.0.0/0 accept #"])
 
 
@@ -2816,3 +2816,52 @@ def test_safe_text_leaves_newline_and_tab_alone() -> None:
     assert safe_text("a\nb\tc") == "a\nb\tc"
     assert safe_text("a\x1bb") == "a?b"
     assert safe_text("a\x00b\x07c\x7fd") == "a?b?c?d"
+
+
+# --- F2: the CLI never lets a v6 address reach the IPv4 saddr set --------------
+
+
+def test_add_refuses_an_ipv6_ip(cfg_path, caplog) -> None:
+    with caplog.at_level("ERROR"):
+        rc = cli.main(
+            ["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "2001:db8::1"]
+        )
+    assert rc == 2
+    assert "IPv4" in caplog.text
+
+
+def test_survivor_saddrs_drops_an_ipv6_record_ip(caplog) -> None:
+    from ups_orchestrator.config import MonitoredMachine
+
+    machines = (
+        MonitoredMachine(name="v6", shutdown_method="native", ip="2001:db8::1"),
+        MonitoredMachine(name="v4", shutdown_method="native", ip="192.168.1.120"),
+    )
+    with caplog.at_level("WARNING"):
+        assert cli._survivor_saddrs(machines) == ["192.168.1.120"]
+    assert "v6" in caplog.text and "IPv4" in caplog.text
+
+
+def test_resolve_remote_ip_rejects_a_v6_ssh_connection_fallback(monkeypatch) -> None:
+    """A v6-reachable secondary's $SSH_CONNECTION field 1 is a v6 literal.
+
+    Accepted, it was written to the record's `ip` and then rendered into the
+    IPv4-only saddr set.
+    """
+    monkeypatch.setattr(
+        cli, "_monitor_run_ssh", lambda _a, _c, _s: (0, "2001:db8::1 4242 2001:db8::2 22\n", "")
+    )
+    assert cli._resolve_remote_ip("mt", None, "") is None
+
+
+def test_resolve_remote_ip_rejects_a_v6_route_src(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_monitor_run_ssh",
+        lambda _a, cmd, _s: (
+            (0, "2001:db8::2 dev eth0 src 2001:db8::1 uid 0\n", "")
+            if "route get" in cmd
+            else (1, "", "")
+        ),
+    )
+    assert cli._resolve_remote_ip("mt", None, "192.168.1.125") is None

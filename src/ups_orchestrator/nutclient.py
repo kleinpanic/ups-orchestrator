@@ -73,6 +73,21 @@ def valid_ip(value: str) -> bool:
     return True
 
 
+def valid_ipv4(value: str) -> bool:
+    """True iff ``value`` is a valid IPv**4** literal. PURE.
+
+    F2: ``ip saddr`` is nftables' IPv4 matcher — the IPv6 spelling is ``ip6
+    saddr``, and a v6 literal inside ``ip saddr { … }`` makes ``nft -f`` reject
+    the WHOLE ruleset. `valid_ip` accepts both families, so a v6 address (reachable
+    via ``monitor add --ip 2001:db8::1``, or from the ``$SSH_CONNECTION`` fallback
+    on a v6-reachable secondary) rendered a file the kernel will not load.
+    """
+    try:
+        return isinstance(ipaddress.ip_address(value.strip()), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
 # --- injected runner types (mirror events.Deps) -------------------------------
 
 RunLocal = Callable[[Sequence[str]], tuple[int, str, str]]
@@ -336,9 +351,16 @@ def render_nft_accept_rule(
     """
     if not saddrs:
         return ""
-    bad = [s for s in saddrs if not valid_ip(s)]
+    # F2: IPv4 specifically. `ip saddr` is the IPv4 matcher (the v6 spelling is
+    # `ip6 saddr`), so a v6 member does not merely fail to match — it makes
+    # `nft -f` reject the ENTIRE ruleset, which is how the operator's policy drop
+    # ends up not loading at the next boot.
+    bad = [s for s in saddrs if not valid_ipv4(s)]
     if bad:
-        raise ValueError(f"nft saddr members must be IP literals; got {bad!r}")
+        raise ValueError(
+            f"nft saddr members must be IPv4 literals (this is an 'ip saddr' set, "
+            f"not 'ip6 saddr'); got {bad!r}"
+        )
     members = ", ".join(s.strip() for s in saddrs)
     return (
         f"{indent}{_NFT_BEGIN}\n"
@@ -584,7 +606,23 @@ def apply_nft(
     conf.write_text(new_text)
     rc, out, err = run_nft(reload_path or path)
     if rc != 0:
-        return rc, out, err
+        # F2: the write happened BEFORE `nft -f` got to judge it, so a rejected
+        # ruleset used to be left on disk permanently. `nft -f` is atomic, so the
+        # RUNNING ruleset is untouched by a failed load — but `nftables.service`
+        # reads this file at boot, so the next reboot came up with the operator's
+        # policy-drop chain not loaded at all. Roll the file back to exactly what
+        # was read, so a failed reload changes nothing anywhere.
+        try:
+            conf.write_text(text)
+        except OSError as exc:  # pragma: no cover — the read above already succeeded
+            return rc, out, (
+                f"{err}\nCRITICAL: could not restore {path} after a failed nft reload "
+                f"({exc}); that file will not load at boot — restore it by hand"
+            )
+        return rc, out, (
+            f"{err}\n{path} was restored to its previous contents; the running "
+            f"ruleset is unchanged (nft -f is atomic)"
+        )
     restart_bouncer()
     return 0, out, err
 

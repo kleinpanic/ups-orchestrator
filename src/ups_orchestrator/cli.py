@@ -902,14 +902,16 @@ def _survivor_saddrs(machines: tuple[MonitoredMachine, ...]) -> list[str]:
         ip = m.ip.strip()
         if not ip:
             continue
-        if not _valid_ip(ip):
+        if not _valid_saddr_ip(ip):
             LOG.warning(
                 "monitor: ignoring machine %r's ip %r for the nft saddr set — it is not a "
-                "valid IP literal, and this value is loaded into the ruleset by nft -f. "
-                "Fix 'ip' in the config, or re-run 'monitor add %s' to re-resolve it.",
-                m.name,
-                m.ip,
-                m.name,
+                "valid IPv4 literal, and this value is loaded into the ruleset by nft -f. "
+                "That set is rendered as 'ip saddr', nftables' IPv4 matcher, so a v6 "
+                "address there makes nft reject the ENTIRE ruleset (F2). Fix 'ip' in the "
+                "config, or re-run 'monitor add %s' to re-resolve it.",
+                safe_text(m.name),
+                safe_text(m.ip),
+                safe_text(m.name),
             )
             continue
         if ip not in out:
@@ -1378,11 +1380,27 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
 
 def _valid_ip(value: str) -> bool:
+    """Any IP literal. Used where either family is legitimate (LISTEN, --primary-ip)."""
     try:
         ipaddress.ip_address(value.strip())
     except ValueError:
         return False
     return True
+
+
+def _valid_saddr_ip(value: str) -> bool:
+    """F2: a machine's ``ip`` is IPv**4** only — its sole consumer is the nft set.
+
+    ``ip`` is documented as "resolved source IP added to the firewall saddr set",
+    and that set is rendered as ``ip saddr { … }``, nftables' IPv4 matcher. A v6
+    literal there does not merely fail to match: ``nft -f`` rejects the whole
+    ruleset, and since the file is written before the reload judges it, the
+    operator's policy-drop chain then fails to load at the next boot.
+
+    Deliberately NOT applied to ``--primary-ip`` or ``nut_server.listen``: those
+    feed upsd's LISTEN and the secondary's MONITOR line, where v6 is legitimate.
+    """
+    return nutclient.valid_ipv4(value)
 
 
 def _strict_positive_baud(value: str | None) -> int | None:
@@ -1433,18 +1451,22 @@ def _resolve_remote_ip(alias: str, explicit: str | None, primary_ip: str) -> str
     over a WAN/NAT SSH path that field is the gateway, so a route lookup toward
     the primary is the only reliable way to learn the machine's real LAN IP.
     """
+    # F2: every rung yields the value that lands in `entry.ip`, whose only consumer
+    # is the `ip saddr` (IPv4) set — so IPv4 is what "usable" means here. A
+    # v6-reachable secondary's $SSH_CONNECTION field 1 is a v6 literal, which used
+    # to be accepted and then rendered a ruleset `nft -f` refuses.
     if explicit:
-        return explicit.strip() if _valid_ip(explicit) else None
+        return explicit.strip() if _valid_saddr_ip(explicit) else None
     if _valid_ip(primary_ip):
         rc, out, _err = _monitor_run_ssh(alias, f"ip -o route get {primary_ip}", None)
         if rc == 0:
             src = _parse_route_src(out)
-            if src is not None:
+            if src is not None and _valid_saddr_ip(src):
                 return src
     rc, out, _err = _monitor_run_ssh(alias, "echo $SSH_CONNECTION", None)
     if rc == 0:
         fields = out.split()
-        if fields and _valid_ip(fields[0]):
+        if fields and _valid_saddr_ip(fields[0]):
             return fields[0]
     return None
 
@@ -1540,8 +1562,16 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             shutdown_cmd,
         )
         return 2
-    if args.ip and not _valid_ip(args.ip):
-        LOG.error("monitor add: --ip %r is not a valid IP literal", args.ip)
+    if args.ip and not _valid_saddr_ip(args.ip):
+        # F2: IPv4 specifically. This value is written to the record's `ip`, whose
+        # only consumer is the `ip saddr` set — nftables' IPv4 matcher. A v6
+        # literal there makes `nft -f` reject the whole ruleset.
+        LOG.error(
+            "monitor add: --ip %r is not a valid IPv4 literal. This address is added to "
+            "the managed 'ip saddr' nft set, which is IPv4-only; a v6 address there makes "
+            "nft refuse the ENTIRE ruleset, taking the operator's policy drop with it.",
+            args.ip,
+        )
         return 2
     if args.ups is not None and not nutclient.valid_nut_name(args.ups):
         LOG.error("monitor add: --ups %r is not a valid NUT UPS name", args.ups)
