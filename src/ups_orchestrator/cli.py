@@ -1023,7 +1023,21 @@ def _verify_serial(m: MonitoredMachine, stat_fn: Callable[[str], os.stat_result]
 
 
 def _verify_ssh_alias(m: MonitoredMachine) -> int:
-    """Reachability of the recorded alias. No NUT secondary check — there is none."""
+    """Reachability of the recorded alias. No NUT secondary check — there is none.
+
+    ME-C5: the rc 2 branch below is DEFENCE IN DEPTH, not the live path. A declared
+    ``ssh`` record with an option-shaped alias is disarmed by ``_transport_notices``
+    at load, so ``_monitor_verify`` returns rc 1 from its ``machine.disarmed`` gate
+    before ever calling this — and rc 1 is the better answer there, because the
+    operator is told the machine will not fire rather than that they typed something
+    wrong. The summary's "option-shaped alias at the sink -> rc 2" row described this
+    function, not the command; the rc table in docs/Configuration.md says rc 1 now.
+
+    It is kept rather than deleted because this function is a SINK — the alias below
+    becomes an argv element of a real ``ssh`` — and the only thing standing between
+    the two is the loader's rule staying in step with this one. Guarding the sink is
+    what makes that coupling safe to lose. Covered by a direct-call test.
+    """
     alias = m.ssh.strip()
     if not alias:
         print(f"{m.name}: FAIL — declares ssh with no alias")

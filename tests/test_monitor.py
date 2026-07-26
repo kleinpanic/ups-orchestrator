@@ -2526,3 +2526,63 @@ def test_verify_blank_ssh_alias_still_reaches_the_probe(cfg_path, monkeypatch) -
 
     assert cli.main(["monitor", "verify", "spark"]) == 1
     assert ssh.calls and ssh.calls[0][0] == ""  # probed over a blank alias, deliberately
+
+
+# --- ME-C5: the rc an option-shaped alias actually produces -------------------
+
+
+def test_verify_declared_ssh_with_an_option_shaped_alias_is_rc1_not_rc2(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    """The documented contract said rc 2; the command has always returned rc 1.
+
+    `_transport_notices` disarms a declared-`ssh` record whose alias is
+    option-shaped, so `_monitor_verify` returns from its `machine.disarmed` gate
+    before `_verify_ssh_alias` is ever called. rc 1 is the better answer — the
+    operator is told the machine will not fire, not that they typed something
+    wrong — so the CODE is right and the rc table was wrong. Pinned here so the
+    two cannot drift again.
+    """
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="ssh", ssh="-oProxyCommand=id", ups="cyberpower")],
+    )
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    rc = cli.main(["monitor", "verify", "mt"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "DISARMED (declared ssh)" in out
+    assert ssh.calls == []  # the alias never reaches an ssh argv
+
+
+def test_verify_ssh_alias_sink_still_refuses_an_option_shaped_alias(monkeypatch, caplog) -> None:
+    """The rc 2 branch is defence in depth at the SINK, so it is tested at the sink.
+
+    `_verify_ssh_alias` puts the alias into a real `ssh` argv. Today nothing gets
+    past the loader to reach it — which is exactly why `grep` found no test and
+    the branch was reported as dead code. Deleting it would leave the sink relying
+    entirely on `_transport_notices` staying in step with it; testing it directly
+    is what makes that coupling safe to lose.
+    """
+    from ups_orchestrator.config import MonitoredMachine
+
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    hostile = MonitoredMachine(
+        name="mt", ssh="-oProxyCommand=touch /tmp/pwn", shutdown_method="ssh"
+    )
+
+    with caplog.at_level("ERROR"):
+        assert cli._verify_ssh_alias(hostile) == 2
+    assert ssh.calls == []
+    assert "is invalid" in caplog.text
+
+
+def test_verify_ssh_alias_sink_accepts_a_plain_alias(monkeypatch) -> None:
+    from ups_orchestrator.config import MonitoredMachine
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "", "")]))
+    assert cli._verify_ssh_alias(MonitoredMachine(name="mt", ssh="mt", shutdown_method="ssh")) == 0
