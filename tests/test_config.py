@@ -1408,6 +1408,24 @@ def test_bl01_explicit_ssh_with_no_ups_degrades(tmp_path: Path) -> None:
     assert _only_target(cfg, "cyberpower2").effective_enabled is False
 
 
+def test_push_machine_naming_an_unknown_ups_is_disarmed_once(tmp_path: Path) -> None:
+    # The unresolvable half of the push-association rule. It is reported with the
+    # specific reason (it can never be projected), and the generic unknown-UPS advisory
+    # is suppressed so the operator gets one actionable notice about the ups rather than
+    # two that disagree about severity.
+    cfg = _one_machine(
+        tmp_path,
+        {"name": "mt", "ssh": "mt", "ups": "cyberpwoer", "shutdown_method": "ssh"},
+    )
+    m = _sole(cfg)
+    assert m.disarmed is True
+    assert m.effective_method == "none"
+    ups_notices = [n for n in m.load_notices if "cyberpwoer" in n.message]
+    assert len(ups_notices) == 1
+    assert ups_notices[0].severity == "error"
+    assert "matches no configured UPS" in ups_notices[0].message
+
+
 def test_bl01_case_mismatched_ups_conflict_degrades(tmp_path: Path) -> None:
     # The reviewer's second live probe: machine mt with ups "CyberPower2" against an
     # enabled target mt on "cyberpower2". HI-03/IB-02.
