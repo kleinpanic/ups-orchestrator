@@ -1003,11 +1003,25 @@ def _rewrite_nft_saddrs(
     Touches nothing but this box: ``apply_nft`` returns ``(0, "no change", "")``
     when the rendered text is unchanged, so the common case is a read and a compare.
     The caller decides whether a failure is fatal; it is always logged here.
+
+    That contract only holds if this NEVER raises. ``apply_nft`` reports a reload
+    failure through its return code, but the compare step READS ``_NFT_PATH``
+    first, and that read is an ordinary ``OSError`` on a box where the file is
+    root-owned — which is every box, for the record-only ``monitor add`` path that
+    deliberately does not need root. Letting it propagate turned "recompute a
+    local firewall file" into a hard rc 1 that also skipped the persist, so
+    ``monitor add --method serial`` could not record a machine as a normal user at
+    all. Caught and reported as a non-zero rc so the caller's own fatal/non-fatal
+    decision is the one that applies.
     """
     restart = (lambda: None) if no_restart_bouncer else _monitor_restart_bouncer
-    rc, _out, err = nutclient.apply_nft(
-        _NFT_PATH, saddrs, _monitor_run_nft, restart, reload_path=_NFT_RELOAD_PATH
-    )
+    try:
+        rc, _out, err = nutclient.apply_nft(
+            _NFT_PATH, saddrs, _monitor_run_nft, restart, reload_path=_NFT_RELOAD_PATH
+        )
+    except OSError as exc:
+        LOG.error("%s: firewall rewrite could not read or write %s: %s", verb, _NFT_PATH, exc)
+        return 1, str(exc)
     if rc != 0:
         LOG.error("%s: firewall reload failed: %s", verb, err)
     return rc, err

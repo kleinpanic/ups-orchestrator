@@ -3006,6 +3006,49 @@ def test_add_record_only_persists_even_when_the_nft_sweep_fails(cfg_path, monkey
     assert _entry(cfg_path, "box")["shutdown_method"] == "none"
 
 
+def test_add_record_only_persists_when_the_nft_file_is_unreadable(cfg_path, monkeypatch) -> None:
+    """A record-only add must not need root, and must not lose the record.
+
+    The sibling test above points `_NFT_PATH` at a MISSING file, which `apply_nft`
+    reports through its return code. The real box fails a different way: the file
+    EXISTS and is root-owned, so the compare step's read raises `PermissionError`
+    before any return code exists. That raise escaped `_rewrite_nft_saddrs`, turned
+    a local firewall sweep into rc 1, and skipped the persist -- so
+    `monitor add --method serial` could not record a machine as a normal user at
+    all. Found by running the CLI as klein against a scratch config, not by the
+    suite: the rc-2 path was covered and the raise path was not, while the sibling
+    test's name implied both.
+    """
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+
+    def _denied(*_a, **_k):
+        raise PermissionError(13, "Permission denied", cli._NFT_PATH)
+
+    monkeypatch.setattr(cli.nutclient, "apply_nft", _denied)
+
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/serial/by-id/fake",
+            "--serial-baud",
+            "9600",
+        ]
+    )
+
+    assert rc == 0
+    entry = _entry(cfg_path, "mt")
+    assert entry["shutdown_method"] == "serial"
+    assert entry["serial_baud"] == 9600
+    assert entry["serial_device"] == "/dev/serial/by-id/fake"
+
+
 def test_add_record_only_no_firewall_skips_the_sweep(cfg_path, monkeypatch) -> None:
     nft = FakeNft()
     monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
