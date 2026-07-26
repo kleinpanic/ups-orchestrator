@@ -15,6 +15,13 @@ Modes::
     ups-orchestrator record              # high-frequency UPS telemetry recorder
     ups-orchestrator power-dashboard     # render/post a live+history power image
     ups-orchestrator webui               # local web dashboard (live status + history)
+    ups-orchestrator remote-shutdown [ups] [--dry-run]
+                                         # evaluate configured + projected targets;
+                                         # --dry-run previews every one with its gate
+                                         # verdict and touches nothing
+    ups-orchestrator shutdown rehearse <machine>
+                                         # push a hard-coded NON-shutdown command over
+                                         # the machine's configured transport
     ups-orchestrator notify-test         # send a Discord delivery test
     ups-orchestrator logs                # tail local JSONL logs
 
@@ -29,6 +36,7 @@ worse than a loud failure at the moment the daemon exists for.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import ipaddress
 import json
 import logging
@@ -53,14 +61,24 @@ from ups_orchestrator.config import (
     _SSH_ALIAS_RE,
     Config,
     MonitoredMachine,
+    ShutdownTarget,
     UpsConfig,
     dual_regime_conflicts,
 )
-from ups_orchestrator.events import Deps, dispatch
+
+# The preview reuses the firing path's OWN gate and projection rather than
+# re-deriving either. A second copy of "would this fire?" is a second answer.
+from ups_orchestrator.events import (
+    Deps,
+    _machine_targets,
+    _target_location,
+    _target_should_fire,
+    dispatch,
+)
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
-from ups_orchestrator.state import StateStore, replace_preserving_metadata
+from ups_orchestrator.state import StateStore, UpsState, replace_preserving_metadata
 
 LOG = logging.getLogger("ups_orchestrator")
 
@@ -135,7 +153,7 @@ def _load_config() -> Config | None:
         return None
 
 
-def _build_deps(cfg: Config) -> Deps:
+def _build_deps(cfg: Config, *, dry_run: bool = False) -> Deps:
     notifier = build_notifier(
         cfg.webhook_url,
         username=cfg.discord_username,
@@ -170,6 +188,7 @@ def _build_deps(cfg: Config) -> Deps:
         load_step=cfg.load_step,
         sample_path=_sample_path(),
         monitored_machines=cfg.monitored_machines,
+        dry_run=dry_run,
     )
 
 
@@ -1569,6 +1588,187 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     return 0
 
 
+# ---- remote-shutdown preview + shutdown rehearse ----------------------------
+
+
+def _resolved_targets(ups: UpsConfig, deps: Deps) -> list[ShutdownTarget]:
+    """Every target this UPS would consider: configured, plus machine projections."""
+    return [*ups.shutdown_targets, *_machine_targets(ups, deps.monitored_machines)]
+
+
+def _preview_verdict(
+    ups: UpsConfig, state: UpsState, deps: Deps, target: ShutdownTarget, snap: UpsSnapshot
+) -> tuple[bool, str]:
+    """The verdict ``_run_shutdown_targets`` would reach for this target, right now.
+
+    A-2 decision 1: the preview REPORTS the gate; it does not bypass it. The
+    effective-enabled filter is applied first because that is the order the firing
+    path applies it in — ``_target_should_fire`` never looks at the target's own
+    flag, so delegating straight to it would annotate a disabled target with the
+    UPS's charge state and imply it was merely waiting for a low battery.
+    """
+    if not target.effective_enabled:
+        if any(n.severity == "error" for n in target.load_notices):
+            return False, "disarmed at load — see 'monitor list'"
+        return False, "target not enabled"
+    return _target_should_fire(ups, state, deps, target, snap)
+
+
+def _cmd_remote_shutdown(argv: list[str]) -> int:
+    """``remote-shutdown [ups] [--dry-run]`` — the Layer-2 entry point.
+
+    This is a TOP-LEVEL verb, not the implicit NUT event route: ``main`` used to
+    fall an unknown mode through to ``_cmd_event``, where ``remote-shutdown``
+    (hyphen) matched no handler and silently did nothing.
+    """
+    parser = argparse.ArgumentParser(prog="ups-orchestrator remote-shutdown")
+    parser.add_argument("ups", nargs="?", help="UPS name (default: every configured UPS)")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print every resolved target with its CURRENT gate verdict; touch nothing",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.dry_run:
+        return _cmd_event("remote_shutdown", _resolve_ups_name(args.ups))
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    deps = _build_deps(cfg, dry_run=True)
+    store = StateStore(_state_path())
+    names = [args.ups] if args.ups else list(cfg.upses)
+    for name in names:
+        ups = cfg.ups(name)
+        if ups is None:
+            LOG.warning("remote-shutdown: unconfigured UPS %r — skipping", name)
+            continue
+        snap = deps.read_snapshot(ups.name)
+        state = store.get(ups.name)
+        print(f"{ups.label} ({ups.name}) — status {snap.status or 'unknown'}")
+        targets = _resolved_targets(ups, deps)
+        if not targets:
+            print("  (no shutdown targets resolved)")
+            continue
+        for t in targets:
+            should, reason = _preview_verdict(ups, state, deps, t, snap)
+            print(
+                f"  {t.name}\t{_target_location(t)}\t{t.cmd}\t"
+                f"would fire: {'yes' if should else 'no'} — {reason}"
+            )
+    # `store.save()` is deliberately NOT called: a preview reads state and writes none.
+    return 0
+
+
+# T-02-24. Hard-coded, quote-free (the tag is what `journalctl -t ups-orchestrator`
+# greps, and `monitor add` rejects a double-quote in a shutdown command). The
+# rehearsal's safety property is that this command CANNOT halt a box — not that a
+# policy flag happens to be set.
+_REHEARSAL_CMD = "logger -t ups-orchestrator PHASE2_REHEARSAL"
+
+
+def _rehearsal_target(cfg: Config, name: str) -> ShutdownTarget | None:
+    """Build an ephemeral target for ``name`` carrying the REHEARSAL command.
+
+    The machine's persisted ``shutdown_cmd`` is never read, so a crash mid-rehearsal
+    can leave neither a no-op armed nor the real command queued. Resolution order is
+    monitored machine first, then a configured legacy target of that name.
+
+    The machine branch reads the DECLARED method on purpose. Rehearsal is a
+    diagnostic for the cable, not a shutdown: refusing to rehearse a machine a load
+    degrade disarmed would withhold the test at exactly the moment an operator is
+    trying to work out what is wrong with it.
+    """
+    machine = _monitor_find(cfg, name)
+    if machine is not None:
+        method = machine.shutdown_method.strip().lower()
+        if method == "serial":
+            return ShutdownTarget(
+                name=machine.name,
+                kind="serial",
+                enabled=True,
+                device=machine.serial_device,
+                baud=machine.serial_baud,
+                cmd=_REHEARSAL_CMD,
+            )
+        if method == "ssh":
+            return ShutdownTarget(
+                name=machine.name,
+                kind="remote",
+                enabled=True,
+                host=machine.ssh,
+                cmd=_REHEARSAL_CMD,
+            )
+        return None  # native/none have no push transport to rehearse
+    for ups in cfg.upses.values():
+        for t in ups.shutdown_targets:
+            if t.name.strip().casefold() == name.strip().casefold():
+                return dataclasses.replace(t, enabled=True, cmd=_REHEARSAL_CMD)
+    return None
+
+
+def _cmd_shutdown(argv: list[str]) -> int:
+    if not argv or argv[0] != "rehearse":
+        LOG.error("usage: ups-orchestrator shutdown rehearse <machine>")
+        return 2
+    parser = argparse.ArgumentParser(prog="ups-orchestrator shutdown rehearse")
+    parser.add_argument("name", help="the machine to rehearse (never a sweep)")
+    args = parser.parse_args(argv[1:])
+
+    cfg = _load_config()
+    if cfg is None:
+        return 1
+    target = _rehearsal_target(cfg, args.name)
+    if target is None:
+        LOG.error(
+            "shutdown rehearse: %r has no serial or ssh transport to rehearse. Only a "
+            "push transport pushes bytes; a native secondary halts itself on this "
+            "primary's FSD and a 'none' record has no authority at all.",
+            args.name,
+        )
+        return 2
+    if target.is_local:
+        LOG.error(
+            "shutdown rehearse: %r is a LOCAL target — this host. There is no cable to "
+            "rehearse, and the command would run here.",
+            args.name,
+        )
+        return 2
+    if target.is_serial:
+        if not target.device.strip():
+            LOG.error("shutdown rehearse: %r has no serial device recorded", args.name)
+            return 2
+        if target.baud is None or target.baud <= 0:
+            LOG.error(
+                "shutdown rehearse: %r has no usable declared baud (the live console "
+                "here is 9600); refusing to guess one",
+                args.name,
+            )
+            return 2
+    elif not target.host.strip() or not _valid_ssh_alias(target.host):
+        LOG.error("shutdown rehearse: %r has no usable ssh alias (%r)", args.name, target.host)
+        return 2
+
+    deps = _build_deps(cfg)
+    where = _target_location(target)
+    # Print the exact transport parameters BEFORE sending, so an operator can abort
+    # a wrong device by reading the line rather than by reading the outcome.
+    print(f"rehearse {target.name} via {where}")
+    print(f"  command: {_REHEARSAL_CMD}   (hard-coded; the recorded shutdown_cmd is not read)")
+    if target.is_serial:
+        print(f"  device:  {target.device} @ {target.baud} baud")
+    rc, _out, err = (
+        deps.serial_shutdown(target) if target.is_serial else deps.ssh_shutdown(target)
+    )
+    if rc != 0:
+        print(f"  FAIL — rc={rc} {err.strip() or '(no stderr)'}")
+        return 1
+    print(f"  OK — look for PHASE2_REHEARSAL on {target.name} "
+          f"(journalctl -t ups-orchestrator)")
+    return 0
+
+
 def _cmd_monitor(argv: list[str]) -> int:
     if not argv:
         LOG.error("usage: ups-orchestrator monitor <add|list|verify|remove> [...]")
@@ -1601,7 +1801,8 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error(
             "usage: ups-orchestrator "
             "<event|tick|watch|status|report|audit|baseline|selftest|boot-audit|record|"
-            "power-dashboard|webui|control|monitor|notify-test|logs> [...]"
+            "power-dashboard|webui|control|monitor|remote-shutdown|shutdown|"
+            "notify-test|logs> [...]"
         )
         return 0
 
@@ -1632,6 +1833,13 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_power_dashboard(args[1:])
     if mode == "monitor":
         return _cmd_monitor(args[1:])
+    # Both of these MUST precede the fall-through: an unknown mode becomes a NUT
+    # event name, where "remote-shutdown" (hyphen) matches no handler and silently
+    # succeeds. The NUT event route keeps its own underscore spelling.
+    if mode == "remote-shutdown":
+        return _cmd_remote_shutdown(args[1:])
+    if mode == "shutdown":
+        return _cmd_shutdown(args[1:])
     if mode == "watch":
         return _cmd_watch()
     return _cmd_event(mode, _resolve_ups_name(args[1] if len(args) > 1 else None))

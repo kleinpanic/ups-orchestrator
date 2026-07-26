@@ -207,6 +207,14 @@ class Deps:
     # ``_machine_targets``. Empty by default so a handler built without config
     # (tests, one-off dispatch) pushes to nothing.
     monitored_machines: tuple[MonitoredMachine, ...] = ()
+    # When set, ``_fire_target`` returns at the TOP: no event-log line, no attempt
+    # notification, no runner and — critically — no ``shutdowns_sent`` append, so a
+    # preview can never poison the dedupe key that decides whether a REAL outage
+    # later shuts a box down. ``remote-shutdown --dry-run`` sets it. It is a
+    # belt-and-braces guarantee rather than the preview's mechanism: the preview
+    # reports the gate without reaching the firing path at all, and this makes any
+    # future path that does reach it under a dry run inert (T-02-13).
+    dry_run: bool = False
 
 
 # --- formatting helpers -------------------------------------------------------
@@ -538,6 +546,15 @@ def _fire_target(
     reason: str,
 ) -> None:
     where = _target_location(target)
+    # T-02-13. FIRST statement with a side effect in sight, deliberately: every line
+    # below this point either tells someone a shutdown happened or makes the system
+    # behave as though one did. Returning here rather than skipping the runner alone
+    # is what keeps a dry run from poisoning `shutdowns_sent`.
+    if deps.dry_run:
+        LOG.info(
+            "[dry-run] would fire %s via %s: %s (%s)", target.name, where, target.cmd, reason
+        )
+        return
     _log_event(
         deps,
         "shutdown_attempt",

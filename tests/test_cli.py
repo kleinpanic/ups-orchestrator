@@ -377,9 +377,12 @@ def _fake_ups(monkeypatch, status: str, charge: int, runtime: int) -> None:
 def _no_transports(monkeypatch) -> list[str]:
     """Any real transport reaching argv is a bug; record instead of executing."""
     ran: list[str] = []
-    monkeypatch.setattr(
-        "subprocess.run", lambda *a, **k: ran.append(str(a)) or (_ for _ in ()).throw(AssertionError)
-    )
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        ran.append(str(a))
+        raise AssertionError(f"a real subprocess escaped the fakes: {a!r}")
+
+    monkeypatch.setattr("subprocess.run", _boom)
     return ran
 
 
@@ -511,7 +514,12 @@ def _rehearse_config(cfg: Path) -> None:
                     "ups1": {
                         "label": "U1",
                         "shutdown_targets": [
-                            {"name": "pi", "kind": "local", "enabled": True, "cmd": "/sbin/poweroff"}
+                            {
+                                "name": "pi",
+                                "kind": "local",
+                                "enabled": True,
+                                "cmd": "/sbin/poweroff",
+                            }
                         ],
                     }
                 },
