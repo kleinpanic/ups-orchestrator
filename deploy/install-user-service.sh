@@ -24,6 +24,15 @@ install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-recorder.service" "$UNIT_
 install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-boot-audit.service" "$UNIT_DIR/"
 install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-report.service" "$UNIT_DIR/"
 install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-report.timer" "$UNIT_DIR/"
+# IF-09: these two shipped in deploy/systemd/ and were installed by NOTHING —
+# neither this script nor install.sh — so `systemctl --user start
+# ups-orchestrator-selftest` failed with "unit not found" on every deployment.
+# Installed, but deliberately NOT enabled: the unit runs a real UPS battery test,
+# which drains the pack, and it needs NUT admin creds in /etc/ups-orchestrator.env
+# that a fresh install does not have. Availability is the fix; arming it is the
+# operator's decision. The final echo below says how.
+install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-selftest.service" "$UNIT_DIR/"
+install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-selftest.timer" "$UNIT_DIR/"
 systemctl --user daemon-reload
 systemctl --user enable --now ups-orchestrator-watch.service
 systemctl --user restart ups-orchestrator-watch.service
@@ -39,3 +48,11 @@ systemctl --user list-timers ups-orchestrator-report.timer --no-pager || true
 if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
   echo "NOTE: linger is OFF — run 'loginctl enable-linger $USER' so it runs while logged out."
 fi
+
+cat <<'EOF'
+
+The weekly battery self-test is installed but NOT enabled — it discharges the
+pack and needs a NUT admin account. To arm it, put UPS_NUT_ADMIN_USER /
+UPS_NUT_ADMIN_PASSWORD in /etc/ups-orchestrator.env, then:
+  systemctl --user enable --now ups-orchestrator-selftest.timer
+EOF

@@ -1092,6 +1092,30 @@ def test_named_temporaryfile_confined_to_known_sites() -> None:
     )
 
 
+def test_every_shipped_systemd_unit_is_installed_by_something() -> None:
+    """IF-09: two units shipped in deploy/systemd/ and were installed by nothing.
+
+    ``ups-orchestrator-selftest.service`` and ``.timer`` referenced
+    ``/usr/local/bin/ups-orchestrator selftest`` and looked like a supported
+    feature, but neither ``install.sh`` nor ``install-user-service.sh`` ever copied
+    them anywhere — so ``systemctl --user start ups-orchestrator-selftest`` failed
+    with "unit not found" on every deployment that ever existed. A shipped-but-
+    unreachable unit is the same class of drift as a documented-but-missing verb,
+    so guard the whole directory rather than those two names.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    units = {p.name for p in (repo / "deploy" / "systemd").iterdir() if p.is_file()}
+    assert units, "deploy/systemd/ is empty — the guard would pass vacuously"
+    installers = "\n".join(
+        (repo / "deploy" / name).read_text() for name in ("install.sh", "install-user-service.sh")
+    )
+    orphans = sorted(name for name in units if name not in installers)
+    assert orphans == [], (
+        "shipped systemd unit(s) that no installer references — they cannot be "
+        f"started on any deployment (IF-09): {orphans}"
+    )
+
+
 def test_installer_and_docs_grant_serial_device_access() -> None:
     """IF-03: nothing shipped granted the serial transport's device access.
 

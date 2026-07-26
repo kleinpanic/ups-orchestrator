@@ -307,6 +307,12 @@ This installs:
   `sudo /opt/ups-orchestrator/venv/bin/pip install matplotlib` (or
   `pip install ups-orchestrator[dashboard]`). Without it the report still sends;
   the image is skipped with a logged warning.
+- `ups-orchestrator-selftest.timer` / `.service`: weekly NUT battery self-test
+  with a Discord alert on failure. **Installed but not enabled** — the test
+  discharges the pack, and it needs a NUT admin account (`instcmds` in
+  `/etc/nut/upsd.users`) exported as `UPS_NUT_ADMIN_USER` /
+  `UPS_NUT_ADMIN_PASSWORD` in `/etc/ups-orchestrator.env`. Arming it is your
+  call: `systemctl --user enable --now ups-orchestrator-selftest.timer`.
 
 You can test the report path immediately:
 
@@ -334,6 +340,7 @@ ups-orchestrator logs notifications
 | `~/.config/systemd/user/ups-orchestrator-watch.service` | the poll loop |
 | `~/.config/systemd/user/ups-orchestrator-recorder.service` | telemetry recorder |
 | `~/.config/systemd/user/ups-orchestrator-report.timer` | daily UPS load report |
+| `~/.config/systemd/user/ups-orchestrator-selftest.timer` | weekly battery self-test (installed, **not enabled**) |
 
 Your real device ids, IPs, and the webhook stay on the machine under `/etc`;
 none of that is in the repo.
