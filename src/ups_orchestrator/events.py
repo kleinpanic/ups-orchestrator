@@ -131,8 +131,24 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
                 f"(mode {stat.filemode(mode)}); refusing to write to it. Check the "
                 f"serial_device path for a typo.",
             )
+        # HI-04: `raw` touches ignbrk/brkint/…/icanon/opost/isig and NOTHING in
+        # c_cflag, so it sets neither clocal nor -crtscts. `clocal` is the correct
+        # setting for the 3-wire TX/RX/GND console this transport targets — it never
+        # asserts DCD — and makes the carrier question moot for the blocking write and
+        # the close() that follow, rather than only for the open(). Without -crtscts a
+        # cable with no CTS can block the write, and close() can block in
+        # tty_wait_until_sent for closing_wait (30 s) inside the poll loop.
         stty = subprocess.run(
-            ["stty", "-F", target.device, str(target.baud), "raw", "-echo"],
+            [
+                "stty",
+                "-F",
+                target.device,
+                str(target.baud),
+                "raw",
+                "-echo",
+                "clocal",
+                "-crtscts",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -158,7 +174,14 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
         # restores the blocking write semantics the short-write guard depends on.
         # (A manual `stty -F` smoke test never reproduces the hang: GNU stty already
         # opens O_RDONLY|O_NONBLOCK.)
-        fd = os.open(target.device, os.O_WRONLY | os.O_NONBLOCK)
+        #
+        # HI-04: O_NOCTTY as well. systemd puts each service in its own session, so
+        # this process is a session leader with no controlling terminal — and under
+        # POSIX such a process opening a tty WITHOUT O_NOCTTY acquires that tty as its
+        # controlling terminal. A carrier transition on the line would then deliver
+        # SIGHUP to the session and kill the daemon mid-outage. Unconditionally correct
+        # for a daemon, and it costs nothing.
+        fd = os.open(target.device, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)

@@ -228,7 +228,9 @@ def test_serial_declared_baud_reaches_stty_argv_and_the_failure_message(monkeypa
     rc, _out, err = _default_serial_shutdown(_serial_target(baud=19200))
 
     assert rc == 1
-    assert wiring.stty_argv == [["stty", "-F", SERIAL_DEVICE, "19200", "raw", "-echo"]]
+    assert wiring.stty_argv == [
+        ["stty", "-F", SERIAL_DEVICE, "19200", "raw", "-echo", "clocal", "-crtscts"]
+    ]
     assert "19200" in err
 
 
@@ -319,6 +321,39 @@ def test_serial_opens_non_blocking_and_then_clears_the_flag(monkeypatch) -> None
     # the short-write guard depends on are preserved.
     assert wiring.flags_set and not (wiring.flags_set[-1] & os.O_NONBLOCK)
     assert wiring.blocking_opened == []  # never through a blocking builtins.open
+
+
+def test_serial_open_does_not_acquire_a_controlling_terminal(monkeypatch) -> None:
+    # HI-04. systemd puts each service in its own session, so `watch` is a session
+    # leader with no controlling terminal — and under POSIX such a process opening a
+    # tty without O_NOCTTY ACQUIRES that tty as its controlling terminal. With CLOCAL
+    # clear (which `stty raw` does not change) a carrier transition on the console then
+    # delivers SIGHUP to the session and the default disposition kills the daemon,
+    # mid-outage, losing the poll loop's in-memory state. Asserted on the flag word,
+    # because the failure is only observable on real hardware.
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"))
+
+    rc, _out, _err = _default_serial_shutdown(_serial_target())
+
+    assert rc == 0
+    _path, flags = wiring.opened[0]
+    assert flags & os.O_NOCTTY
+
+
+def test_serial_stty_sets_clocal_and_disables_hardware_flow_control(monkeypatch) -> None:
+    # The other half of HI-04. `raw` touches nothing in c_cflag, so the O_NONBLOCK open
+    # bypassed the DCD wait only for the open() itself — the flag is cleared straight
+    # afterwards, restoring the kernel's carrier sensitivity for the blocking write and
+    # the close(). `clocal` settles it for the whole line; `-crtscts` keeps a cable with
+    # no CTS from blocking the write and the close (up to closing_wait, 30 s, inside
+    # the poll loop).
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"))
+
+    _default_serial_shutdown(_serial_target())
+
+    (argv,) = wiring.stty_argv
+    assert "clocal" in argv
+    assert "-crtscts" in argv
 
 
 def test_serial_closes_the_descriptor_when_clearing_the_flag_fails(monkeypatch) -> None:
