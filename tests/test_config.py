@@ -217,7 +217,6 @@ def test_monitored_machines_parse(tmp_path: Path) -> None:
         {
             "monitored_machines": [
                 {"name": "mt", "ssh": "mt", "ups": "cyberpower", "powervalue": 2},
-                "not-a-dict",
             ],
             "upses": {"u1": {"label": "U1"}},
         },
@@ -228,6 +227,46 @@ def test_monitored_machines_parse(tmp_path: Path) -> None:
     assert m.name == "mt" and m.ssh == "mt" and m.ups == "cyberpower"
     assert m.powervalue == 2
     assert m.backup.enabled is False  # default-off backup
+
+
+@pytest.mark.parametrize("shape", [{}, None, "spark", 7])
+def test_non_list_monitored_machines_refuses_to_load(tmp_path: Path, shape: object) -> None:
+    # The silent-unprotection hole. Authored as an OBJECT keyed by name, or as `null`,
+    # this used to coerce to `()`: zero machines, zero degraded notices, zero log lines,
+    # and a status banner reading healthy while every push machine was unprotected. It
+    # is the identical defect class already closed for `upses`.
+    p = _write(tmp_path, {"monitored_machines": shape, "upses": {"u1": {"label": "U1"}}})
+    with pytest.raises(ValueError, match="monitored_machines"):
+        Config.load(p, env={})
+
+
+def test_non_dict_monitored_machine_entry_refuses_to_load(tmp_path: Path) -> None:
+    # A single bad entry used to be dropped just as silently, unprotecting exactly the
+    # machine the operator fat-fingered. The error names the index so it is findable.
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [
+                {"name": "mt", "ssh": "mt", "ups": "u1"},
+                "spark",
+            ],
+            "upses": {"u1": {"label": "U1"}},
+        },
+    )
+    with pytest.raises(ValueError, match="index 1"):
+        Config.load(p, env={})
+
+
+def test_absent_monitored_machines_is_still_fine(tmp_path: Path) -> None:
+    # Back-compat (P2-07): an ABSENT key is not an authored mistake. Every pre-Phase-2
+    # config on disk omits it, and none of them may start refusing to load.
+    p = _write(tmp_path, {"upses": {"u1": {"label": "U1"}}})
+    assert Config.load(p, env={}).monitored_machines == ()
+    # An explicitly empty array is equally fine.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    p2 = _write(sub, {"monitored_machines": [], "upses": {"u1": {"label": "U1"}}})
+    assert Config.load(p2, env={}).monitored_machines == ()
 
 
 def test_monitored_machine_to_dict_preserves_unknown_keys() -> None:
@@ -690,8 +729,10 @@ def test_mutual_exclusion_ssh_disarms_machine_and_target(tmp_path: Path) -> None
     assert _only_target(cfg).effective_enabled is False
 
 
-def test_mutual_exclusion_ignores_target_on_a_different_ups(tmp_path: Path) -> None:
-    # Same target name, different UPS — not the same power domain, not a conflict.
+def test_mutual_exclusion_ignores_a_PUSH_target_on_a_different_ups(tmp_path: Path) -> None:
+    # STILL PINNED. A serial/ssh push is projected only onto the UPS the machine names,
+    # so a same-named target on another UPS fires on a different outage — same target
+    # name, different power domain, not a conflict.
     p = _write(
         tmp_path,
         {
@@ -709,6 +750,44 @@ def test_mutual_exclusion_ignores_target_on_a_different_ups(tmp_path: Path) -> N
     )
     cfg = Config.load(p, env={})
     assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ()
+
+
+def test_mutual_exclusion_CATCHES_a_native_machine_against_any_ups(tmp_path: Path) -> None:
+    # The carve-out above does NOT extend to `native`. A native authority is the remote
+    # box's own upsmon firing on this primary's FSD — it is keyed to no UPS in this file
+    # — so "different power domain" does not separate it from a legacy push anywhere.
+    # Before this fix the load produced ZERO notices and two live authorities.
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [
+                {"name": "spark", "ssh": "spark", "ups": "cyberpower3", "shutdown_method": "native"}
+            ],
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [{"name": "spark", "enabled": True, "host": "spark"}],
+                },
+                "cyberpower3": {"label": "CP3"},
+            },
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ("spark",)
+
+    # INV-DECLARED: a native machine is never disarmed by config; the LEGACY side is
+    # what gets disabled, leaving exactly one authority.
+    (machine,) = cfg.monitored_machines
+    assert machine.disarmed is False
+    assert machine.effective_method == "native"
+    (target,) = cfg.upses["cyberpower"].shutdown_targets
+    assert target.effective_enabled is False
+
+    # And the operator is told, including an answer to "but that is a different UPS".
+    assert cfg.degraded, "a cross-UPS native collision must not be silent"
+    text = " ".join(n.message for n in cfg.degraded)
+    assert "DIFFERENT UPS" in text
+    assert "'cyberpower3'" in text
 
 
 def test_pure_legacy_target_warns_only_and_still_loads(caplog, tmp_path: Path) -> None:
@@ -1309,14 +1388,59 @@ def test_dual_regime_pairs_canonicalises_the_ups_name_on_both_sides() -> None:
     assert pairs == (("mt", "CyberPower2", "mt"),)
 
 
-def test_dual_regime_pairs_ignores_a_target_on_a_different_ups() -> None:
-    # The machine's ups RESOLVES, so the scan is scoped to that UPS. Same target name on
-    # another UPS is a different power domain, not a conflict.
+def test_dual_regime_pairs_ignores_a_PUSH_target_on_a_different_ups() -> None:
+    # STILL PINNED. The machine's ups RESOLVES and the method is a push, which
+    # `_machine_targets` projects onto that UPS only, so the scan is scoped to it. Same
+    # target name on another UPS is a different power domain, not a conflict.
     pairs = dual_regime_pairs(
         _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}),
         _upses(cyberpower={"label": "CP"}, other=_enabled_mt_target()),
     )
     assert pairs == ()
+    # Same shape, serial rather than ssh — the carve-out is about push-ness, not ssh.
+    pairs = dual_regime_pairs(
+        _machines(
+            {
+                "name": "mt",
+                "ups": "cyberpower",
+                "shutdown_method": "serial",
+                "serial_device": "/dev/ttyUSB0",
+                "serial_baud": 9600,
+            }
+        ),
+        _upses(cyberpower={"label": "CP"}, other=_enabled_mt_target()),
+    )
+    assert pairs == ()
+
+
+def test_dual_regime_pairs_CATCHES_a_native_machine_on_a_different_ups() -> None:
+    # A native authority is not keyed to any UPS in this config, so a resolving `ups`
+    # must NOT narrow the scan. This is the cross-UPS double-shutdown the final
+    # verification found surviving.
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "native"}),
+        _upses(cyberpower={"label": "CP"}, other=_enabled_mt_target()),
+    )
+    assert pairs == (("mt", "other", "mt"),)
+
+
+def test_dual_regime_pairs_native_widening_still_finds_its_own_ups_once() -> None:
+    # Widening must not double-report the machine's own UPS, and must find a collision
+    # there as before.
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "native"}),
+        _upses(cyberpower=_enabled_mt_target(), other={"label": "Other"}),
+    )
+    assert pairs == (("mt", "cyberpower", "mt"),)
+
+
+def test_dual_regime_pairs_native_reports_every_colliding_ups() -> None:
+    # Two enabled targets on two UPSes are two separate authorities to disable.
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "native"}),
+        _upses(cyberpower=_enabled_mt_target(), other=_enabled_mt_target()),
+    )
+    assert pairs == (("mt", "cyberpower", "mt"), ("mt", "other", "mt"))
 
 
 def test_dual_regime_pairs_ignores_a_disabled_target() -> None:

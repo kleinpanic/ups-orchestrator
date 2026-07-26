@@ -40,6 +40,42 @@ gate. For `native`, the trigger is NUT's own low-battery (`LB`) condition on
 the primary, which is an entirely separate mechanism with its own thresholds
 configured in NUT itself, not in this orchestrator's config at all.
 
+### The push is NOT driven by NUT's `LB` flag — read this before relying on it
+
+The paragraph above is easy to read as "both authorities fire at low battery,
+just with different thresholds". They do not share a *mechanism*, and the
+difference decides whether a push happens at all:
+
+- **`native` fires from NUT.** The primary raises FSD on its own `LB` condition
+  and the remote secondary's `upsmon` halts the box. Nothing in this repo is
+  involved, and nothing in this repo can stop it.
+- **A `serial`/`ssh` push fires from this orchestrator's `watch` poll loop, and
+  from nowhere else.** `UpsSnapshot.low_battery` — the parsed `LB` flag — has
+  **zero consumers in the shutdown gate**. It is read only by `status`,
+  `report`, `selftest` and the web UI, all of which merely display it.
+  `deploy/nut/upssched.conf.snippet` does map `AT LOWBATT * EXECUTE lowbatt`
+  and `deploy/upssched-cmd.sh` does forward it, but `handle_lowbatt` writes a
+  `lowbatt` event and sends one notification, then returns. **It never reaches
+  the shutdown path.**
+
+Two consequences follow, and neither is obvious from the requirement text:
+
+1. **If the `watch` unit is not running, no push ever fires.** NUT will still
+   deliver its LOWBATT notification and a `native` secondary will still halt
+   itself, so the outage looks handled — while every `serial`/`ssh` machine
+   silently rides the battery to the floor. `systemctl --user status
+   ups-orchestrator-watch` is therefore a shutdown-path check, not just a
+   monitoring one.
+2. **Both `shutdown.external` thresholds must be crossed, not either.** When
+   `battery_below` *and* `runtime_below` are both set, `_close_to_empty` ANDs
+   them. A UPS at 5% charge that still reports 20 minutes of runtime does not
+   open the gate. Only when one of the two is left unset does the other decide
+   alone.
+
+This split is deliberate — `native` at NUT's LB, push at operator-tunable
+thresholds crossed earlier — but it means the two authorities can fire minutes
+apart, and it means the push has a liveness dependency that `native` does not.
+
 **Local-last, and what that costs during an outage (D-7).** The watcher host's
 own `local` target — its own poweroff — is always held until every enabled
 remote/serial/push target on the same UPS has been *attempted* (not

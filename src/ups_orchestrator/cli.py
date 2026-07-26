@@ -1710,12 +1710,18 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     )
     conflicts = dual_regime_conflicts((*others, candidate), cfg.upses)
     if conflicts and not args.force:
+        # "on its UPS" was the old text and is no longer the whole truth: a declared
+        # `native` machine is scanned against EVERY configured UPS, because its
+        # authority is the remote box's own upsmon on this primary's FSD and is keyed
+        # to no UPS in this file.
+        scope_text = "on ANY configured UPS" if method == "native" else "on its UPS"
         LOG.error(
             "monitor add: %s is both an enrolled machine (shutdown_method=%r) and an "
-            "enabled shutdown_target on its UPS (double-shutdown risk) — pass --force to "
+            "enabled shutdown_target %s (double-shutdown risk) — pass --force to "
             "override",
             args.name,
             method,
+            scope_text,
         )
         return 2
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import stat
@@ -11,7 +12,12 @@ import pytest
 
 from conftest import FakeNotifier, make_deps, make_ups, shutdown_policy, snap
 from ups_orchestrator import events as events_mod
-from ups_orchestrator.config import ConfigNotice, MonitoredMachine, ShutdownTarget
+from ups_orchestrator.config import (
+    ConfigNotice,
+    MonitoredMachine,
+    ShutdownTarget,
+    is_disarming,
+)
 from ups_orchestrator.events import (
     _default_local_shutdown,
     _default_serial_shutdown,
@@ -1506,3 +1512,253 @@ def test_a_held_local_target_logs_why_it_is_waiting() -> None:
     ]
     assert held, "the held local target left no trace"
     assert "srv" in str(held[-1]["reason"])
+
+
+def _cross_ups_config(tmp_path, *, method: str) -> dict:
+    """The exact shape the final verification executed, parameterised by method."""
+    return {
+        "upses": {
+            "cyberpower": {
+                "label": "CP",
+                "shutdown_targets": [
+                    {"name": "spark", "kind": "remote", "enabled": True, "host": "spark"}
+                ],
+            },
+            "cyberpower3": {"label": "CP3", "shutdown_targets": []},
+        },
+        "monitored_machines": [
+            {"name": "spark", "ssh": "spark", "ups": "cyberpower3", "shutdown_method": method}
+        ],
+        "shutdown": {
+            "enabled": True,
+            "require_power_outage": True,
+            "min_on_battery_seconds": 0,
+            "external": {"enabled": True, "battery_below": 15, "runtime_below": 300},
+        },
+    }
+
+
+def _fire_every_ups(cfg) -> list[str]:
+    """Run one on-battery-and-low tick per configured UPS; return what fired, in order."""
+    fired: list[str] = []
+    for ups in cfg.upses.values():
+        notifier = FakeNotifier()
+        deps, calls = make_deps(
+            notifier,
+            _low(),
+            countdown_every=0,
+            monitored_machines=cfg.monitored_machines,
+        )
+        dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+        fired.extend(calls)
+    return fired
+
+
+def test_cross_ups_native_collision_cannot_fire_two_authorities(tmp_path) -> None:
+    """The surviving double-shutdown the final verification reproduced.
+
+    spark declares `native` on cyberpower3 AND has an enabled legacy target on
+    cyberpower. Before the fix: `degraded notices: 0`, a cyberpower tick fired
+    `ssh:spark`, and spark ALSO self-halts on cyberpower3's FSD — two live
+    authorities with zero operator surface. `native` is the one authority config
+    cannot disarm, so the ONLY correct outcome is that this daemon pushes nothing.
+    """
+    from ups_orchestrator.config import Config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(_cross_ups_config(tmp_path, method="native")))
+    cfg = Config.load(p, env={})
+
+    # The push is gone: no tick on any UPS reaches a transport.
+    assert _fire_every_ups(cfg) == []
+
+    # The native authority is untouched (INV-DECLARED) and is the single survivor.
+    (spark,) = cfg.monitored_machines
+    assert (spark.disarmed, spark.effective_method) == (False, "native")
+
+    # ...and the operator was told, which is the half that was entirely missing.
+    assert [n.subject for n in cfg.degraded if is_disarming(n)], "silent again"
+    assert any("spark" in n.message for n in cfg.degraded)
+
+
+def test_cross_ups_PUSH_collision_still_fires_both_independently(tmp_path) -> None:
+    """The behaviour deliberately preserved, pinned so the fix cannot over-reach.
+
+    Two pushes keyed to two different UPSes ARE two power domains: each fires on
+    its own outage, and neither is a double-shutdown of one event. Nothing is
+    disarmed and both still fire — one per tick, never both on the same tick.
+    """
+    from ups_orchestrator.config import Config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(_cross_ups_config(tmp_path, method="ssh")))
+    cfg = Config.load(p, env={})
+
+    (spark,) = cfg.monitored_machines
+    assert (spark.disarmed, spark.effective_method) == (False, "ssh")
+    assert [n for n in cfg.degraded if is_disarming(n)] == []
+
+    # One firing per UPS tick: the legacy target on cyberpower, the projected push
+    # on cyberpower3. Two events, two authorities, never the same event twice.
+    assert _fire_every_ups(cfg) == ["spark", "spark"]
+
+
+class _TimelineNotifier(FakeNotifier):
+    """A notifier that writes into a shared timeline, so ordering is observable.
+
+    The real notifier's cost is what F3 is about: max_attempts=3 x timeout=5.0 plus
+    backoff is ~16.5 s against a switch the outage has already killed. Cost is not
+    simulated here — ORDER is the invariant, and order is what decides whether the
+    transport waits on a POST or the POST waits on the transport.
+    """
+
+    def __init__(self, timeline: list[str]) -> None:
+        super().__init__()
+        self._timeline = timeline
+
+    def send(self, note):
+        kind = (
+            "attempt" if "attempt" in note.title else "result" if "sent" in note.title else "other"
+        )
+        self._timeline.append(f"NOTIFY:{kind}")
+        return super().send(note)
+
+
+def _fire_timeline(targets: tuple[ShutdownTarget, ...]) -> list[str]:
+    """Run one on-battery-and-low tick; return the interleaved POST/transport order."""
+    timeline: list[str] = []
+    notifier = _TimelineNotifier(timeline)
+    deps, _calls = make_deps(notifier, _low(), countdown_every=0)
+
+    def _ssh(target: ShutdownTarget) -> tuple[int, str, str]:
+        timeline.append(f"TRANSPORT:{target.name}")
+        return 0, "", ""
+
+    deps = replace(deps, ssh_shutdown=_ssh)
+    ups = make_ups("ups1", targets=targets, shutdown_policy=shutdown_policy())
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+    return [e for e in timeline if e != "NOTIFY:other"]
+
+
+def test_f3_transport_is_not_made_to_wait_on_a_notification() -> None:
+    """F3. The attempt POST used to precede the runner, so every transport waited.
+
+    Measured before this fix with a 0.30 s stand-in POST: three ssh targets took
+    2.40 s and every transport was preceded by a full blocking POST. Scaled to the
+    real notifier against a dead switch that is ~16.5 s per target, serialised,
+    inside a gate that opens at runtime_below: 300 — and `cyberpower` powers BOTH
+    this orchestrator and the Dell PowerEdge, so that time comes straight out of
+    the Pi's own remaining runtime.
+    """
+    order = _fire_timeline((_remote("box0"), _remote("box1"), _remote("box2")))
+
+    assert order == [
+        "TRANSPORT:box0",
+        "NOTIFY:attempt",
+        "NOTIFY:result",
+        "TRANSPORT:box1",
+        "NOTIFY:attempt",
+        "NOTIFY:result",
+        "TRANSPORT:box2",
+        "NOTIFY:attempt",
+        "NOTIFY:result",
+    ]
+    # The load-bearing property, stated independently of the exact embed set: no
+    # notification is ever emitted before the first transport, and each transport
+    # is reached having waited on strictly fewer POSTs than there are prior targets
+    # x 2. Before the fix the first entry was NOTIFY:attempt.
+    assert order[0].startswith("TRANSPORT:")
+    assert order.index("TRANSPORT:box2") == 6  # was 7 with the attempt POST in front
+
+
+def test_f3_reorder_preserves_the_shutdowns_sent_guarantee() -> None:
+    """T-02-24 must survive the reorder: a failing remote still lets the local fire.
+
+    The append moved to sit between the runner and both notifications; it must
+    still happen on EVERY outcome, including a non-zero rc and an escaping runner.
+    """
+    for runner, label in (
+        (lambda _t: (1, "", "boom"), "rc!=0"),
+        (_raise_switch_is_dead, "raised"),
+    ):
+        notifier = FakeNotifier()
+        deps, calls = make_deps(notifier, _low(), countdown_every=0, local_rc=0)
+        deps = replace(deps, ssh_shutdown=runner)
+        ups = make_ups(
+            "ups1",
+            targets=(_remote("srv"), _local("pi")),
+            shutdown_policy=shutdown_policy(internal_enabled=True),
+        )
+        state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+        dispatch("tick", ups, state, deps)
+
+        assert state.shutdowns_sent == ["srv", "pi"], label
+        assert calls == ["local"], label  # the local proceeded despite the dead remote
+        # ...and the operator still gets both embeds for the failed remote.
+        titles = [n.title for n in notifier.sent]
+        assert any("shutdown attempt for srv" in t for t in titles), label
+        assert any("shutdown FAILED for srv" in t for t in titles), label
+
+
+def _raise_switch_is_dead(_target: ShutdownTarget) -> tuple[int, str, str]:
+    raise RuntimeError("the switch is dead")
+
+
+# --- P2-03's unstated narrowing: the push trigger is NOT NUT's LB flag ---------
+
+
+def test_lowbatt_never_fires_a_push_even_with_a_machine_enrolled() -> None:
+    """docs/Shutdown-Mechanisms.md: NUT's LOWBATT does not reach the shutdown path.
+
+    `test_lowbatt_only_notifies` above proves the handler fires nothing, but it
+    runs with no enrolled machine and no target, so it cannot distinguish "does
+    not fire" from "had nothing to fire". This one hands `handle_lowbatt` a push
+    machine AND an enabled legacy target on a fully-armed policy.
+    """
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier,
+        snap("OB LB", charge=2, runtime=30),
+        countdown_every=0,
+        monitored_machines=(_spark(),),
+    )
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+    ups = make_ups("ups1", targets=(_remote("srv"),), shutdown_policy=shutdown_policy())
+
+    dispatch("lowbatt", ups, state, deps)
+
+    assert calls == []
+    assert state.shutdowns_sent == []
+
+
+def test_the_LB_flag_alone_does_not_open_the_push_gate() -> None:
+    """The push gate reads the configured thresholds, never `UpsSnapshot.low_battery`.
+
+    `LB` is set and the battery is under `battery_below`, but runtime is above
+    `runtime_below` — and `_close_to_empty` ANDs the two when both are configured.
+    NUT would already be halting a native secondary here; the push does not fire.
+    """
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier,
+        snap("OB LB", charge=5, runtime=1200),
+        countdown_every=0,
+        monitored_machines=(_spark(),),
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps)
+
+    assert calls == []
+
+    # Drop runtime under the threshold — now BOTH are crossed and it fires. Same
+    # snapshot LB flag in both halves, so the flag is provably not the trigger.
+    deps2, calls2 = make_deps(
+        notifier,
+        snap("OB LB", charge=5, runtime=120),
+        countdown_every=0,
+        monitored_machines=(_spark(),),
+    )
+    dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps2)
+    assert calls2 == ["spark"]
