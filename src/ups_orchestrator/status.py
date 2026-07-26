@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, ConfigNotice
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
@@ -151,6 +151,29 @@ def _card(
     return ["", *_panel(title, _vlen(title), inner, use_color=use_color)]
 
 
+def _degraded_block(degraded: tuple[ConfigNotice, ...], *, use_color: bool) -> list[str]:
+    """Render every load-time degrade notice above the per-UPS cards.
+
+    A disarmed shutdown authority is a standing condition, not a footnote — this is
+    what makes RA-01's degrade visible without opening a terminal to run
+    ``monitor list``. Returns no lines at all when ``degraded`` is empty, so a
+    healthy config's status output is unchanged.
+    """
+    if not degraded:
+        return []
+
+    def c(text: str, code: str) -> str:
+        return f"{code}{text}{_RESET}" if use_color else text
+
+    title = c("⚠ DEGRADED CONFIG", _RED)
+    lines = []
+    for n in degraded:
+        label = "ERROR" if n.severity == "error" else "ADVISORY"
+        color = _RED if n.severity == "error" else _YELLOW
+        lines.append(f"{c(label, color)} {c(n.subject, _BOLD)}: {n.message}")
+    return ["", *_panel(title, _vlen(title), lines, use_color=use_color)]
+
+
 def render(
     cfg: Config, *, color: bool = True, now: float | None = None, sample_path: Path | None = None
 ) -> str:
@@ -159,6 +182,7 @@ def render(
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
     header = f"⚡ UPS Orchestrator — {ts}"
     lines = [f"{_BOLD}{header}{_RESET}" if color else header]
+    lines.extend(_degraded_block(cfg.degraded, use_color=color))
     for name, ups in cfg.upses.items():
         snap = read_snapshot(name)
         lines.extend(_card(ups.label, snap, _recent_watts(sample_path, name, now), use_color=color))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from conftest import make_ups
 from ups_orchestrator import status
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, ConfigNotice
 from ups_orchestrator.nut import UpsSnapshot
 
 
@@ -79,6 +79,52 @@ def test_panel_ascii_fallback_when_no_color() -> None:
     lines = status._panel("T", 1, ["body"], use_color=False)
     assert lines[0].startswith("+-") and lines[-1].startswith("+-")
     assert all("\033[" not in x for x in lines)
+
+
+def test_status_healthy_config_has_no_degraded_block(monkeypatch) -> None:
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert "DEGRADED" not in rendered
+
+
+def test_status_shows_error_and_advisory_notices(monkeypatch) -> None:
+    degraded = (
+        ConfigNotice(severity="error", subject="mt", message="no serial device — disarmed"),
+        ConfigNotice(severity="advisory", subject="spark", message="shutdown_cmd needs sudo"),
+    )
+    cfg = Config(
+        webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded
+    )
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert "DEGRADED" in rendered
+    assert "ERROR" in rendered and "mt" in rendered and "no serial device — disarmed" in rendered
+    assert "ADVISORY" in rendered and "spark" in rendered and "shutdown_cmd needs sudo" in rendered
+
+
+def test_status_degraded_block_appears_before_first_ups_card(monkeypatch) -> None:
+    degraded = (ConfigNotice(severity="error", subject="mt", message="disarmed"),)
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert rendered.index("DEGRADED") < rendered.index("Test ups1")
+
+
+def test_status_degraded_block_no_color_has_no_escape_codes(monkeypatch) -> None:
+    degraded = (
+        ConfigNotice(severity="error", subject="mt", message="disarmed"),
+        ConfigNotice(severity="advisory", subject="spark", message="needs sudo"),
+    )
+    cfg = Config(webhook_url="", upses={}, degraded=degraded)
+    rendered = status.render(cfg, color=False, now=0)
+    assert "\033[" not in rendered
 
 
 def test_battery_and_load_gauge_colors_by_threshold() -> None:
