@@ -144,8 +144,11 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/nutclient.py",
-        '    if not saddrs:\n        return ""\n    members = ", ".join(saddrs)',
-        '    if not saddrs:\n        saddrs = ["0.0.0.0"]\n    members = ", ".join(saddrs)',
+        # HI-C2 inserted the member validation between the guard and the join, so the
+        # pattern is anchored on the guard alone. An empty set must REMOVE the rule,
+        # never render a match-anything one.
+        '    if not saddrs:\n        return ""\n',
+        '    if not saddrs:\n        saddrs = ["0.0.0.0"]\n',
         "nutclient: empty-saddrs drops accept rule",
     ),
     (
