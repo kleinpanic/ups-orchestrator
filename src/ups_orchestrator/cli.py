@@ -46,7 +46,7 @@ from ups_orchestrator.events import Deps, dispatch
 from ups_orchestrator.jsonlog import append_event
 from ups_orchestrator.notify import build_notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
-from ups_orchestrator.state import StateStore
+from ups_orchestrator.state import StateStore, replace_preserving_metadata
 
 LOG = logging.getLogger("ups_orchestrator")
 
@@ -770,9 +770,11 @@ def _monitor_persist(cfg_path: Path, machines: list[dict[str, object]]) -> None:
     """Write monitored_machines back by mutating the RAW config dict, atomically.
 
     Unknown keys (e.g. a ``_comment``) are preserved because we round-trip the
-    parsed JSON rather than a frozen Config. The write is temp+fsync+os.replace
-    (state.py pattern) so a crash mid-write can't corrupt the file the watch
-    service reads. The secondary password is never among the written fields.
+    parsed JSON rather than a frozen Config. The write is
+    temp+fsync+replace_preserving_metadata (state.py) so a crash mid-write
+    can't corrupt the file the watch service reads, and the replace itself
+    can't strip the mode/owner/ACL the installer gave the file (T-02-23).
+    The secondary password is never among the written fields.
     """
     import tempfile
 
@@ -792,7 +794,7 @@ def _monitor_persist(cfg_path: Path, machines: list[dict[str, object]]) -> None:
             tmp.write("\n")
             tmp.flush()
             os.fsync(tmp.fileno())
-        tmp_path.replace(cfg_path)
+        replace_preserving_metadata(tmp_path, cfg_path)
     finally:
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
