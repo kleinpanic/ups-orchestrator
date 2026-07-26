@@ -1819,9 +1819,19 @@ def test_verify_ssh_unreachable_alias_is_rc1(cfg_path, monkeypatch) -> None:
 # --- remove: method-aware and ambiguity-refusing (T-02-48) --------------------
 
 
-def test_remove_non_native_skips_the_nut_disarm_and_the_nft_rewrite(
+def test_remove_non_native_skips_the_remote_disarm_but_not_the_local_nft_rewrite(
     cfg_path, monkeypatch
 ) -> None:
+    """ME-C4: the gate bundled two actions with very different blast radii.
+
+    The REMOTE disarm SSHes into another host and runs `sudo systemctl` — skipping
+    it for a record this tool never enrolled natively is right, and is what this
+    still asserts. The nft rewrite recomputes a purely LOCAL file from the survivor
+    list; skipping it was what left a stale saddr in the managed set for a host
+    with no native record.
+
+    This test previously asserted `nft.calls == []`, i.e. it encoded the defect.
+    """
     _write_config(
         cfg_path,
         machines=[
@@ -1836,11 +1846,66 @@ def test_remove_non_native_skips_the_nut_disarm_and_the_nft_rewrite(
     monkeypatch.setattr(cli, "_monitor_run_nft", nft)
     monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
     assert cli.main(["monitor", "remove", "spark"]) == 0
-    assert ssh.calls == [] and nft.calls == []
+    assert ssh.calls == [], "no remote host may be touched for a non-native record"
+    assert nft.calls, "the local, idempotent saddr rewrite must still run"
     data = json.loads(cfg_path.read_text())
     assert [m["name"] for m in data["monitored_machines"]] == ["mt"]
-    # The native survivor is untouched, declaration included.
+    # The native survivor is untouched, declaration and upsd accept included.
     assert _entry(cfg_path, "mt")["shutdown_method"] == "native"
+    assert "192.168.1.114" in Path(cli._NFT_PATH).read_text()
+
+
+def test_remove_non_native_revokes_the_stale_saddr_it_was_still_granted(
+    cfg_path, monkeypatch
+) -> None:
+    """The concrete leak: a former native secondary hand-edited to `ssh`.
+
+    `_survivor_saddrs` keeps only DECLARED-native records (HI-C2), so this
+    record's ip is not in the set the rewrite computes — but nothing ever ran the
+    rewrite, so the accept it had been granted survived its own removal.
+    """
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="native", ssh="mt", ip="192.168.1.114"),
+            _machine_entry("spark", method="native", ssh="spark", ip="192.168.1.120"),
+        ],
+    )
+    ssh, nft = FakeSSH(), FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+    # Seed the managed set with both, the way a native enrollment of each would.
+    assert cli.main(["monitor", "remove", "spark"]) == 0
+    assert "192.168.1.120" not in Path(cli._NFT_PATH).read_text()
+
+    # Now demote mt to a push record by hand and remove it: the remote disarm is
+    # skipped (correct), and its saddr must still go.
+    _write_config(
+        cfg_path, machines=[_machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower")]
+    )
+    ssh.calls.clear()
+    assert cli.main(["monitor", "remove", "mt"]) == 0
+    assert ssh.calls == []
+    assert "192.168.1.114" not in Path(cli._NFT_PATH).read_text()
+
+
+def test_remove_non_native_persists_even_when_the_nft_sweep_fails(cfg_path, monkeypatch) -> None:
+    """The sweep is a repair, not the operator's request.
+
+    Refusing the removal on a failed rewrite would leave BOTH the record and the
+    stale saddr — strictly worse than leaving the saddr alone and saying so. The
+    native path keeps its fatal rc 4, where the accept is that record's own.
+    """
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("spark", method="ssh", ssh="spark", ups="cyberpower")],
+    )
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    monkeypatch.setattr(cli, "_NFT_PATH", "/nonexistent/main.nft")  # apply_nft -> rc 2
+
+    assert cli.main(["monitor", "remove", "spark"]) == 0
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
 
 
 def test_remove_native_still_disarms_and_rewrites_the_firewall(cfg_path, monkeypatch) -> None:
@@ -2586,3 +2651,91 @@ def test_verify_ssh_alias_sink_accepts_a_plain_alias(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "", "")]))
     assert cli._verify_ssh_alias(MonitoredMachine(name="mt", ssh="mt", shutdown_method="ssh")) == 0
+
+
+# --- ME-C4: `monitor add --method ssh/serial/none` revokes the ip it sheds ------
+
+
+def test_add_record_only_revokes_a_stale_saddr_the_record_no_longer_owns(
+    cfg_path, monkeypatch
+) -> None:
+    """The other half of ME-C4's "no command in the family revokes a shed ip".
+
+    The IW-05 shape: a former native secondary hand-edited to a push method but
+    still carrying its enrollment `ip`, whose accept is still in the managed set.
+    `_survivor_saddrs`'s native filter (HI-C2) already excludes it from the
+    computed set — but the record-only branch returned before ever reaching an nft
+    step, so nothing recomputed the file and the accept survived indefinitely.
+    """
+    from ups_orchestrator import nutclient
+
+    # Seed the managed set the way this machine's native enrollment left it.
+    seeded, _changed = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.114"])
+    Path(cli._NFT_PATH).write_text(seeded)
+    assert "192.168.1.114" in Path(cli._NFT_PATH).read_text()
+
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="ssh", ssh="mt", ups="cyberpower", ip="192.168.1.114")
+        ],
+    )
+    ssh, nft = FakeSSH(), FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+
+    rc = cli.main(["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"])
+
+    assert rc == 0
+    assert ssh.calls == [], "a record-only add must not contact any host"
+    assert nft.calls, "the local, idempotent saddr rewrite must run"
+    assert "192.168.1.114" not in Path(cli._NFT_PATH).read_text()
+
+
+def test_add_record_only_opens_nothing_for_the_machine_it_records(cfg_path, monkeypatch) -> None:
+    """The rewrite must never become an nft OPENING for a non-native record.
+
+    T-02-11/P2-02: a machine with no NUT enrollment of its own gets no upsd.users,
+    no LISTEN, no accept. `_survivor_saddrs`'s native filter is what guarantees it,
+    and this pins that the new nft call cannot smuggle one in.
+    """
+    _write_config(cfg_path, machines=[])
+    nft = FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+
+    rc = cli.main(
+        [
+            "monitor", "add", "box", "--method", "ssh", "--ssh", "box", "--ups", "cyberpower",
+            "--ip", "192.168.1.130",
+        ]
+    )
+
+    assert rc == 0
+    text = Path(cli._NFT_PATH).read_text()
+    assert "192.168.1.130" not in text
+    assert "3493" not in text  # no upsd accept was rendered at all
+    # ...and `ip` is still written only by the native enrollment path.
+    assert _entry(cfg_path, "box")["ip"] == ""
+
+
+def test_add_record_only_persists_even_when_the_nft_sweep_fails(cfg_path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    monkeypatch.setattr(cli, "_NFT_PATH", "/nonexistent/main.nft")  # apply_nft -> rc 2
+
+    rc = cli.main(["monitor", "add", "box", "--method", "none"])
+
+    assert rc == 0
+    assert _entry(cfg_path, "box")["shutdown_method"] == "none"
+
+
+def test_add_record_only_no_firewall_skips_the_sweep(cfg_path, monkeypatch) -> None:
+    nft = FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+
+    rc = cli.main(["monitor", "add", "box", "--method", "none", "--no-firewall"])
+
+    assert rc == 0 and nft.calls == []

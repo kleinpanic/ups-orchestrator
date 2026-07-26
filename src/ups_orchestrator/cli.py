@@ -869,6 +869,31 @@ def _survivor_saddrs(machines: tuple[MonitoredMachine, ...]) -> list[str]:
     return out
 
 
+def _rewrite_nft_saddrs(
+    saddrs: list[str], *, no_restart_bouncer: bool, verb: str
+) -> tuple[int, str]:
+    """Recompute the managed nft accept from ``saddrs``. LOCAL, idempotent (ME-C4).
+
+    Shared by ``monitor remove`` and the record-only branch of ``monitor add``,
+    which are the two commands that can make a machine STOP being a native
+    secondary. Neither used to run it — ``remove`` skipped it for a non-native
+    record and ``add --method ssh/serial/none`` returned before reaching it — so no
+    command in the family revoked the ip a record shed, and the managed set kept
+    granting upsd access to a host with no native record at all.
+
+    Touches nothing but this box: ``apply_nft`` returns ``(0, "no change", "")``
+    when the rendered text is unchanged, so the common case is a read and a compare.
+    The caller decides whether a failure is fatal; it is always logged here.
+    """
+    restart = (lambda: None) if no_restart_bouncer else _monitor_restart_bouncer
+    rc, _out, err = nutclient.apply_nft(
+        _NFT_PATH, saddrs, _monitor_run_nft, restart, reload_path=_NFT_RELOAD_PATH
+    )
+    if rc != 0:
+        LOG.error("%s: firewall reload failed: %s", verb, err)
+    return rc, err
+
+
 def _monitor_persist(cfg_path: Path, machines: list[dict[str, object]]) -> None:
     """Write monitored_machines back by mutating the RAW config dict, atomically.
 
@@ -1230,21 +1255,35 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
     survivors = tuple(m for m in cfg.monitored_machines if m is not machine)
     saddrs = _survivor_saddrs(survivors)
-    # The remote NUT teardown and the nft rewrite exist for a native enrollment and
-    # only for one. A serial/ssh/none record has no remote upsmon to disable and no
-    # upsd accept of its own; running either would touch a box this record never
-    # enrolled. Keyed on the DECLARED method (INV-DECLARED).
+    # ME-C4. The gate bundled two actions with very different blast radii, and only
+    # one of them belongs behind it:
+    #
+    #  * the REMOTE NUT disarm SSHes into another host and runs `sudo systemctl`.
+    #    Skipping it for a record this tool never enrolled natively is correct and
+    #    stays keyed on the DECLARED method (INV-DECLARED);
+    #  * the nft rewrite recomputes a purely LOCAL file from the survivor list and
+    #    reloads it. It touches no other host and `apply_nft` returns
+    #    ("no change") when the text is unchanged, so it is idempotent and free.
+    #
+    # Skipping the second left a stale saddr in the managed set for a host with no
+    # record at all — and with `monitor add --method ssh/serial/none` also returning
+    # before its own nft step, NO command in the family revoked the ip a record shed.
+    # The rewrite is unconditional now; with `_survivor_saddrs`'s native filter
+    # (HI-C2) the managed set becomes exactly "the ip of every surviving native
+    # record", which is the invariant it was always supposed to have.
     is_native = machine.shutdown_method.strip().lower() == "native"
 
     if args.dry_run:
-        if not is_native:
-            print(f"[dry-run] disarm remote: skip (declared {machine.shutdown_method})")
-            print(f"[dry-run] firewall: skip (declared {machine.shutdown_method})")
-        else:
-            disarm = "skip (--keep-remote)" if args.keep_remote else machine.ssh
-            fw = "skip (--no-firewall)" if args.no_firewall else saddrs
-            print(f"[dry-run] disarm remote: {disarm}")
-            print(f"[dry-run] firewall: {fw}")
+        disarm = (
+            f"skip (declared {machine.shutdown_method})"
+            if not is_native
+            else "skip (--keep-remote)"
+            if args.keep_remote
+            else machine.ssh
+        )
+        fw = "skip (--no-firewall)" if args.no_firewall else saddrs
+        print(f"[dry-run] disarm remote: {disarm}")
+        print(f"[dry-run] firewall: {fw}")
         print(f"[dry-run] persist: drop {machine.name} (config written LAST)")
         return 0
 
@@ -1268,14 +1307,20 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             LOG.error("monitor remove: remote disarm failed: %s", err)
             return 3
 
-    # 2) firewall: rewrite the saddr set from survivors (unless --no-firewall)
-    if is_native and not args.no_firewall:
-        restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
-        rc, _out, err = nutclient.apply_nft(
-            _NFT_PATH, saddrs, _monitor_run_nft, restart, reload_path=_NFT_RELOAD_PATH
+    # 2) firewall: rewrite the saddr set from survivors (unless --no-firewall).
+    # ME-C4: unconditional. The rewrite is local and idempotent, and a NON-native
+    # record can still hold a stale enrollment `ip` in the managed set — that is
+    # precisely the ip nothing else revokes.
+    if not args.no_firewall:
+        rc, err = _rewrite_nft_saddrs(
+            saddrs, no_restart_bouncer=args.no_restart_bouncer, verb="monitor remove"
         )
-        if rc != 0:
-            LOG.error("monitor remove: firewall reload failed: %s", err)
+        # Fatal only for the native path, where the accept is this record's own and
+        # step 3 has not run yet. For a non-native record the removal is the
+        # operator's actual request and the rewrite is a repair sweep: refusing here
+        # would leave BOTH the record AND the stale saddr, which is strictly worse.
+        # Logged either way — never silent.
+        if rc != 0 and is_native:
             return 4
 
     # 3) persist config LAST (so a firewall failure leaves config unchanged)
@@ -1614,6 +1659,17 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             serial_baud=baud,
             raw=dict(existing.raw) if existing is not None else {},
         )
+        # ME-C4: the ip this record SHEDS has to be revoked by something. `others`
+        # already excludes every record of this name, and `_survivor_saddrs` keeps
+        # only declared-native machines, so a re-enrolment of a former native
+        # secondary as serial/ssh/none drops its ip out of the computed set — which
+        # is exactly the revocation nothing in the family performed. The record-only
+        # branch returned before ever reaching an nft step, and `monitor remove`
+        # skipped its own rewrite for a non-native record, so between them the
+        # managed set kept granting upsd access to a host with no native record.
+        # This still opens NOTHING for this machine: a non-native entry contributes
+        # no saddr of its own.
+        saddrs = _survivor_saddrs((*others, entry))
         if args.dry_run:
             transport = {
                 "serial": f"serial {args.serial_device} @ {baud} baud",
@@ -1622,9 +1678,18 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             }[method]
             print(f"[dry-run] record-only add ({method}): {transport}")
             print(f"[dry-run] shutdown_cmd: {shutdown_cmd}")
-            print("[dry-run] skipped: upsd.users, LISTEN, nft, remote upsmon (native-only)")
+            print("[dry-run] skipped: upsd.users, LISTEN, remote upsmon (native-only)")
+            fw = "skip (--no-firewall)" if args.no_firewall else saddrs
+            print(f"[dry-run] firewall: {fw}   (revokes any ip this record sheds)")
             print(f"[dry-run] persist: {args.name} (config written LAST)")
             return 0
+        if not args.no_firewall:
+            # Never fatal here: recording the machine is the operator's actual
+            # request and the rewrite is a repair sweep for an accept this record
+            # does not own. Refusing would leave the stale saddr AND no record.
+            _rewrite_nft_saddrs(
+                saddrs, no_restart_bouncer=args.no_restart_bouncer, verb="monitor add"
+            )
         _monitor_persist(cfg_path, [*(m.to_dict() for m in others), entry.to_dict()])
         print(f"recorded {args.name} (shutdown_method={method})")
         return 0

@@ -212,8 +212,9 @@ sudo ups-orchestrator monitor add somebox --method none
 ups-orchestrator monitor list      # declared method, and the effective method when it differs;
                                     # plus every Config.degraded notice, ERROR/ADVISORY labelled
 ups-orchestrator monitor verify mt # "will this machine actually shut down?" — see below
-sudo ups-orchestrator monitor remove mt   # native: real remote NUT teardown + nft/saddr update;
-                                    # serial/ssh/none: config entry only
+sudo ups-orchestrator monitor remove mt   # native: real remote NUT teardown + nft/saddr rewrite;
+                                    # serial/ssh/none: config entry + the same LOCAL nft rewrite
+                                    # (no remote host is contacted for a non-native record)
 
 # Preview without touching anything
 ups-orchestrator remote-shutdown cyberpower --dry-run
@@ -356,6 +357,32 @@ polling zero or ambiguous UPSes while looking healthy, which is worse than
 refusing to start. Every shutdown-authority misconfiguration — a bad baud, a
 dual-regime conflict, an unresolvable `ups`, a stale `ip` on a push record —
 degrades instead.
+
+### The managed nft `saddr` set
+
+The upsd accept spliced into the operator's input base chain grants port 3493 to
+exactly **the `ip` of every surviving `native` record** — nothing else. Two rules
+keep that true, and both are enforced on the **declared** method:
+
+- `_survivor_saddrs` filters to `shutdown_method == "native"` and to values that
+  are valid IP literals. A `serial`/`ssh`/`none` record carrying a stale
+  enrollment `ip` contributes nothing, and a non-literal is dropped with a
+  warning rather than spliced into a ruleset `nft -f` loads as root.
+- **Both** `monitor add` and `monitor remove` recompute and reload the set, for
+  every method — not just for `native`. The rewrite is local and idempotent
+  (`apply_nft` short-circuits when the rendered text is unchanged), so this costs
+  nothing when there is nothing to do, and it is what revokes the `ip` a record
+  sheds when it stops being a native secondary. Skip it with `--no-firewall`.
+
+Only the **remote** NUT teardown in `monitor remove` stays `native`-only: it
+SSHes into another host and runs `sudo systemctl`, which has no business running
+for a record this tool never enrolled natively.
+
+A failed rewrite is fatal (rc 4) on the `native` path, where the accept is that
+record's own. On a non-native `add`/`remove` it is logged and the config change
+still lands: the record edit is the operator's actual request and the rewrite is
+a repair sweep, so refusing would leave *both* the stale saddr and the wrong
+record.
 
 ### File permissions after a persist
 
