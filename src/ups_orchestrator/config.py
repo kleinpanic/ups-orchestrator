@@ -9,9 +9,11 @@ setups, but ``config.example.json`` ships it empty.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
+import re
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -473,21 +475,13 @@ class MonitoredMachine:
                     method,
                 )
 
-        # A legacy backup {enabled:true, kind:serial} that derived to "serial" has
-        # no serial_device/serial_baud to project — refuse it with a migration
-        # error instead of silently producing an unfireable serial transport.
-        if (
-            "shutdown_method" not in data
-            and method == "serial"
-            and not serial_device
-        ):
-            raise ValueError(
-                f"monitored machine {name!r} has a legacy backup "
-                f"{{enabled:true, kind:serial}} but no serial device to project; "
-                f"set an explicit shutdown_method:'serial' with serial_device + "
-                f"serial_baud to migrate."
-            )
-
+        # RA-01: a legacy backup {enabled:true, kind:serial} with no serial_device used
+        # to raise here. It no longer does. MonitoredMachine.backup has ZERO runtime
+        # consumers, so hard-failing the whole daemon over an inert field is the exact
+        # MED-08 outage — and on the outage path specifically, _cmd_event returns 0 when
+        # _load_config returns None, so a config that trips a load-time raise turns every
+        # real NUT power event into a silent no-op that reports success (IW-06). The
+        # shape now parses, and Config.load disarms it with the migration remedy named.
         return cls(
             name=name,
             ssh=ssh,
@@ -647,29 +641,198 @@ class UpsConfig:
         )
 
 
+# INV-DEGRADE has exactly FOUR write points, and they are these. Every notice site goes
+# through one of them, so the invariant has four places to audit rather than a rule to
+# remember at every site. They are named for their SEVERITY because the round-3 failure
+# mode was not that an executor would choose badly — it was that only one door existed.
+# All four APPEND via dataclasses.replace and never overwrite: a push machine can
+# legitimately earn both the NEW-2 advisory and a T-02-10 ssh-alias error in one load.
+
+
+def _disarm_machine(machine: MonitoredMachine, message: str) -> MonitoredMachine:
+    """Append an ERROR notice: this machine stops being pushed — unless it is native."""
+    return dataclasses.replace(
+        machine,
+        load_notices=(
+            *machine.load_notices,
+            ConfigNotice(severity="error", subject=machine.name, message=message),
+        ),
+    )
+
+
+def _advise_machine(machine: MonitoredMachine, message: str) -> MonitoredMachine:
+    """Append an ADVISORY notice: nothing about this machine's armed state changes."""
+    return dataclasses.replace(
+        machine,
+        load_notices=(
+            *machine.load_notices,
+            ConfigNotice(severity="advisory", subject=machine.name, message=message),
+        ),
+    )
+
+
+def _disarm_target(ups_key: str, target: ShutdownTarget, message: str) -> ShutdownTarget:
+    """Append an ERROR notice: this legacy target stops firing."""
+    return dataclasses.replace(
+        target,
+        load_notices=(
+            *target.load_notices,
+            ConfigNotice(severity="error", subject=f"{ups_key}/{target.name}", message=message),
+        ),
+    )
+
+
+def _advise_target(ups_key: str, target: ShutdownTarget, message: str) -> ShutdownTarget:
+    """Append an ADVISORY notice: this legacy target still fires."""
+    return dataclasses.replace(
+        target,
+        load_notices=(
+            *target.load_notices,
+            ConfigNotice(severity="advisory", subject=f"{ups_key}/{target.name}", message=message),
+        ),
+    )
+
+
+# T-02-10. A plain host or ssh_config alias: no leading "-" (ssh would read it as an
+# option), no whitespace, no shell metacharacters. `user@host` and `host:port` shapes are
+# allowed because they are legitimate operator spellings.
+_SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._@:-]*$")
+
+
+def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
+    """``(severity, message)`` pairs for one machine's DECLARED transport parameters."""
+    found: list[tuple[str, str]] = []
+    method = m.shutdown_method.strip().lower()
+    if method == "serial":
+        device = m.serial_device.strip()
+        if not device:
+            if "shutdown_method" in m.raw:
+                found.append(
+                    (
+                        "error",
+                        "declares shutdown_method='serial' with an empty serial_device, so "
+                        "there is nothing to write the shutdown command to. Set "
+                        "serial_device to the console device under /dev/.",
+                    )
+                )
+            else:
+                # Distinguished by the ABSENCE of an explicit key: this is the legacy
+                # backup {enabled:true, kind:serial} shape, which needs a migration, not
+                # a device typo fix.
+                found.append(
+                    (
+                        "error",
+                        "has a legacy backup {enabled:true, kind:serial} that derived "
+                        "shutdown_method='serial', but no serial device to project. "
+                        "Migrate it: set an explicit shutdown_method 'serial' with "
+                        "serial_device and serial_baud.",
+                    )
+                )
+        elif not device.startswith("/dev/") or device == "/dev/":
+            # MED-10 (config half). The serial writer opens the device with mode "wb",
+            # which TRUNCATES a regular file — so a typo'd path destroys that file and
+            # still reports success. The transport-side guard is 02-07.
+            found.append(
+                (
+                    "error",
+                    f"declares serial_device {device!r}, which is not an absolute path "
+                    f"under /dev/. The serial writer opens it with mode 'wb', which "
+                    f"TRUNCATES a regular file, so a typo would destroy that file and "
+                    f"still report success. Use the console device path under /dev/.",
+                )
+            )
+        if m.serial_baud is None:
+            declared = m.raw.get("serial_baud", m.raw.get("serial", {}))
+            if isinstance(declared, dict):
+                declared = declared.get("baud")
+            if declared is None:
+                found.append(
+                    (
+                        "error",
+                        "declares shutdown_method='serial' with no serial_baud. The baud "
+                        "is never assumed: a mismatch writes garbage down the line and "
+                        "still returns rc 0, a silent no-shutdown. Declare serial_baud "
+                        "(the live console here is 9600).",
+                    )
+                )
+            else:
+                # HI-04: quote the operator's ORIGINAL value, never a sentinel the parser
+                # invented — which is only possible because to_dict never wrote one back.
+                found.append(
+                    (
+                        "error",
+                        f"declares serial_baud {declared!r}, which is not an integer. "
+                        f"Declare an integer serial_baud (the live console here is 9600).",
+                    )
+                )
+        elif m.serial_baud <= 0:
+            found.append(
+                (
+                    "error",
+                    f"declares serial_baud {m.serial_baud}; POSIX B0 means hang up the "
+                    f"line, so stty would disconnect the console it was about to use. "
+                    f"Declare the live console's baud (9600 here).",
+                )
+            )
+    elif method == "ssh":
+        alias = m.ssh.strip()
+        if not alias:
+            found.append(
+                (
+                    "error",
+                    "declares shutdown_method='ssh' with an empty ssh alias, so there is "
+                    "no host to connect to. Set 'ssh' to the hostname or ssh_config "
+                    "alias of the box to shut down.",
+                )
+            )
+        elif not _SSH_ALIAS_RE.match(alias):
+            # T-02-10. This value becomes an argv element in an UNATTENDED ssh at outage
+            # time (before 02-02 it only ever reached a foreground operator command), and
+            # an option-shaped value is interpreted by ssh as an option — a probe produced
+            # an argv carrying an injected ProxyCommand while validation returned clean.
+            found.append(
+                (
+                    "error",
+                    f"declares ssh alias {m.ssh!r}, which is not a plain host or "
+                    f"ssh_config alias. That value becomes an argv element in an "
+                    f"unattended ssh at outage time, where a leading '-' is read as an "
+                    f"option and shell metacharacters are carried verbatim. Use a plain "
+                    f"hostname or ssh_config alias.",
+                )
+            )
+    elif method == "native" and not m.ups.strip():
+        # HI-05 corrected: REPORTED, never disarmed. Config cannot disarm a native
+        # authority — see MonitoredMachine.disarmed. Routing it through the advisory
+        # helper makes the disposition explicit rather than relying on the native
+        # carve-out to neutralise a disarm.
+        found.append(
+            (
+                "advisory",
+                f"declares shutdown_method='native' with a blank ups, so nothing here "
+                f"associates it with a UPS. Config cannot disarm a native authority: the "
+                f"remote box's own upsmon halts it on this primary's FSD. Run "
+                f"'monitor verify {m.name}' to learn whether that secondary is actually "
+                f"armed, and 'monitor remove {m.name}' to disarm it.",
+            )
+        )
+    return tuple(found)
+
+
 def validate_active_transports(
     monitored_machines: tuple[MonitoredMachine, ...],
-) -> tuple[str, ...]:
-    """Return per-machine errors for effective methods with invalid transport params.
+) -> tuple[tuple[str, str, str], ...]:
+    """Return ``(machine_name, severity, message)`` for invalid transport parameters.
 
-    ``_as_int`` silently substitutes defaults (config.py:27), so a bad baud never
-    surfaces as a coercion failure — validation must be explicit. A serial method
-    with an empty ``serial_device`` or a non-positive ``serial_baud``, or an ssh
-    method with an empty ssh alias, is a load-time error (finding 3): otherwise
-    ``_default_serial_shutdown`` would open a bogus device or ssh would target no host.
+    A pure reporter that raises nothing (RA-01): a machine's transport being
+    unconfigurable is not a reason to stop watching the UPS. It reads the DECLARED
+    method (INV-DECLARED), so the same findings recur on a reload of an already-degraded
+    config and the degrade is idempotent.
     """
-    errors: list[str] = []
-    for m in monitored_machines:
-        method = m.shutdown_method.strip().lower()
-        if method == "serial":
-            if not m.serial_device.strip():
-                errors.append(f"{m.name}: serial method with empty serial_device")
-            if m.serial_baud is None or m.serial_baud <= 0:
-                errors.append(f"{m.name}: serial method with non-positive serial_baud")
-        elif method == "ssh":
-            if not m.ssh.strip():
-                errors.append(f"{m.name}: ssh method with empty ssh alias")
-    return tuple(errors)
+    return tuple(
+        (m.name, severity, message)
+        for m in monitored_machines
+        for severity, message in _transport_notices(m)
+    )
 
 
 # Every kind ``events._fire_target`` dispatches deliberately. Anything else is not
@@ -917,6 +1080,201 @@ def legacy_only_targets(
     return tuple(remnant)
 
 
+_PUSH_METHODS = frozenset({"serial", "ssh"})
+
+
+def _apply_degrades(
+    machines: tuple[MonitoredMachine, ...],
+    upses: dict[str, UpsConfig],
+) -> tuple[tuple[MonitoredMachine, ...], dict[str, UpsConfig], tuple[ConfigNotice, ...]]:
+    """Attach every load-time notice in a fixed order and return the degraded config.
+
+    Nothing here raises, nothing is dropped, and no persisted field is written
+    (INV-DEGRADE) — the only state produced is ``load_notices`` on copies plus the
+    returned notice tuple. Detection reads the DECLARATION throughout (INV-DECLARED), so
+    the result is recomputed identically on every load: fixing the config re-arms, and
+    nothing latches or drifts.
+
+    Order is fixed and asserted: duplicates, dual-regime conflicts (the structural
+    double-shutdown is the most actionable), push-association and unknown-UPS, the
+    stale-enrollment fingerprint, transports, legacy targets, then the two advisories.
+    """
+    working = list(machines)
+    target_lists = {key: list(ups.shutdown_targets) for key, ups in upses.items()}
+    notices: list[ConfigNotice] = []
+
+    def _record(notice: ConfigNotice) -> None:
+        notices.append(notice)
+        if notice.severity == "error":
+            logger.error("config degrade: %s", notice)
+        else:
+            logger.warning("config advisory: %s", notice)
+
+    def disarm_at(i: int, message: str) -> None:
+        working[i] = _disarm_machine(working[i], message)
+        _record(working[i].load_notices[-1])
+
+    def advise_at(i: int, message: str) -> None:
+        working[i] = _advise_machine(working[i], message)
+        _record(working[i].load_notices[-1])
+
+    def indices(name: str) -> list[int]:
+        return [i for i, m in enumerate(working) if m.name == name]
+
+    def disarm_target(ups_key: str, target_name: str, message: str) -> None:
+        for j, t in enumerate(target_lists[ups_key]):
+            if t.name == target_name and not any(n.severity == "error" for n in t.load_notices):
+                target_lists[ups_key][j] = _disarm_target(ups_key, t, message)
+                _record(target_lists[ups_key][j].load_notices[-1])
+                return
+
+    # 1. LO-13 duplicate names. Every colliding record is KEPT — a drop is written by
+    # _monitor_persist as a DELETION, since it rewrites the whole array from
+    # cfg.monitored_machines, so an unrelated `monitor remove <other>` would silently
+    # destroy an operator-authored record. All of them are disarmed instead: firing "one
+    # of the two mt records" is a guess. Lossless on disk, fail-closed on shutdown.
+    seen: dict[str, int] = {}
+    for m in working:
+        key = m.name.strip().casefold()
+        seen[key] = seen.get(key, 0) + 1
+    for i, m in enumerate(list(working)):
+        if seen[m.name.strip().casefold()] > 1:
+            disarm_at(
+                i,
+                f"duplicate monitored_machines name: {seen[m.name.strip().casefold()]} records "
+                f"share this name (case-insensitively), so which one a shutdown would fire is "
+                f"a guess. Every record is kept — none is dropped — and all of them are "
+                f"disarmed. Give each machine a unique name.",
+            )
+
+    # 2. Dual-regime conflicts, SPLIT BY DECLARED AUTHORITY TYPE (RA-01 round 2).
+    for machine_name, ups_key, target_name in dual_regime_pairs(tuple(working), upses):
+        hits = indices(machine_name)
+        method = working[hits[0]].shutdown_method
+        if method == "native":
+            # Config cannot disarm a native authority, and round 1's claim that it could
+            # produced the mirror of this phase's target failure: an operator told a
+            # still-protected box is unprotected, plus a cosmetic "none" that would have
+            # let 02-03's guard permit a native->push switch over a live remote upsmon.
+            message = (
+                f"governed by BOTH shutdown regimes: declared shutdown_method='native' and "
+                f"also an enabled shutdown_target {target_name!r} on UPS {ups_key!r}. The "
+                f"legacy target has been disabled. This machine remains ARMED and is now the "
+                f"single surviving authority — its own upsmon halts it on this primary's FSD "
+                f"and lives in that box's /etc, so no config change here can disarm it. Run "
+                f"'monitor verify {machine_name}' to check that secondary, and "
+                f"'monitor remove {machine_name}' to actually disarm it."
+            )
+        else:
+            message = (
+                f"governed by BOTH shutdown regimes: declared shutdown_method={method!r} and "
+                f"also an enabled shutdown_target {target_name!r} on UPS {ups_key!r}, which "
+                f"would shut this box down twice. Both are disarmed. Remove the enabled "
+                f"shutdown_target, or set this machine's shutdown_method to 'none'."
+            )
+        for i in hits:
+            disarm_at(i, message)
+        disarm_target(
+            ups_key,
+            target_name,
+            f"disabled: it collides with monitored machine {machine_name!r}, which declares "
+            f"shutdown_method={method!r}. A machine takes exactly one shutdown authority.",
+        )
+
+    # 3. Push-association (the correction to BL-01's premise) and unknown UPS names.
+    unprojectable = set(unprojectable_push_machines(tuple(working), upses))
+    for name in unprojectable:
+        for i in indices(name):
+            declared_ups = working[i].ups.strip()
+            if declared_ups:
+                where = f"its ups {declared_ups!r} matches no configured UPS"
+            else:
+                where = "its ups is blank"
+            disarm_at(
+                i,
+                f"declares shutdown_method={working[i].shutdown_method!r} but {where}. Pushes "
+                f"are projected per UPS on that UPS's low-battery event, so this machine is "
+                f"projected on no event at all and can never fire. Disarmed so it does not "
+                f"report as protected. Set 'ups' to the UPS that powers this box.",
+            )
+    for name, ups_name in unknown_ups_references(tuple(working), upses):
+        if name in unprojectable:
+            continue  # already disarmed, with a more specific reason
+        for i in indices(name):
+            advise_at(
+                i,
+                f"references UPS {ups_name!r}, which is not configured. Its declared "
+                f"shutdown_method is {working[i].shutdown_method!r}, so nothing is disarmed "
+                f"here; fix the name or add the UPS.",
+            )
+
+    # 4. IW-05, the hand-edit hole no CLI guard can close. `ip` is the nft saddr address
+    # resolved by _resolve_remote_ip and is written ONLY by the native enrollment path, so
+    # a push record carrying one is a probable former native secondary whose upsmon was
+    # never torn down: two live authorities. Fail closed against the suspected one.
+    for i, m in enumerate(list(working)):
+        if m.shutdown_method.strip().lower() in _PUSH_METHODS and m.ip.strip():
+            disarm_at(
+                i,
+                f"declares shutdown_method={m.shutdown_method!r} but carries a non-empty ip "
+                f"{m.ip!r}. That address is written only by the native enrollment path, so "
+                f"this is probably a former native secondary whose shutdown_method was "
+                f"hand-edited — leaving the remote upsmon armed AND enabling a push, two live "
+                f"authorities. Disarmed (fail closed). Run 'monitor verify {m.name}' to check "
+                f"whether that secondary still answers, and 'monitor remove {m.name}' to "
+                f"actually disarm it.",
+            )
+
+    # 5. Transports. The severity is chosen at THIS call site, by name, per notice.
+    for name, severity, message in validate_active_transports(tuple(working)):
+        for i in indices(name):
+            if severity == "error":
+                disarm_at(i, message)
+            else:
+                advise_at(i, message)
+
+    # 6. Legacy targets that cannot fire or would misdispatch.
+    for ups_key, target_name, message in validate_legacy_targets(upses):
+        disarm_target(ups_key, target_name, f"disabled: {message}")
+
+    # 7. The two ADVISORIES. Neither changes any machine's armed state — that is
+    # guaranteed by the severity fold, not by these call sites being careful.
+    for i, m in enumerate(list(working)):
+        method = m.shutdown_method.strip().lower()
+        if method in _PUSH_METHODS and requires_root_escalation(m.shutdown_cmd):
+            # NEW-2, keyed on the VALUE: every record ever persisted carries an explicit
+            # shutdown_cmd at exactly the wrong-for-push value, so key presence carries
+            # no signal whatsoever.
+            advise_at(
+                i,
+                f"declares shutdown_method={m.shutdown_method!r} with shutdown_cmd "
+                f"{m.shutdown_cmd!r}, which invokes a root-only halt binary with no "
+                f"escalation. upsmon runs SHUTDOWNCMD as root, so that is right for "
+                f"'native' and wrong for a push, where it runs as the ssh user or the "
+                f"far-end auto-login user. Over ssh that fails with a non-zero rc; over "
+                f"serial it fails SILENTLY — the bytes are delivered, the write returns rc "
+                f"0, and success is reported for a box that stayed up. Advisory only: this "
+                f"machine is still armed. Declare an escalated shutdown_cmd (e.g. prefixed "
+                f"with 'sudo') unless the far end logs in as root.",
+            )
+        elif method == "none" and m.ups.strip() and "shutdown_method" in m.raw:
+            # BL-02, routed to the degrade surface rather than to a journal line, because
+            # RA-01's own argument is that a log line is an insufficient operator surface.
+            advise_at(
+                i,
+                f"declares shutdown_method='none' while naming UPS {m.ups!r}. 'none' does "
+                f"NOT disarm an already-enrolled native secondary: the remote upsmon still "
+                f"powers this box off on the primary's FSD. Run 'monitor verify {m.name}' to "
+                f"check, and 'monitor remove {m.name}' to actually disarm it.",
+            )
+
+    degraded_upses = {
+        key: dataclasses.replace(ups, shutdown_targets=tuple(target_lists[key]))
+        for key, ups in upses.items()
+    }
+    return tuple(working), degraded_upses, tuple(notices)
+
+
 @dataclass(frozen=True)
 class Config:
     """Top-level configuration for all monitored UPSes."""
@@ -933,20 +1291,50 @@ class Config:
     discord_avatar_url: str = ""
     nut_server: NutServer = field(default_factory=NutServer)
     monitored_machines: tuple[MonitoredMachine, ...] = ()
+    # Every load-time degrade, machine- and target-level, in detection order. This is a
+    # machine-readable OPERATOR SURFACE — rendered by monitor list and monitor verify and
+    # at watch startup (02-03) and by status and the web UI (02-08) — not a log-only
+    # artefact, because RA-01's whole argument is that a journal line is insufficient.
+    degraded: tuple[ConfigNotice, ...] = ()
 
     def ups(self, name: str) -> UpsConfig | None:
         """Look up a UPS by NUT name, returning ``None`` if it is not configured."""
         return self.upses.get(normalize_ups_name(name))
 
     @classmethod
-    def load(cls, path: Path, env: Mapping[str, str] | None = None) -> Config:
+    def load(cls, path: Path | str, env: Mapping[str, str] | None = None) -> Config:
         """Load and validate configuration from ``path``.
 
-        Raises ``ValueError`` if no UPS sections are defined, since a monitor with
-        nothing to monitor is almost certainly a mistake.
+        ONE rule decides what raises: *a config error that makes the file unparseable, or
+        that corrupts the MONITORING TOPOLOGY, is fatal; a config error that makes a
+        SHUTDOWN AUTHORITY unsafe or unfireable disarms that authority — if it is
+        disarmable — and always loads.*
+
+        The availability half is not theoretical. ``_cmd_event`` returns 0 when
+        ``_load_config`` returns ``None``, and ``upssched-cmd.sh`` invokes it for
+        ``onbatt``, ``lowbatt`` and ``remote_shutdown`` — so a config that trips a
+        load-time raise turns every real NUT power event into a silent no-op that reports
+        success, at the exact moment the daemon exists for (IW-06).
+
+        The seven fatal classes: unreadable file, malformed JSON, a non-object JSON root
+        (LO-15), ``upses`` absent or empty, a non-object entry inside ``upses``, an
+        effective ``upses`` mapping that is empty after filtering, and colliding canonical
+        UPS keys. The last three are monitoring-topology corruption — ``watch`` would poll
+        zero or ambiguous UPSes while looking healthy.
+
+        Everything else degrades: see ``_apply_degrades`` and ``Config.degraded``.
         """
         environ: Mapping[str, str] = os.environ if env is None else env
-        raw = json.loads(path.read_text())
+        # LO-16: accept a str as well as a Path. The live probe reproduced
+        # `AttributeError: 'str' object has no attribute 'read_text'` against the real
+        # config file — the same escaped-handler class as LO-15, since cli._load_config
+        # catches only (OSError, ValueError).
+        cfg_path = Path(path)
+        raw = json.loads(cfg_path.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"Config root in {cfg_path} is not a JSON object (got {type(raw).__name__})"
+            )
 
         webhook_env = str(raw.get("discord_webhook_env", "UPS_DISCORD_WEBHOOK"))
         webhook = (
@@ -955,7 +1343,7 @@ class Config:
 
         upses_raw = raw.get("upses", {})
         if not isinstance(upses_raw, dict) or not upses_raw:
-            raise ValueError(f"No 'upses' configured in {path}")
+            raise ValueError(f"No 'upses' configured in {cfg_path}")
 
         global_scope = _norm_scope(raw.get("shutdown_scope"), "remote")
         shutdown_policy = ShutdownPolicy.from_dict(raw.get("shutdown"))
@@ -969,6 +1357,27 @@ class Config:
             for name, data in upses_raw.items()
             if isinstance(data, dict)
         }
+        # A non-empty raw `upses` whose values are all non-objects passed the check above
+        # and then filtered to {}; `watch` polled zero UPSes and looked healthy. Loud
+        # refusal beats a silently useless daemon.
+        if not upses:
+            raise ValueError(f"No usable 'upses' in {cfg_path}: every entry is a non-object")
+        non_objects = [name for name, data in upses_raw.items() if not isinstance(data, dict)]
+        if non_objects:
+            # Previously filtered out silently. A monitored UPS vanishing from the
+            # topology is not a shutdown-authority error — it is a monitor that quietly
+            # stops watching a UPS.
+            raise ValueError(
+                f"Non-object 'upses' entr{'y' if len(non_objects) == 1 else 'ies'} in "
+                f"{cfg_path}: {', '.join(repr(n) for n in non_objects)}"
+            )
+        _index, collisions = canonical_ups_index(upses)
+        if collisions:
+            raise ValueError(
+                f"UPS names in {cfg_path} collide when canonicalised, making projection and "
+                f"lookup ambiguous: "
+                + "; ".join(f"{first!r} and {second!r}" for first, second in collisions)
+            )
 
         machines_raw = raw.get("monitored_machines", [])
         monitored_machines = (
@@ -977,19 +1386,10 @@ class Config:
             else ()
         )
 
-        # STRICT per-machine mutual exclusion (P2-06): a machine carries exactly one
-        # effective method, so any overlap with an enabled legacy shutdown_target on
-        # the same UPS is a hard error — it would shut the box down twice (or shut
-        # down a machine declared "none"). Fail closed at load, not at outage time.
-        conflicts = dual_regime_conflicts(monitored_machines, upses)
-        if conflicts:
-            methods = {m.name: m.shutdown_method for m in monitored_machines}
-            raise ValueError(
-                "Machine(s) governed by BOTH shutdown regimes: "
-                + "; ".join(f"{n} (shutdown_method={methods[n]})" for n in conflicts)
-                + ". Each machine takes exactly one method — remove the enabled "
-                "shutdown_target on its UPS, or set the machine's shutdown_method."
-            )
+        # RA-01: per-machine mutual exclusion is still ENFORCED (P2-06) — but by disarming
+        # every disarmable authority and reporting it, not by refusing to load. See
+        # _apply_degrades for the split by authority type and the full notice set.
+        monitored_machines, upses, degraded = _apply_degrades(monitored_machines, upses)
 
         remnant = legacy_only_targets(monitored_machines, upses)
         if remnant:
@@ -999,12 +1399,6 @@ class Config:
                 "legacy regime. Migrate them to a monitored_machines entry with an "
                 "explicit shutdown_method.",
                 ", ".join(remnant),
-            )
-
-        transport_errors = validate_active_transports(monitored_machines)
-        if transport_errors:
-            raise ValueError(
-                "Invalid active shutdown transport(s): " + "; ".join(transport_errors)
             )
 
         return cls(
@@ -1021,4 +1415,5 @@ class Config:
             discord_avatar_url=str(raw.get("discord_avatar_url", "")),
             nut_server=NutServer.from_dict(raw.get("nut_server")),
             monitored_machines=monitored_machines,
+            degraded=degraded,
         )
