@@ -52,7 +52,7 @@
           "kind": "serial",
           "enabled": false,
           "device": "/dev/ttyUSB0",
-          "baud": 115200,
+          "baud": 9600,
           "cmd": "sudo /sbin/shutdown -h now"
         },
         {

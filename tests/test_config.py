@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -11,7 +12,10 @@ from ups_orchestrator.config import (
     ShutdownTarget,
     derive_shutdown_method,
     dual_regime_conflicts,
+    legacy_only_targets,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write(tmp_path: Path, data: dict[str, object]) -> Path:
@@ -235,7 +239,10 @@ def test_monitored_machines_default_empty(tmp_path: Path) -> None:
     assert cfg.monitored_machines == ()
 
 
-def test_dual_regime_conflict_detected(caplog, tmp_path: Path) -> None:
+def test_dual_regime_conflict_detected(tmp_path: Path) -> None:
+    # P2-06: mutual exclusion is enforced, not warned. "mt" has a ups and no
+    # explicit method, so it derives "native"; an enabled shutdown_target with the
+    # same name on that UPS is the classic double-shutdown and is now a load error.
     p = _write(
         tmp_path,
         {
@@ -248,10 +255,8 @@ def test_dual_regime_conflict_detected(caplog, tmp_path: Path) -> None:
             },
         },
     )
-    with caplog.at_level("WARNING"):
-        cfg = Config.load(p, env={})
-    assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ("mt",)
-    assert any("mt" in rec.message for rec in caplog.records)
+    with pytest.raises(ValueError, match="BOTH shutdown regimes"):
+        Config.load(p, env={})
 
 
 def test_dual_regime_no_conflict_when_target_disabled(tmp_path: Path) -> None:
@@ -291,7 +296,12 @@ def test_serial_baud_defaults_9600_never_115200() -> None:
     # An explicit serial method with no baud must default to 9600, matching the
     # live line — never the 115200 landmine (P2-08).
     m = MonitoredMachine.from_dict(
-        {"name": "mt", "ups": "cyberpower", "shutdown_method": "serial", "serial_device": "/dev/ttyUSB0"}
+        {
+            "name": "mt",
+            "ups": "cyberpower",
+            "shutdown_method": "serial",
+            "serial_device": "/dev/ttyUSB0",
+        }
     )
     assert m.serial_baud == 9600
     assert m.serial_device == "/dev/ttyUSB0"
@@ -357,7 +367,7 @@ def test_derive_backup_remote_to_ssh_only_when_enabled() -> None:
     )
 
 
-def test_from_dict_derives_native_for_spark_shape() -> None:
+def test_spark_derive_native_not_ssh() -> None:
     # spark's real Phase-1 shape: ups set, backup {enabled:false,kind:remote}, no shutdown_method.
     m = MonitoredMachine.from_dict(
         {
@@ -410,7 +420,12 @@ def test_transport_valid_serial_empty_device_rejected(tmp_path: Path) -> None:
         {
             "upses": {"cyberpower": {"label": "CP"}},
             "monitored_machines": [
-                {"name": "mt", "ups": "cyberpower", "shutdown_method": "serial", "serial_baud": 9600}
+                {
+                    "name": "mt",
+                    "ups": "cyberpower",
+                    "shutdown_method": "serial",
+                    "serial_baud": 9600,
+                }
             ],
         },
     )
@@ -453,10 +468,194 @@ def test_transport_valid_ssh_empty_alias_rejected(tmp_path: Path) -> None:
 
 
 def test_legacy_baud_default_now_9600() -> None:
-    # ShutdownTarget.baud landmine closed: default is 9600, not 115200.
+    # ShutdownTarget.baud landmine closed: default is 9600, not 115200, in BOTH the
+    # parser (a legacy target that omits "baud") and the declared dataclass field.
+    # `name` has no default, so the declared field default is asserted directly
+    # rather than by constructing a bare ShutdownTarget().
     t = ShutdownTarget.from_dict({"name": "s", "kind": "serial", "device": "/dev/ttyUSB0"})
     assert t.baud == 9600
-    assert ShutdownTarget().baud == 9600
+    declared = {f.name: f.default for f in dataclasses.fields(ShutdownTarget)}
+    assert declared["baud"] == 9600
+
+
+# --- Phase 2 Task 2: STRICT mutual exclusion re-keyed on the effective method ---
+
+
+def _mutual_exclusion_config(tmp_path: Path, machine: dict[str, object]) -> Path:
+    """A config where ``machine`` collides with an enabled legacy target on its UPS."""
+    return _write(
+        tmp_path,
+        {
+            "monitored_machines": [machine],
+            "upses": {
+                "cyberpower": {
+                    "label": "CP",
+                    "shutdown_targets": [
+                        {"name": "mt", "kind": "remote", "enabled": True, "host": "mt"}
+                    ],
+                }
+            },
+        },
+    )
+
+
+def test_mutual_exclusion_native_legacy_target_raises(tmp_path: Path) -> None:
+    # native + enabled legacy target: the secondary fires below LB and the target
+    # fires on the external-group thresholds — the live double-shutdown (events.py).
+    p = _mutual_exclusion_config(
+        tmp_path,
+        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "native"},
+    )
+    with pytest.raises(ValueError, match="shutdown_method=native"):
+        Config.load(p, env={})
+
+
+def test_mutual_exclusion_none_legacy_target_raises(tmp_path: Path) -> None:
+    # none + enabled legacy target: the machine is declared OFF yet still gets shut
+    # down by the legacy regime. Fail closed rather than honour the stale target.
+    p = _mutual_exclusion_config(
+        tmp_path,
+        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "none"},
+    )
+    with pytest.raises(ValueError, match="shutdown_method=none"):
+        Config.load(p, env={})
+
+
+def test_mutual_exclusion_serial_legacy_target_raises(tmp_path: Path) -> None:
+    p = _mutual_exclusion_config(
+        tmp_path,
+        {
+            "name": "mt",
+            "ups": "cyberpower",
+            "shutdown_method": "serial",
+            "serial_device": "/dev/ttyUSB0",
+        },
+    )
+    with pytest.raises(ValueError, match="shutdown_method=serial"):
+        Config.load(p, env={})
+
+
+def test_mutual_exclusion_ssh_legacy_target_raises(tmp_path: Path) -> None:
+    p = _mutual_exclusion_config(
+        tmp_path,
+        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"},
+    )
+    with pytest.raises(ValueError, match="shutdown_method=ssh"):
+        Config.load(p, env={})
+
+
+def test_mutual_exclusion_ignores_target_on_a_different_ups(tmp_path: Path) -> None:
+    # Same target name, different UPS — not the same power domain, not a conflict.
+    p = _write(
+        tmp_path,
+        {
+            "monitored_machines": [
+                {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}
+            ],
+            "upses": {
+                "cyberpower": {"label": "CP"},
+                "other": {
+                    "label": "Other",
+                    "shutdown_targets": [{"name": "mt", "enabled": True, "host": "mt"}],
+                },
+            },
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert dual_regime_conflicts(cfg.monitored_machines, cfg.upses) == ()
+
+
+def test_pure_legacy_target_warns_only_and_still_loads(caplog, tmp_path: Path) -> None:
+    # P2-07: a shutdown_target with NO monitored_machines entry has no effective
+    # method to key on, so it stays warn-only and keeps loading.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "u1": {
+                    "label": "U1",
+                    "shutdown_targets": [
+                        {"name": "fileserver", "enabled": True, "host": "fs.lan"}
+                    ],
+                }
+            }
+        },
+    )
+    with caplog.at_level("WARNING"):
+        cfg = Config.load(p, env={})
+    assert cfg.monitored_machines == ()
+    assert legacy_only_targets(cfg.monitored_machines, cfg.upses) == ("u1/fileserver",)
+    assert any("fileserver" in rec.getMessage() for rec in caplog.records)
+
+
+def test_legacy_only_targets_excludes_local_and_disabled(tmp_path: Path) -> None:
+    # A local target is the watcher host, never a monitored_machines entry, and a
+    # disabled target fires nothing — neither is a migration remnant.
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "u1": {
+                    "label": "U1",
+                    "shutdown_targets": [
+                        {"name": "this-host", "kind": "local", "enabled": True},
+                        {"name": "off", "kind": "remote", "enabled": False, "host": "h"},
+                    ],
+                }
+            }
+        },
+    )
+    cfg = Config.load(p, env={})
+    assert legacy_only_targets(cfg.monitored_machines, cfg.upses) == ()
+
+
+# --- Phase 2 Task 3: regressions — spark derivation, shipped baud, legacy load ---
+
+
+def test_legacy_serial_load_defaults_9600(tmp_path: Path) -> None:
+    # A pre-Phase-2 config: serial shutdown_target with no "baud" key and no
+    # monitored_machines entry. It must still load, at 9600 — not the 115200
+    # landmine that silently sends garbage down a 9600 console (P2-08).
+    p = _write(
+        tmp_path,
+        {
+            "upses": {
+                "u1": {
+                    "label": "U1",
+                    "shutdown_targets": [
+                        {
+                            "name": "bigserver-serial",
+                            "kind": "serial",
+                            "enabled": True,
+                            "device": "/dev/ttyUSB0",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+    cfg = Config.load(p, env={})
+    u1 = cfg.ups("u1")
+    assert u1 is not None
+    (target,) = u1.shutdown_targets
+    assert target.is_serial and target.baud == 9600
+
+
+def test_config_example_baud_9600_no_115200() -> None:
+    # install.sh copies config.example.json verbatim to /etc, so the shipped default
+    # is the landmine that reaches real operators. Negative-grep the whole file.
+    example = REPO_ROOT / "config.example.json"
+    text = example.read_text()
+    assert "115200" not in text
+    data = json.loads(text)
+    serial_targets = [
+        t
+        for ups in data["upses"].values()
+        for t in ups.get("shutdown_targets", [])
+        if t.get("kind") == "serial"
+    ]
+    assert serial_targets
+    assert all(t["baud"] == 9600 for t in serial_targets)
 
 
 def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> None:

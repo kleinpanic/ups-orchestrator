@@ -517,12 +517,17 @@ def dual_regime_conflicts(
 ) -> tuple[str, ...]:
     """Return names of machines governed by BOTH shutdown regimes.
 
-    A conflict is a machine that is enrolled as a native NUT secondary AND is
-    an *enabled* ``shutdown_target`` on the UPS it references. The native
-    secondary fires below LB while the shutdown_target uses the shared
-    external-group thresholds — a double-shutdown risk. This is the single
-    shared detector: ``Config.load`` warns on it, and ``monitor add`` (plan 04)
-    refuses without ``--force``. Matching is case-insensitive on the machine name.
+    A conflict is a monitored machine that also appears as an *enabled*
+    ``shutdown_target`` on the UPS it references. Since every ``monitored_machines``
+    entry now carries an EFFECTIVE ``shutdown_method`` (explicit or derived), this
+    is re-keyed on that method rather than on "is a native secondary": every
+    value in the allow-set conflicts with a legacy target, so the check is a plain
+    overlap test. ``native`` + legacy still double-shuts (the secondary fires below
+    LB while the target uses the external-group thresholds); ``serial``/``ssh`` +
+    legacy fires the same box twice over two transports; and ``none`` + legacy
+    fires a machine the operator declared off. All four are hard errors at
+    ``Config.load``. ``monitor add`` uses the same detector and refuses without
+    ``--force``. Matching is case-insensitive on the machine name.
     """
     conflicts: list[str] = []
     for m in monitored_machines:
@@ -535,6 +540,27 @@ def dual_regime_conflicts(
                 conflicts.append(m.name)
                 break
     return tuple(conflicts)
+
+
+def legacy_only_targets(
+    monitored_machines: tuple[MonitoredMachine, ...],
+    upses: dict[str, UpsConfig],
+) -> tuple[str, ...]:
+    """Return ``ups/target`` labels for enabled targets with no monitored machine.
+
+    These are the pure-legacy remnant: there is no ``monitored_machines`` entry to
+    key an effective shutdown method on, so nothing can conflict and the entry must
+    keep loading (P2-07). It is warn-only, not an error. ``local`` targets are the
+    watcher host itself — they have no monitored_machines entry by construction and
+    are not a migration candidate, so they are excluded.
+    """
+    known = {m.name.strip().lower() for m in monitored_machines}
+    remnant: list[str] = []
+    for ups_name, ups in upses.items():
+        for t in ups.shutdown_targets:
+            if t.enabled and not t.is_local and t.name.strip().lower() not in known:
+                remnant.append(f"{ups_name}/{t.name}")
+    return tuple(remnant)
 
 
 @dataclass(frozen=True)
@@ -597,20 +623,34 @@ class Config:
             else ()
         )
 
+        # STRICT per-machine mutual exclusion (P2-06): a machine carries exactly one
+        # effective method, so any overlap with an enabled legacy shutdown_target on
+        # the same UPS is a hard error — it would shut the box down twice (or shut
+        # down a machine declared "none"). Fail closed at load, not at outage time.
+        conflicts = dual_regime_conflicts(monitored_machines, upses)
+        if conflicts:
+            methods = {m.name: m.shutdown_method for m in monitored_machines}
+            raise ValueError(
+                "Machine(s) governed by BOTH shutdown regimes: "
+                + "; ".join(f"{n} (shutdown_method={methods[n]})" for n in conflicts)
+                + ". Each machine takes exactly one method — remove the enabled "
+                "shutdown_target on its UPS, or set the machine's shutdown_method."
+            )
+
+        remnant = legacy_only_targets(monitored_machines, upses)
+        if remnant:
+            logger.warning(
+                "Legacy shutdown_target(s) %s have no monitored_machines entry, so no "
+                "per-machine shutdown_method governs them; they still fire under the "
+                "legacy regime. Migrate them to a monitored_machines entry with an "
+                "explicit shutdown_method.",
+                ", ".join(remnant),
+            )
+
         transport_errors = validate_active_transports(monitored_machines)
         if transport_errors:
             raise ValueError(
                 "Invalid active shutdown transport(s): " + "; ".join(transport_errors)
-            )
-
-        conflicts = dual_regime_conflicts(monitored_machines, upses)
-        if conflicts:
-            logger.warning(
-                "Machine(s) %s are both an enrolled NUT secondary and an enabled "
-                "shutdown_target on the same UPS: the native secondary fires below LB "
-                "while the shutdown_target uses the shared external-group thresholds, "
-                "a double-shutdown risk deferred to a follow-up.",
-                ", ".join(conflicts),
             )
 
         return cls(
