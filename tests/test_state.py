@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import stat
+import subprocess
+
+import pytest
 
 from ups_orchestrator import state as state_mod
 from ups_orchestrator.state import StateStore
@@ -57,3 +63,119 @@ def test_state_from_dict_ignores_non_numeric_recent_loads(tmp_path) -> None:
     path.write_text(json.dumps({"ups1": {"recent_loads": [40, "x", 30, None]}}))
     store = StateStore(path)
     assert store.get("ups1").recent_loads == [40, 30]
+
+
+# --- T-02-23: metadata-preserving atomic replace ------------------------------
+#
+# `tempfile.NamedTemporaryFile` creates at 0600 owned by the writer, and a bare
+# `Path.replace` makes the destination inherit the TEMP file's mode/owner/ACL,
+# silently stripping whatever the installer set on the real file. These tests
+# pin that the shared helper (used by `StateStore.save`) copies the
+# destination's metadata onto the temp file before the rename.
+
+
+def _alt_gid(current: int) -> int | None:
+    """A supplementary group id this process belongs to, other than ``current``."""
+    for gid in os.getgroups():
+        if gid != current:
+            return gid
+    return None
+
+
+def test_save_preserves_mode_over_existing_file(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    os.chmod(path, 0o640)
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    store.save()
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_save_preserves_group_where_settable(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    current_gid = path.stat().st_gid
+    alt_gid = _alt_gid(current_gid)
+    if alt_gid is None:
+        pytest.skip("process has no alternate supplementary group to test with")
+    os.chown(path, -1, alt_gid)
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    store.save()
+
+    assert path.stat().st_gid == alt_gid
+
+
+def test_save_over_missing_destination_still_works(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    assert not path.exists()
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    store.save()  # must not raise on a first-ever write
+
+    assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 1
+
+
+def test_save_preserves_acl_when_supported(tmp_path) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("setfacl/getfacl not available on this system")
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    # A uid unlikely to already appear on the destination's ACL, so this is a
+    # genuinely new entry beyond what the owner/group/other bits already imply.
+    setfacl = subprocess.run(
+        ["setfacl", "-m", "u:65534:r", str(path)], capture_output=True, text=True
+    )
+    if setfacl.returncode != 0:
+        pytest.skip(f"filesystem does not support POSIX ACLs: {setfacl.stderr.strip()}")
+
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    store.save()
+
+    acl = subprocess.run(
+        ["getfacl", "-n", "--omit-header", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "user:65534:r--" in acl
+
+
+def test_save_completes_and_warns_when_metadata_read_fails(monkeypatch, tmp_path, caplog) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    store = StateStore(path)  # constructed before the patch, so _load()'s own
+    store.get("ups1").onbatt_since = 1  # stat-based exists() check is unaffected
+
+    real_stat = state_mod.Path.stat
+
+    def _flaky_stat(self, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        if self == path:
+            raise OSError("stat blew up")
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(state_mod.Path, "stat", _flaky_stat)
+    with caplog.at_level("WARNING"):
+        store.save()  # must complete, not raise, despite the stat failure
+
+    assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 1
+    assert any("state.json" in rec.message for rec in caplog.records)
+
+
+def test_save_payload_roundtrips_through_reload(tmp_path) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 42
+    store.get("ups1").shutdowns_sent = ["low_battery"]
+    store.save()
+
+    reloaded = StateStore(path)
+    st = reloaded.get("ups1")
+    assert st.onbatt_since == 42
+    assert st.shutdowns_sent == ["low_battery"]
