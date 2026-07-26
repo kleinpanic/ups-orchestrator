@@ -1939,3 +1939,86 @@ def test_event_returns_nonzero_when_the_config_cannot_be_loaded(cfg_path, watch_
     # silent no-op that reported SUCCESS.
     cfg_path.write_text("{ this is not json")
     assert cli.main(["onbatt", "cyberpower"]) != 0
+
+
+# --- BL-C1: a config-authored ssh alias reaching the ssh argv ------------------
+#
+# T-02-10 hardened the argparse boundary (`--ssh`) and 02-06 hardened the loader for
+# a declared-`ssh` record. Neither covers a NATIVE record: `_transport_notices`
+# applies the alias rule only under `method == "ssh"`, and `MonitoredMachine.disarmed`
+# is False for native by construction — so `monitor verify` and `monitor remove` were
+# the only checkpoints, and both were re-validating `ups` while handing `ssh` straight
+# to the argv.
+
+_INJECTED_ALIAS = "-oProxyCommand=touch /tmp/pwn"
+
+
+def test_verify_refuses_an_option_shaped_config_alias_rc2(cfg_path, monkeypatch) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")
+        ],
+    )
+    ssh = FakeSSH([(0, "OL\n", "")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    assert cli.main(["monitor", "verify", "evil"]) == 2
+    assert ssh.calls == []  # the alias never reached an ssh argv
+
+
+def test_remove_refuses_to_run_the_remote_disarm_with_an_option_shaped_alias(
+    cfg_path, monkeypatch
+) -> None:
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")
+        ],
+    )
+    ssh, nft = FakeSSH(), FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+
+    assert cli.main(["monitor", "remove", "evil"]) == 2
+    assert ssh.calls == []
+    # ...and the record is still on disk, so the operator can fix or re-remove it.
+    assert [m["name"] for m in json.loads(cfg_path.read_text())["monitored_machines"]] == ["evil"]
+
+
+def test_remove_with_keep_remote_still_completes_for_a_bad_alias(cfg_path, monkeypatch) -> None:
+    # The refusal is scoped to the step that uses the alias. Removing the record is
+    # the remedy for a bad alias, so the verb must not become unusable.
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("evil", method="native", ssh=_INJECTED_ALIAS, ip="192.168.1.9")
+        ],
+    )
+    ssh, nft = FakeSSH(), FakeNft()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+
+    assert cli.main(["monitor", "remove", "evil", "--keep-remote"]) == 0
+    assert ssh.calls == []
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
+
+
+def test_verify_secondary_rejects_an_option_shaped_alias_at_the_shared_sink() -> None:
+    # Belt-and-braces one layer down: verify_secondary documented that it did NOT
+    # validate the alias, which made every caller the only checkpoint.
+    from ups_orchestrator import nutclient
+
+    calls: list[tuple[str, str, str | None]] = []
+
+    def _record(alias: str, command: str, stdin: str | None = None) -> tuple[int, str, str]:
+        calls.append((alias, command, stdin))
+        return 0, "OL", ""
+
+    ok, detail = nutclient.verify_secondary(_INJECTED_ALIAS, "cyberpower", "192.168.1.125", _record)
+
+    assert ok is False
+    assert "alias" in detail
+    assert calls == []

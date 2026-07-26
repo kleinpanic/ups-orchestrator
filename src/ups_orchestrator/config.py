@@ -744,6 +744,21 @@ def _advise_target(ups_key: str, target: ShutdownTarget, message: str) -> Shutdo
 _SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._@:-]*$")
 
 
+def valid_ssh_alias(value: str) -> bool:
+    """Is ``value`` safe to hand to ``ssh`` as a destination argv element?
+
+    BL-01/BL-C1: the ONE predicate for this question. It had been three call sites
+    that each had to remember — ``MonitoredMachine.ssh`` at load, ``--ssh`` at the
+    argparse boundary — while ``ShutdownTarget.host``/``.user``, ``monitor verify``'s
+    and ``monitor remove``'s config-sourced alias, and ``shutdown rehearse``'s
+    ``user@host`` all reached the same ``ssh`` argv unchecked. A blank value is
+    rejected too: there is no destination to connect to, so nothing may be built from
+    it. The ``user@host`` and ``host:port`` shapes are legitimate operator spellings
+    and stay allowed.
+    """
+    return bool(_SSH_ALIAS_RE.match(value.strip()))
+
+
 def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
     """``(severity, message)`` pairs for one machine's DECLARED transport parameters."""
     found: list[tuple[str, str]] = []
@@ -830,7 +845,7 @@ def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
                     "alias of the box to shut down.",
                 )
             )
-        elif not _SSH_ALIAS_RE.match(alias):
+        elif not valid_ssh_alias(alias):
             # T-02-10. This value becomes an argv element in an UNATTENDED ssh at outage
             # time (before 02-02 it only ever reached a foreground operator command), and
             # an option-shaped value is interpreted by ssh as an option — a probe produced
@@ -969,7 +984,7 @@ def validate_legacy_targets(
                 # checked; the legacy half reaches the identical argv.
                 for field_name, value in (("host", t.host), ("user", t.user)):
                     v = value.strip()
-                    if v and not _SSH_ALIAS_RE.match(v):
+                    if v and not valid_ssh_alias(v):
                         problems.append(
                             (
                                 ups_key,

@@ -54,17 +54,17 @@ from types import FrameType
 from ups_orchestrator import audit, nutclient, recorder, report
 from ups_orchestrator import status as status_view
 
-# _SSH_ALIAS_RE is imported deliberately rather than re-spelled here: T-02-10's
+# valid_ssh_alias is imported deliberately rather than re-spelled here: T-02-10's
 # CLI check and 02-06's load-time check must be the SAME rule, or a value the CLI
-# accepts could be disarmed at load (or worse, the reverse). One regex, two sinks.
+# accepts could be disarmed at load (or worse, the reverse). One predicate, every sink.
 from ups_orchestrator.config import (
-    _SSH_ALIAS_RE,
     Config,
     MonitoredMachine,
     ShutdownTarget,
     UpsConfig,
     dual_regime_conflicts,
     is_disarming,
+    valid_ssh_alias,
 )
 
 # The preview reuses the firing path's OWN gate and projection rather than
@@ -1067,6 +1067,23 @@ def _monitor_verify(
                 "monitor verify: config UPS name %r for %s is invalid", machine.ups, machine.name
             )
             return 2
+        # BL-C1: the alias is config-sourced too and becomes an argv element of the
+        # ssh this is about to run. `verify_secondary` re-validates `ups` and `primary`
+        # and documents that it does NOT validate the alias, and the loader cannot
+        # cover this path either — `_transport_notices` applies the alias rule only
+        # under method == "ssh", and a native record is never disarmed by
+        # construction. This is the only checkpoint, and it was checking the other
+        # field. `monitor remove` remains available to clean the record up.
+        if machine.ssh.strip() and not _valid_ssh_alias(machine.ssh):
+            LOG.error(
+                "monitor verify: config ssh alias %r for %s is not a plain host or "
+                "ssh_config alias; refusing to run the probe. Fix 'ssh' in the config, "
+                "or run 'monitor remove %s'.",
+                machine.ssh,
+                machine.name,
+                machine.name,
+            )
+            return 2
         primary = _monitor_primary_ip(cfg, args.primary_ip)
         ok, detail = nutclient.verify_secondary(
             machine.ssh,
@@ -1156,6 +1173,19 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
     # 1) disarm remote (unless --keep-remote, or the record is not native)
     if is_native and not args.keep_remote:
+        # BL-C1. Checked HERE rather than at the top of the command deliberately:
+        # removing the record is the remedy for a bad alias, so refusing the whole
+        # verb would trap the operator. Only the step that puts the alias in an ssh
+        # argv is refused; --keep-remote then completes the local half.
+        if machine.ssh.strip() and not _valid_ssh_alias(machine.ssh):
+            LOG.error(
+                "monitor remove: config ssh alias %r for %s is not a plain host or "
+                "ssh_config alias; refusing to run the remote disarm. Fix 'ssh' in the "
+                "config, or re-run with --keep-remote and disarm that box by hand.",
+                machine.ssh,
+                machine.name,
+            )
+            return 2
         rc, _out, err = _monitor_run_ssh(machine.ssh, _REMOTE_DISARM, None)
         if rc != 0:
             LOG.error("monitor remove: remote disarm failed: %s", err)
@@ -1273,7 +1303,7 @@ def _valid_ssh_alias(alias: str) -> bool:
     ``ssh`` at outage time once the push projection is live, where a leading ``-``
     is read as an option.
     """
-    return bool(_SSH_ALIAS_RE.match(alias.strip()))
+    return valid_ssh_alias(alias)
 
 
 def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:

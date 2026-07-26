@@ -27,6 +27,10 @@ import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+# The alias-shape rule is shared with Config.load and with the CLI's argparse
+# boundary rather than re-spelled here — one predicate, every ssh sink (BL-C1).
+from ups_orchestrator.config import valid_ssh_alias
+
 # A NUT UPS name is restricted to this charset (letters, digits, dot, dash,
 # underscore) by upsd itself. Any other byte — a space, semicolon, backtick,
 # ``$`` — cannot be a real UPS name, so a value carrying one is an injection
@@ -74,7 +78,9 @@ def _default_run_ssh(
     alias: str, command: str, stdin: str | None = None
 ) -> tuple[int, str, str]:  # pragma: no cover
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, command],
+        # BL-C1: `--` terminates OpenSSH's option parsing, so an option-shaped alias
+        # that reached here is read as a destination rather than as `-oProxyCommand=`.
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", alias, command],
         input=stdin,
         capture_output=True,
         text=True,
@@ -471,8 +477,16 @@ def verify_secondary(
     ``ups`` and ``primary`` are interpolated into a remote shell command, so
     they are re-validated at this sink (config-sourced values reach here without
     passing the argparse boundary): a bad ``ups`` name or ``primary`` IP is
-    refused with ``(False, reason)`` rather than executed.
+    refused with ``(False, reason)`` rather than executed. BL-C1: ``alias`` is now
+    re-validated here too. The docstring used to say it was NOT, which made every
+    caller the only checkpoint — and `monitor verify`/`monitor remove` were checking
+    the other field.
     """
+    if alias.strip() and not valid_ssh_alias(alias):
+        # A BLANK alias is a different defect (there is no host to probe) and is left
+        # to the runner to fail on, exactly as it does today; this guard is about a
+        # value that ssh would read as an option.
+        return False, f"invalid ssh alias: {alias!r}"
     if not valid_nut_name(ups):
         return False, f"invalid UPS name: {ups!r}"
     if not valid_ip(primary):
