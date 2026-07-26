@@ -1574,6 +1574,32 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         LOG.error("monitor add: %s not set in the environment", _SECRET_ENV)
         return 2
 
+    ns = cfg.nut_server
+
+    # LO-C1: a dry run prints the plan and TOUCHES NOTHING — the remote included.
+    # This print used to sit BELOW steps 7 and 8, i.e. below two SSH round-trips into
+    # the machine (`_resolve_remote_ip`) and a local `ip -o route get`
+    # (`_resolve_primary_ip`). Nothing was mutated, so the flag's own help was true,
+    # but "mutate nothing" is not "touch nothing" — and this is the mechanism behind
+    # 02-03's own reported live-contact exception. Only what the operator supplied on
+    # the command line is shown; everything the real run would have to ASK a host for
+    # is rendered unresolved rather than resolved.
+    if args.dry_run:
+        preview_ip = args.ip.strip() if args.ip else ""
+        preview_primary = args.primary_ip.strip() if args.primary_ip else ""
+        unresolved = "<unresolved — the real run probes for it>"
+        saddrs = _survivor_saddrs((*others, dataclasses.replace(candidate, ip=preview_ip)))
+        print(f"[dry-run] resolve ip: {preview_ip or unresolved}")
+        print(
+            f"[dry-run] bootstrap primary: LISTEN {preview_primary or unresolved}, "
+            f"user {ns.secondary_user} (password <redacted>), nft "
+            + ("skip" if args.no_firewall else str(saddrs))
+        )
+        print(f"[dry-run] remote bootstrap: {ssh_alias} detect/install/write/enable")
+        print("[dry-run] verify (deep) then persist entry (no password)")
+        print("[dry-run] contacted: nothing — no ssh, no route probe, no local command")
+        return 0
+
     # 7. resolve the remote source IP (validated literal). When --primary-ip is
     # given, the remote `ip route get <primary>` learns the machine's real LAN
     # source; otherwise the resolver falls back to $SSH_CONNECTION field 1.
@@ -1595,7 +1621,6 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             ip,
         )
         return 2
-    ns = cfg.nut_server
     # Carry a pre-existing entry's raw dict so re-adding (idempotent replace)
     # preserves that machine's operator-authored keys (e.g. a _comment).
     # BL-02/IB-03: shutdown_method is passed EXPLICITLY. `to_dict` always emits the
@@ -1615,16 +1640,6 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         raw=dict(existing.raw) if existing is not None else {},
     )
     saddrs = _survivor_saddrs((*others, entry))
-
-    if args.dry_run:
-        print(f"[dry-run] resolve ip: {ip}")
-        print(
-            f"[dry-run] bootstrap primary: LISTEN {primary}, user {ns.secondary_user} "
-            "(password <redacted>), nft " + ("skip" if args.no_firewall else str(saddrs))
-        )
-        print(f"[dry-run] remote bootstrap: {ssh_alias} detect/install/write/enable")
-        print("[dry-run] verify (deep) then persist entry (no password)")
-        return 0
 
     # 9. bootstrap primary WITH the real password (upsd.users + LISTEN + restart + nft)
     is_root = os.geteuid() == 0

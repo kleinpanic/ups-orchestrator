@@ -2299,3 +2299,62 @@ def test_add_still_refuses_a_double_quote_in_shutdown_cmd(cfg_path, monkeypatch)
         ]
     )
     assert rc == 2
+
+
+# --- LO-C1: `monitor add --dry-run` contacts nothing, not just mutates nothing -
+
+
+def test_add_dry_run_contacts_no_host_and_runs_no_local_probe(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    """The plan used to be printed BELOW two SSH round-trips and a route probe.
+
+    `_resolve_remote_ip` runs `ip -o route get <primary>` and `echo $SSH_CONNECTION`
+    ON THE MACHINE, and `_resolve_primary_ip` runs a local `ip -o route get`. Both
+    are read-only, so nothing was mutated — but the flag's contract is that an
+    operator can rehearse an enrollment against a machine that is not there, and it
+    was not being honoured. No `--ip`/`--primary-ip` here, so the old code had to
+    ask a host for both.
+    """
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    ssh, local, nft = FakeSSH(), FakeLocal(), FakeNft()
+    probes: list[list[str]] = []
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_local", local)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(
+        cli, "_monitor_run_local_probe", lambda argv: (probes.append(list(argv)), (0, "", ""))[1]
+    )
+    # A loopback-only LISTEN is what forces `_resolve_primary_ip` past its config
+    # short-circuit and into the local route probe.
+    _write_config(cfg_path, extra={"nut_server": {"listen": ["127.0.0.1"], "port": 3493}})
+
+    rc = cli.main(["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--dry-run"])
+
+    assert rc == 0
+    assert ssh.calls == [], "a dry run must not open an ssh connection to the machine"
+    assert probes == [], "a dry run must not run a local route probe"
+    assert local.calls == [] and nft.calls == []
+    out = capsys.readouterr().out
+    assert "<unresolved" in out  # ...and it says so rather than inventing a value
+    assert _PW not in out
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
+
+
+def test_add_dry_run_still_shows_operator_supplied_values(cfg_path, monkeypatch, capsys) -> None:
+    """What the operator typed needs no host to learn, so it is still rendered."""
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+
+    rc = cli.main(
+        [
+            "monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower",
+            "--ip", "192.168.1.114", "--primary-ip", "192.168.1.125", "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "resolve ip: 192.168.1.114" in out
+    assert "LISTEN 192.168.1.125" in out
+    assert "'192.168.1.114'" in out  # ...and it reaches the previewed nft saddr set
