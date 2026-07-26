@@ -13,10 +13,15 @@ from ups_orchestrator.config import (
     MonitoredMachine,
     ShutdownTarget,
     UpsConfig,
+    canonical_ups_index,
+    canonical_ups_key,
     derive_shutdown_method,
     dual_regime_conflicts,
+    dual_regime_pairs,
     legacy_only_targets,
     requires_root_escalation,
+    unknown_ups_references,
+    unprojectable_push_machines,
     validate_legacy_targets,
 )
 
@@ -952,3 +957,202 @@ def test_validate_legacy_targets_silent_on_healthy_and_disabled() -> None:
         {"name": "off", "kind": "telepathy", "enabled": False},
     )
     assert validate_legacy_targets(healthy) == ()
+
+
+# --- Plan 02-06 Task 2: one canonical UPS key, the corrected detector, BL-01 ---
+#
+# These exercise the pure detectors DIRECTLY rather than through Config.load, which
+# still raises on a conflict until Task 3.
+
+
+def _machines(*records: dict[str, object]) -> tuple[MonitoredMachine, ...]:
+    return tuple(MonitoredMachine.from_dict(r) for r in records)
+
+
+def _upses(**spec: dict[str, object]) -> dict[str, UpsConfig]:
+    return {name: UpsConfig.from_dict(name, data) for name, data in spec.items()}
+
+
+def _enabled_mt_target() -> dict[str, object]:
+    return {"shutdown_targets": [{"name": "mt", "kind": "remote", "enabled": True, "host": "mt"}]}
+
+
+def test_canonical_ups_key_strips_host_whitespace_and_case() -> None:
+    assert canonical_ups_key("cyberpower2") == "cyberpower2"
+    assert canonical_ups_key("CyberPower2") == "cyberpower2"
+    assert canonical_ups_key("  cyberpower2  ") == "cyberpower2"
+    assert canonical_ups_key("CyberPower2@localhost") == "cyberpower2"
+    assert canonical_ups_key("") == ""
+    assert canonical_ups_key("   ") == ""
+
+
+def test_canonical_ups_index_maps_and_reports_collisions() -> None:
+    index, collisions = canonical_ups_index(_upses(CyberPower2={"label": "CP2"}))
+    assert collisions == ()
+    assert index["cyberpower2"].name == "CyberPower2"
+
+    # Two authored keys that canonicalise to one make projection and lookup
+    # ambiguous — monitoring-topology corruption, so Config.load raises on it.
+    _index, collisions = canonical_ups_index(
+        _upses(cyberpower2={"label": "a"}, CyberPower2={"label": "b"})
+    )
+    assert collisions == (("cyberpower2", "CyberPower2"),)
+
+
+def test_dual_regime_pairs_returns_machine_ups_target_triples() -> None:
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}),
+        _upses(cyberpower=_enabled_mt_target()),
+    )
+    # The triple lets a caller disarm the exact target, not merely learn a machine name.
+    assert pairs == (("mt", "cyberpower", "mt"),)
+
+
+def test_dual_regime_pairs_scans_every_ups_when_the_machine_has_no_ups() -> None:
+    # BL-01. EVERY pre-existing mutual-exclusion fixture sets "ups": "cyberpower", which
+    # is the shared blind spot that let 41 green tests miss this: a blank ups resolved to
+    # no UpsConfig and the machine was SKIPPED, so the collision was never seen. A typo
+    # must widen the scan, never silence it.
+    upses = _upses(cyberpower=_enabled_mt_target())
+    # derived ssh: no ups, backup {enabled:true, kind:remote}
+    derived = _machines({"name": "mt", "ssh": "mt", "backup": {"enabled": True, "kind": "remote"}})
+    assert derived[0].shutdown_method == "ssh"
+    assert dual_regime_pairs(derived, upses) == (("mt", "cyberpower", "mt"),)
+    # explicit ssh with no ups
+    explicit = _machines({"name": "mt", "ssh": "mt", "shutdown_method": "ssh"})
+    assert dual_regime_pairs(explicit, upses) == (("mt", "cyberpower", "mt"),)
+
+
+def test_dual_regime_pairs_scans_every_ups_when_the_ups_is_unknown() -> None:
+    # A machine naming a wholly unknown UPS still collides with an enabled target of the
+    # same name on some other UPS. Fail closed on the typo.
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "typo", "shutdown_method": "ssh"}),
+        _upses(cyberpower=_enabled_mt_target()),
+    )
+    assert pairs == (("mt", "cyberpower", "mt"),)
+
+
+def test_dual_regime_pairs_canonicalises_the_ups_name_on_both_sides() -> None:
+    # HI-03: one canonicalisation used by the detector, the push-association check and
+    # (02-07) the projector, so a capitalisation cannot mean two things in two modules.
+    for declared in ("CyberPower2", "  cyberpower2  ", "cyberpower2@localhost"):
+        pairs = dual_regime_pairs(
+            _machines(
+                {"name": "mt", "ssh": "mt", "ups": declared, "shutdown_method": "ssh"}
+            ),
+            _upses(cyberpower2=_enabled_mt_target()),
+        )
+        assert pairs == (("mt", "cyberpower2", "mt"),), declared
+
+    # ...and the same when the AUTHORED key is the odd one out.
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower2", "shutdown_method": "ssh"}),
+        _upses(CyberPower2=_enabled_mt_target()),
+    )
+    assert pairs == (("mt", "CyberPower2", "mt"),)
+
+
+def test_dual_regime_pairs_ignores_a_target_on_a_different_ups() -> None:
+    # The machine's ups RESOLVES, so the scan is scoped to that UPS. Same target name on
+    # another UPS is a different power domain, not a conflict.
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}),
+        _upses(cyberpower={"label": "CP"}, other=_enabled_mt_target()),
+    )
+    assert pairs == ()
+
+
+def test_dual_regime_pairs_ignores_a_disabled_target() -> None:
+    pairs = dual_regime_pairs(
+        _machines({"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}),
+        _upses(
+            cyberpower={"shutdown_targets": [{"name": "mt", "enabled": False, "host": "mt"}]}
+        ),
+    )
+    assert pairs == ()
+
+
+def test_dual_regime_pairs_reads_declared_state_not_effective_state() -> None:
+    # INV-DECLARED: this is what keeps cli.py's --force gate firing against an
+    # already-degraded config. A machine carrying an ERROR notice is effectively "none",
+    # but the detector still sees the declaration and still reports the conflict.
+    disarmed = dataclasses.replace(
+        MonitoredMachine.from_dict(
+            {"name": "mt", "ssh": "mt", "ups": "cyberpower", "shutdown_method": "ssh"}
+        ),
+        load_notices=(_err(),),
+    )
+    assert disarmed.effective_method == "none"
+    assert dual_regime_pairs((disarmed,), _upses(cyberpower=_enabled_mt_target())) == (
+        ("mt", "cyberpower", "mt"),
+    )
+
+
+def test_dual_regime_conflicts_dedups_and_preserves_first_seen_order() -> None:
+    # The public signature and de-duplicated return are unchanged: cli.py's gate and its
+    # error text stay behaviourally identical for the shapes they already covered.
+    machines = _machines(
+        {"name": "zeta", "ssh": "zeta", "shutdown_method": "ssh"},
+        {"name": "mt", "ssh": "mt", "shutdown_method": "ssh"},
+    )
+    upses = _upses(
+        cyberpower={
+            "shutdown_targets": [
+                {"name": "mt", "enabled": True, "host": "mt"},
+                {"name": "zeta", "enabled": True, "host": "zeta"},
+            ]
+        },
+        other={
+            "shutdown_targets": [{"name": "mt", "enabled": True, "host": "mt"}],
+        },
+    )
+    # "mt" collides on two UPSes, so dual_regime_pairs reports it twice...
+    assert len(dual_regime_pairs(machines, upses)) == 3
+    # ...and the projection de-duplicates it, first-seen order preserved.
+    assert dual_regime_conflicts(machines, upses) == ("zeta", "mt")
+
+
+def test_unknown_ups_references_reports_only_non_empty_unresolvable_names() -> None:
+    machines = _machines(
+        {"name": "typo", "ssh": "typo", "ups": "cyberpwoer", "shutdown_method": "ssh"},
+        {"name": "blank", "ssh": "blank", "shutdown_method": "ssh"},
+        {"name": "fine", "ssh": "fine", "ups": "CyberPower", "shutdown_method": "ssh"},
+    )
+    assert unknown_ups_references(machines, _upses(cyberpower={"label": "CP"})) == (
+        ("typo", "cyberpwoer"),
+    )
+
+
+def test_unprojectable_push_machines_reports_the_structurally_unfireable() -> None:
+    # The push-association rule, and the correction to BL-01's premise. _machine_targets
+    # projects only a machine whose UPS matches the UPS being handled, so a blank or
+    # unresolvable ups on a push machine is projected on NO event at all: it reports as
+    # protected and can never fire. Note that derive_shutdown_method yields a push method
+    # ONLY when ups is blank, so the ENTIRE derived-push class lands here.
+    upses = _upses(cyberpower={"label": "CP"})
+    blank = _machines({"name": "blank", "ssh": "blank", "shutdown_method": "ssh"})
+    unknown = _machines(
+        {"name": "typo", "ssh": "typo", "ups": "cyberpwoer", "shutdown_method": "serial"}
+    )
+    derived = _machines({"name": "legacy", "ssh": "legacy", "backup": {"enabled": True}})
+    assert unprojectable_push_machines(blank, upses) == ("blank",)
+    assert unprojectable_push_machines(unknown, upses) == ("typo",)
+    assert unprojectable_push_machines(derived, upses) == ("legacy",)
+
+
+def test_unprojectable_push_machines_silent_on_native_and_on_resolvable_push() -> None:
+    upses = _upses(cyberpower={"label": "CP"})
+    # A native machine with a blank ups is Task 3's NOTICE-ONLY case, never a push case:
+    # config cannot disarm a native authority.
+    native_blank = _machines({"name": "spark", "ssh": "spark", "shutdown_method": "native"})
+    assert native_blank[0].shutdown_method == "native"
+    assert unprojectable_push_machines(native_blank, upses) == ()
+    # A push machine whose ups resolves (even case-mismatched) is projectable.
+    resolvable = _machines(
+        {"name": "mt", "ssh": "mt", "ups": "CyberPower@localhost", "shutdown_method": "ssh"}
+    )
+    assert unprojectable_push_machines(resolvable, upses) == ()
+    # "none" is not a push method.
+    off = _machines({"name": "off", "shutdown_method": "none"})
+    assert unprojectable_push_machines(off, upses) == ()
