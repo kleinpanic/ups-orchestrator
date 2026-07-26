@@ -881,6 +881,19 @@ def test_config_example_baud_9600_no_115200() -> None:
     assert all(t["baud"] == 9600 for t in serial_targets)
 
 
+def test_config_example_scopes_native_mutual_exclusion_across_every_ups() -> None:
+    # IF-07. The shipped comment said the collision was scoped to "the same UPS".
+    # The cross-UPS widening made that false for a declared `native` machine — it is
+    # scanned against EVERY configured UPS, and `_monitor_add`'s own refusal text
+    # says "on ANY configured UPS". install.sh copies this file verbatim into
+    # production, so the stale sentence is what a real operator reads while deciding
+    # whether two shutdown authorities can coexist.
+    example = REPO_ROOT / "config.example.json"
+    comment = json.loads(example.read_text())["upses"]["ups1"]["shutdown_targets__comment"]
+    assert "on the same UPS" not in comment
+    assert "on ANY configured UPS" in comment
+
+
 def test_malformed_json_config_loads_as_none(monkeypatch, tmp_path: Path) -> None:
     from ups_orchestrator import cli
 
