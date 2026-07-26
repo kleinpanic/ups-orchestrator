@@ -987,3 +987,94 @@ def test_remote_shutdown_dry_run_states_that_a_real_run_would_refuse(
 
     assert "$UPSNAME is unset" in out
     assert "exits 2" in out
+
+
+# --- F1: a degraded config must not kill the daemon through the notifier -------
+
+
+def test_watch_survives_a_degraded_config_with_a_malformed_webhook_url(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """The whole premise of RA-01, defeated through the notification path.
+
+    `_notify_degraded` is the ONE `notifier.send` on the daemon's startup path
+    outside every guard, and it fires ONLY when the config is degraded. A
+    malformed webhook URL made `urllib.request.Request` raise ValueError — not an
+    OSError, so uncaught — so `watch` never reached its poll loop and exited 1,
+    `Restart=always` respawned it, and the box monitored NOTHING in a permanent
+    restart loop.
+
+    RA-01 replaced hard-fail with degrade-and-disarm precisely so a bad config
+    could not stop monitoring. This is the regression test for that promise.
+    """
+    secret = "TOKENabcdef0123456789"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "discord_webhook_url": f"https//discord.com/api/webhooks/1/{secret}",  # no colon
+                "upses": {"ups1": {"label": "U1"}},
+                # A serial record with a blank `ups` is disarmed at load, so
+                # `cfg.degraded` is non-empty and `_notify_degraded` fires.
+                "monitored_machines": [
+                    {
+                        "name": "spark",
+                        "ups": "",
+                        "shutdown_method": "serial",
+                        "serial_device": "/dev/ttyUSB0",
+                        "serial_baud": 9600,
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.delenv("UPS_DISCORD_WEBHOOK", raising=False)  # the file value must win
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(cfg))
+    monkeypatch.setenv("UPS_ORCH_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(tmp_path / "notify.jsonl"))
+    monkeypatch.setattr(cli, "dispatch", lambda *_a, **_k: None)
+
+    ticks = {"n": 0}
+
+    def _stop_after_one_tick(_secs: float) -> None:
+        ticks["n"] += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", _stop_after_one_tick)
+
+    with caplog.at_level("WARNING"), pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+
+    assert ticks["n"] == 1, "watch must reach its poll loop despite the degrade + bad webhook"
+    assert secret not in caplog.text, "a webhook token must never reach the journal"
+
+
+def test_watch_notification_log_never_records_the_webhook_token(monkeypatch, tmp_path) -> None:
+    """`AuditedNotifier` persists `DeliveryResult.error` to notifications.jsonl.
+
+    So an unredacted transport error puts the credential on DISK, not just in the
+    journal — and that file outlives the process.
+    """
+    secret = "TOKENabcdef0123456789"
+    url = f"https://discord.example.invalid/api/webhooks/1/{secret}"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"discord_webhook_url": url, "upses": {"ups1": {"label": "U1"}}}))
+    log = tmp_path / "notify.jsonl"
+    monkeypatch.delenv("UPS_DISCORD_WEBHOOK", raising=False)
+    monkeypatch.setenv("UPS_ORCH_CONFIG", str(cfg))
+    monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(log))
+
+    import urllib.error
+
+    import ups_orchestrator.notify as notify_mod
+
+    monkeypatch.setattr(notify_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        notify_mod.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(urllib.error.URLError(f"cannot reach {url}")),
+    )
+
+    _fake_ups(monkeypatch, "OL", 100, 600)
+    assert cli.main(["notify-test"]) == 1
+    assert secret not in log.read_text()

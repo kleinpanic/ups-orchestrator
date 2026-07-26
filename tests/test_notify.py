@@ -164,3 +164,125 @@ def test_notify_4xx_fails_without_retry(monkeypatch) -> None:
     assert res.status_code == 400
     assert res.attempts == 1
     assert calls["n"] == 1  # no retry on 4xx
+
+
+# --- F1: `send` never raises, and the webhook token never leaves this module ---
+#
+# The webhook URL's last path segment is bearer-equivalent: anyone who reads one
+# can post to that channel indefinitely. Every assertion below checks BOTH halves —
+# that nothing escaped, and that the token is not in what was logged or returned.
+
+_SECRET = "TOKENabcdef0123456789"
+_TYPO_URL = f"https//discord.com/api/webhooks/1/{_SECRET}"  # missing colon
+_FILE_URL = "file:///etc/hostname"
+
+
+def test_send_does_not_raise_on_a_malformed_url(caplog) -> None:
+    """`urllib.request.Request` raises ValueError on a scheme-less URL.
+
+    ValueError is not an OSError, so the loop's `(URLError, OSError)` clause never
+    saw it. `_notify_degraded` is the one `send` on the daemon's startup path
+    outside every guard — and it fires ONLY when the config is degraded — so this
+    turned a config typo into a `watch` that never reached its poll loop.
+    """
+    n = DiscordWebhookNotifier(_TYPO_URL, max_attempts=1)
+    with caplog.at_level("WARNING"):
+        result = n.send(Notification(title="t"))
+    assert result.ok is False
+    assert result.configured is True
+    assert _SECRET not in caplog.text
+    assert _SECRET not in result.error
+
+
+def test_send_does_not_raise_on_a_file_url(caplog, tmp_path) -> None:
+    """`file://` does not raise in urlopen — it SUCCEEDS.
+
+    `resp.getcode()` then returns None and `200 <= None` is a TypeError, which is
+    likewise not an OSError. Reported as undelivered rather than escaping.
+    """
+    probe = tmp_path / "probe.txt"
+    probe.write_text("x")
+    n = DiscordWebhookNotifier(f"file://{probe}", max_attempts=1)
+    with caplog.at_level("WARNING"):
+        result = n.send(Notification(title="t"))
+    assert result.ok is False
+    assert "not an HTTP endpoint" in result.error
+
+
+def test_send_never_raises_whatever_urllib_does(caplog, monkeypatch) -> None:
+    """The catch-all backstop: the promise must not rest on an exception list.
+
+    Enumerating classes is exactly how ValueError and TypeError were missed, so a
+    surprise from a future urllib must still not reach the daemon.
+    """
+    import ups_orchestrator.notify as notify_mod
+
+    def _surprise(*_a: object, **_k: object) -> None:
+        raise RecursionError(f"something new about {_SECRET}")
+
+    monkeypatch.setattr(notify_mod.urllib.request, "Request", _surprise)
+    n = DiscordWebhookNotifier(f"https://discord.com/api/webhooks/1/{_SECRET}", max_attempts=3)
+
+    with caplog.at_level("WARNING"):
+        result = n.send(Notification(title="t"))
+
+    assert result.ok is False
+    assert "RecursionError" in result.error
+    assert _SECRET not in caplog.text, "the exception message must not be logged verbatim"
+    assert _SECRET not in result.error
+
+
+def test_send_redacts_the_token_from_a_transport_error(caplog, monkeypatch) -> None:
+    """`DeliveryResult.error` is PERSISTED to notifications.jsonl by AuditedNotifier.
+
+    An unredacted transport error therefore puts the token on disk as well as in
+    the journal.
+    """
+    import urllib.error
+
+    import ups_orchestrator.notify as notify_mod
+
+    url = f"https://discord.com/api/webhooks/1/{_SECRET}"
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise urllib.error.URLError(f"failed to open {url}")
+
+    monkeypatch.setattr(notify_mod.urllib.request, "urlopen", _boom)
+    monkeypatch.setattr(notify_mod.time, "sleep", lambda _s: None)
+    n = DiscordWebhookNotifier(url, max_attempts=1)
+
+    with caplog.at_level("WARNING"):
+        result = n.send(Notification(title="t"))
+
+    assert result.ok is False
+    assert _SECRET not in result.error
+    assert _SECRET not in caplog.text
+    assert "redacted" in result.error
+
+
+def test_build_notifier_fails_closed_on_an_unusable_url(caplog) -> None:
+    with caplog.at_level("ERROR"):
+        notifier = build_notifier(_TYPO_URL)
+    assert isinstance(notifier, NullNotifier)
+    assert _SECRET not in caplog.text, "the log line reporting it must not echo the credential"
+
+
+def test_build_notifier_fails_closed_on_a_non_http_scheme(caplog) -> None:
+    with caplog.at_level("ERROR"):
+        assert isinstance(build_notifier(_FILE_URL), NullNotifier)
+    assert isinstance(build_notifier("ftp://example.com/x"), NullNotifier)
+    assert isinstance(build_notifier("notascheme"), NullNotifier)
+    # ...and a real one is still a real one.
+    real = build_notifier("https://discord.com/api/webhooks/1/x")
+    assert isinstance(real, DiscordWebhookNotifier)
+
+
+def test_usable_webhook_url_predicate() -> None:
+    from ups_orchestrator.notify import usable_webhook_url
+
+    assert usable_webhook_url("https://discord.com/api/webhooks/1/abc")
+    assert usable_webhook_url("http://127.0.0.1:8080/hook")
+    assert not usable_webhook_url("")
+    assert not usable_webhook_url("https//discord.com/x")  # the missing-colon typo
+    assert not usable_webhook_url("file:///etc/passwd")
+    assert not usable_webhook_url("https://")  # no netloc
