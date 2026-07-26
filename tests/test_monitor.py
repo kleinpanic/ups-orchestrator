@@ -2193,3 +2193,47 @@ def test_list_degrade_banner_neutralises_control_characters_in_a_machine_name(
     banner = out[out.index("DEGRADED CONFIG") :]
     assert "\x1b" not in banner  # the escape never reaches the terminal
     assert "mt?[2J?[H" in banner  # ...and the name is still identifiable
+
+
+# --- LO-C2: the transition guard normalises like every other method comparison -
+
+
+def test_transition_guard_refuses_an_unnormalised_native_declaration(
+    cfg_path, monkeypatch, caplog
+) -> None:
+    """`from_dict` lower-cases the field; `MonitoredMachine` does not promise it.
+
+    `_monitor_add` builds `MonitoredMachine` directly (twice), so the guard's
+    correctness rested on a property of a constructor it does not use. Drive it
+    with the Config object itself so the comparison — not the loader — is what is
+    under test: an unnormalised `"Native"` must still be refused, because letting
+    it through is the exact native->push double-shutdown T-02-23 exists to close.
+    """
+    from ups_orchestrator.config import Config, MonitoredMachine, UpsConfig
+
+    cfg = Config(
+        webhook_url="",
+        upses={"cyberpower": UpsConfig(name="cyberpower", label="CyberPower")},
+        monitored_machines=(
+            MonitoredMachine(
+                name="spark",
+                ssh="spark",
+                ups="cyberpower",
+                shutdown_method="Native",  # never normalised by any constructor
+                ip="192.168.1.120",
+            ),
+        ),
+    )
+    before = cfg_path.read_text()
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+
+    with caplog.at_level("ERROR"):
+        rc = cli._monitor_add(
+            cfg, cfg_path, ["spark", "--method", "ssh", "--ssh", "spark", "--ups", "cyberpower"]
+        )
+
+    assert rc == 2
+    assert "already enrolled as a NATIVE secondary" in caplog.text
+    assert cfg_path.read_text() == before  # the live native record is untouched
+    assert ssh.calls == []

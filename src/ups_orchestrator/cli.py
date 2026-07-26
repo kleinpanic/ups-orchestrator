@@ -1466,7 +1466,19 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     # NUT teardown. Refusing beats an implicit cross-host disarm. Reading the
     # declaration is load-bearing: nothing rewrites that field, so a load-time
     # degrade can never open this guard.
-    if existing is not None and existing.shutdown_method == "native" and method != "native":
+    #
+    # LO-C2: normalised, like every other method comparison in this file
+    # (`_probe_secondary_reason`, `_monitor_remove`, `_rehearsal_target`,
+    # `_survivor_saddrs`). The bare `==` happened to hold only because `from_dict`
+    # lower-cases the field — but `MonitoredMachine` itself makes no such promise and
+    # `_monitor_add` constructs one directly a few lines below, so the guard's
+    # correctness rested on a property of a DIFFERENT constructor. A `"Native"` that
+    # reaches this comparison unnormalised opens the native->push hole outright.
+    if (
+        existing is not None
+        and existing.shutdown_method.strip().lower() == "native"
+        and method != "native"
+    ):
         LOG.error(
             "monitor add: %s is already enrolled as a NATIVE secondary. Changing it to "
             "%r here would leave that box's remote upsmon armed AND add a second "
