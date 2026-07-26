@@ -1022,3 +1022,533 @@ def test_named_temporaryfile_confined_to_known_sites() -> None:
         "write must go through state.replace_preserving_metadata instead of "
         "reimplementing the unprotected temp+replace idiom"
     )
+
+
+# =============================================================================
+# 02-03 Task 1 — `monitor add` branches on --method (BL-02 / IB-03, T-02-10,
+# T-02-11, T-02-12, T-02-23 transition guard, T-02-54 flag split, NEW-2)
+#
+# INV-DECLARED: every gate and every persist below reads the DECLARED
+# `shutdown_method`. A record's effect is never consulted here.
+# =============================================================================
+
+
+def _entry(cfg_path: Path, name: str) -> dict:
+    """The persisted monitored_machines entry for ``name``."""
+    data = json.loads(cfg_path.read_text())
+    return next(m for m in data["monitored_machines"] if m["name"].strip() == name)
+
+
+def _machine_entry(
+    name: str,
+    *,
+    method: str,
+    ssh: str = "",
+    ups: str = "cyberpower",
+    ip: str = "",
+    device: str = "",
+    baud: int | None = None,
+    cmd: str = "/sbin/shutdown -h now",
+) -> dict:
+    """A monitored_machines entry carrying an EXPLICIT shutdown_method."""
+    entry: dict = {
+        "name": name,
+        "ssh": ssh,
+        "ups": ups,
+        "powervalue": 1,
+        "os": "auto",
+        "shutdown_cmd": cmd,
+        "ip": ip,
+        "backup": {"enabled": False, "kind": "remote"},
+        "shutdown_method": method,
+        "serial_device": device,
+    }
+    if baud is not None:
+        entry["serial_baud"] = baud
+    return entry
+
+
+def _no_privileged_seams(monkeypatch) -> tuple[FakeSSH, FakeLocal, FakeNft, list]:
+    """Wire every privileged seam to a recorder, so a record-only add proves it ran none."""
+    ssh, local, nft = FakeSSH(), FakeLocal(), FakeNft()
+    probes: list = []
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_local", local)
+    monkeypatch.setattr(cli, "_monitor_run_nft", nft)
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+    monkeypatch.setattr(
+        cli, "_monitor_run_local_probe", lambda argv: (probes.append(list(argv)), (1, "", ""))[1]
+    )
+    return ssh, local, nft, probes
+
+
+_UPS_WITH_MT_TARGET = {
+    "upses": {
+        "cyberpower": {
+            "label": "CyberPower",
+            "shutdown_targets": [{"name": "mt", "enabled": True, "host": "mt"}],
+        }
+    }
+}
+
+
+# --- serial: record-only, before the password lookup --------------------------
+
+
+def test_add_serial_records_device_and_baud_and_runs_no_privileged_step(
+    cfg_path, monkeypatch
+) -> None:
+    # The env secret is DELETED: a serial add that still succeeds proves the
+    # record-only branch runs BEFORE the secondary-password lookup (T-02-11).
+    monkeypatch.delenv(cli._SECRET_ENV, raising=False)
+    ssh, local, nft, probes = _no_privileged_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "spark",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/ttyUSB0",
+            "--serial-baud",
+            "9600",
+        ]
+    )
+    assert rc == 0
+    assert ssh.calls == [] and local.calls == [] and nft.calls == [] and probes == []
+    entry = _entry(cfg_path, "spark")
+    assert entry["shutdown_method"] == "serial"
+    assert entry["serial_device"] == "/dev/ttyUSB0"
+    assert entry["serial_baud"] == 9600
+    assert entry["ssh"] == ""  # no alias required, and none invented
+    assert entry["ip"] == ""  # `ip` is written only by the native enrollment path
+    from ups_orchestrator.config import MonitoredMachine
+
+    assert MonitoredMachine.from_dict(entry).shutdown_method == "serial"
+
+
+def test_add_serial_missing_baud_rc2_names_9600(cfg_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    with caplog.at_level("ERROR"):
+        rc = cli.main(
+            [
+                "monitor",
+                "add",
+                "spark",
+                "--method",
+                "serial",
+                "--ups",
+                "cyberpower",
+                "--serial-device",
+                "/dev/ttyUSB0",
+            ]
+        )
+    assert rc == 2
+    assert "9600" in caplog.text
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
+
+
+@pytest.mark.parametrize("baud", ["0", "-1", "fast", "9600.5"])
+def test_add_serial_invalid_baud_rc2_no_silent_fallback(cfg_path, monkeypatch, baud) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "spark",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/ttyUSB0",
+            "--serial-baud",
+            baud,
+        ]
+    )
+    assert rc == 2
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
+
+
+def test_add_serial_missing_device_rc2(cfg_path, monkeypatch) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "spark",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-baud",
+            "9600",
+        ]
+    )
+    assert rc == 2
+
+
+def test_add_serial_dry_run_prints_record_only_plan_and_persists_nothing(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    ssh, local, nft, _p = _no_privileged_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "spark",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/ttyUSB0",
+            "--serial-baud",
+            "9600",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "record-only" in out and "/dev/ttyUSB0" in out and "9600" in out
+    assert ssh.calls == [] and local.calls == [] and nft.calls == []
+    assert json.loads(cfg_path.read_text())["monitored_machines"] == []
+
+
+# --- ssh / none: record-only --------------------------------------------------
+
+
+def test_add_ssh_records_alias_only(cfg_path, monkeypatch) -> None:
+    monkeypatch.delenv(cli._SECRET_ENV, raising=False)
+    ssh, local, nft, _p = _no_privileged_seams(monkeypatch)
+    rc = cli.main(
+        ["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"]
+    )
+    assert rc == 0
+    assert ssh.calls == [] and local.calls == [] and nft.calls == []
+    entry = _entry(cfg_path, "mt")
+    assert entry["shutdown_method"] == "ssh"
+    assert entry["ssh"] == "mt"
+    assert entry["serial_device"] == "" and "serial_baud" not in entry
+    assert entry["ip"] == ""
+
+
+def test_add_ssh_without_alias_rc2(cfg_path, monkeypatch) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    assert cli.main(["monitor", "add", "mt", "--method", "ssh", "--ups", "cyberpower"]) == 2
+
+
+def test_add_none_records_no_active_authority(cfg_path, monkeypatch) -> None:
+    monkeypatch.delenv(cli._SECRET_ENV, raising=False)
+    ssh, local, nft, _p = _no_privileged_seams(monkeypatch)
+    rc = cli.main(["monitor", "add", "shelf", "--method", "none"])
+    assert rc == 0
+    assert ssh.calls == [] and local.calls == [] and nft.calls == []
+    entry = _entry(cfg_path, "shelf")
+    assert entry["shutdown_method"] == "none"
+    assert entry["ssh"] == "" and entry["ups"] == "" and entry["ip"] == ""
+
+
+# --- BL-02 / IB-03: no persist path may write the dataclass default -----------
+
+
+def test_add_native_default_method_persists_native_not_none(cfg_path, add_env, monkeypatch) -> None:
+    # BL-02: `--ups` with no `--method` is the Phase-1 invocation. It must persist
+    # `native`, and a from_dict round-trip of the persisted dict must return it.
+    monkeypatch.setattr(cli, "_monitor_run_ssh", _add_ssh_all_ok(with_ip=True))
+    monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_NFT_PATH", str(add_env["tmp"] / "u.nft"))
+    monkeypatch.setattr(cli, "_NFT_RELOAD_PATH", str(add_env["tmp"] / "u.nft"))
+    _seed_nft(add_env["tmp"] / "u.nft")
+    rc = cli.main(["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "1.2.3.4"])
+    assert rc == 0
+    entry = _entry(cfg_path, "mt")
+    assert entry["shutdown_method"] == "native"
+    from ups_orchestrator.config import MonitoredMachine
+
+    assert MonitoredMachine.from_dict(entry).shutdown_method == "native"
+
+
+def test_add_reenroll_of_live_native_record_persists_native_not_none(
+    cfg_path, add_env, monkeypatch
+) -> None:
+    # IB-03, the LIVE instance of BL-02: re-running `monitor add spark` is Phase 1's
+    # documented repair action, and step 6 re-arms spark's remote upsmon. A persisted
+    # `none` would declare the box opted out while it still self-halts on FSD, and
+    # both 02-06's detector and 02-07's projector key on the method — so a corrupted
+    # record is invisible to them by construction. A FIRST-enrollment test passes
+    # while this path stays broken, so the existing record is present here.
+    _write_config(cfg_path, machines=[_machine("spark", ip="192.168.1.120")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", _add_ssh_all_ok(with_ip=True))
+    monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_NFT_PATH", str(add_env["tmp"] / "u.nft"))
+    monkeypatch.setattr(cli, "_NFT_RELOAD_PATH", str(add_env["tmp"] / "u.nft"))
+    _seed_nft(add_env["tmp"] / "u.nft")
+    rc = cli.main(
+        ["monitor", "add", "spark", "--ssh", "spark", "--ups", "cyberpower", "--ip", "192.168.1.120"]
+    )
+    assert rc == 0
+    entry = _entry(cfg_path, "spark")
+    assert entry["shutdown_method"] == "native", "re-enroll wrote the dataclass default (BL-02)"
+    from ups_orchestrator.config import MonitoredMachine
+
+    assert MonitoredMachine.from_dict(entry).shutdown_method == "native"
+
+
+def test_add_dual_regime_candidate_carries_the_resolved_method(cfg_path, monkeypatch) -> None:
+    # The gate candidate matters as much as the persisted entry: the refusal text
+    # reports the method, and a candidate defaulting to `none` sends the operator to
+    # fix the wrong thing.
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    seen: dict[str, object] = {}
+
+    def _capture(machines, upses):  # noqa: ANN001
+        seen["methods"] = {m.name: m.shutdown_method for m in machines}
+        return ()
+
+    monkeypatch.setattr(cli, "dual_regime_conflicts", _capture)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "spark",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/ttyUSB0",
+            "--serial-baud",
+            "9600",
+        ]
+    )
+    assert rc == 0
+    assert seen["methods"] == {"spark": "serial"}
+
+
+def test_remove_leaves_survivor_declared_method_unchanged(cfg_path, monkeypatch) -> None:
+    # The survivor rewrite is the path that freezes the whole file into explicit
+    # methods. A survivor carrying a load notice keeps its DECLARATION (INV-DEGRADE).
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry("mt", method="ssh", ssh="mt"),
+            _machine_entry("spark", method="native", ssh="spark", ip="192.168.1.120"),
+        ],
+        extra=_UPS_WITH_MT_TARGET,
+    )
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+    assert cli.main(["monitor", "remove", "spark"]) == 0
+    # mt is disarmed at load (it collides with an enabled legacy target) but its
+    # DECLARATION must survive the rewrite untouched.
+    assert _entry(cfg_path, "mt")["shutdown_method"] == "ssh"
+
+
+# --- transition guard: keyed on the DECLARED method (T-02-23) -----------------
+
+
+@pytest.mark.parametrize("method", ["serial", "ssh", "none"])
+def test_add_native_to_push_transition_refused_rc2(cfg_path, monkeypatch, caplog, method) -> None:
+    _write_config(cfg_path, machines=[_machine("spark", ip="192.168.1.120")])
+    ssh, local, nft, _p = _no_privileged_seams(monkeypatch)
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    argv = ["monitor", "add", "spark", "--method", method, "--ups", "cyberpower"]
+    if method == "serial":
+        argv += ["--serial-device", "/dev/ttyUSB0", "--serial-baud", "9600"]
+    if method == "ssh":
+        argv += ["--ssh", "spark"]
+    with caplog.at_level("ERROR"):
+        rc = cli.main(argv)
+    assert rc == 2
+    assert "monitor remove spark" in caplog.text
+    assert ssh.calls == []  # no implicit cross-host disarm
+    # The declaration on disk is untouched.
+    assert "shutdown_method" not in _entry(cfg_path, "spark")
+
+
+def test_add_transition_guard_not_opened_by_a_load_degrade(cfg_path, monkeypatch, caplog) -> None:
+    # A declared-native record that also collides with an enabled legacy target
+    # carries an ERROR notice. `disarmed` carves native out, so its EFFECTIVE method
+    # is still native — but the guard must key on the DECLARATION regardless, which
+    # is what keeps a future notice class from opening a native->push switch over a
+    # live remote upsmon.
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="native", ssh="mt", ip="192.168.1.114")],
+        extra=_UPS_WITH_MT_TARGET,
+    )
+    _no_privileged_seams(monkeypatch)
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    from ups_orchestrator.config import Config
+
+    loaded = Config.load(cfg_path)
+    machine = loaded.monitored_machines[0]
+    assert machine.load_notices, "fixture must carry a load notice for this test to mean anything"
+    assert machine.shutdown_method == "native"
+    with caplog.at_level("ERROR"):
+        rc = cli.main(["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"])
+    assert rc == 2
+    assert "monitor remove mt" in caplog.text
+    assert _entry(cfg_path, "mt")["shutdown_method"] == "native"
+
+
+def test_add_force_gate_still_refuses_a_disarmed_record(cfg_path, monkeypatch) -> None:
+    # `dual_regime_conflicts` reads DECLARED state, so the --force gate keeps firing
+    # against a config `Config.load` already disarmed.
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="ssh", ssh="mt")],
+        extra=_UPS_WITH_MT_TARGET,
+    )
+    _no_privileged_seams(monkeypatch)
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    argv = ["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt", "--ups", "cyberpower"]
+    assert cli.main(argv) == 2
+    assert cli.main([*argv, "--force"]) == 0
+
+
+# --- T-02-54: --force no longer authorises a remote NUT config clobber --------
+
+
+def _ssh_with_operator_monitor_line() -> FakeSSH:
+    return FakeSSH(
+        [
+            (0, "Linux\n/usr/bin/pacman\n", ""),  # detect (--ip given, no probe)
+            (0, "", ""),  # install
+            (0, "MONITOR myups@host 1 admin pw primary\n", ""),  # operator's own upsmon.conf
+            (0, "", ""),  # cat nut.conf
+            (0, "", ""),  # write upsmon.conf
+            (0, "", ""),  # write nut.conf
+            (0, "", ""),  # enable
+            (0, "OL\n", ""),  # verify shallow
+            (0, "", ""),  # verify deep
+        ]
+    )
+
+
+def _native_add_env(add_env, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_NFT_PATH", str(add_env["tmp"] / "u.nft"))
+    monkeypatch.setattr(cli, "_NFT_RELOAD_PATH", str(add_env["tmp"] / "u.nft"))
+    _seed_nft(add_env["tmp"] / "u.nft")
+
+
+def test_force_alone_does_not_authorise_the_remote_config_overwrite(
+    cfg_path, add_env, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "_monitor_run_ssh", _ssh_with_operator_monitor_line())
+    _native_add_env(add_env, monkeypatch)
+    rc = cli.main(
+        ["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "1.2.3.4", "--force"]
+    )
+    assert rc == 3  # the remote guard still refuses; --force is local-only now
+
+
+def test_force_remote_config_authorises_the_remote_overwrite(cfg_path, add_env, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_monitor_run_ssh", _ssh_with_operator_monitor_line())
+    _native_add_env(add_env, monkeypatch)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--ssh",
+            "mt",
+            "--ups",
+            "cyberpower",
+            "--ip",
+            "1.2.3.4",
+            "--force-remote-config",
+        ]
+    )
+    assert rc == 0
+
+
+# --- T-02-10: the ssh alias is validated for SHAPE ----------------------------
+
+
+@pytest.mark.parametrize("alias", ["-oProxyCommand=id", "mt; touch /tmp/pwned", "a b", "$(id)"])
+def test_add_rejects_an_option_shaped_or_metachar_ssh_alias_rc2(
+    cfg_path, monkeypatch, caplog, alias
+) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    ssh, _l, _n, _p = _no_privileged_seams(monkeypatch)
+    with caplog.at_level("ERROR"):
+        rc = cli.main(["monitor", "add", "mt", "--ssh", alias, "--ups", "cyberpower"])
+    assert rc == 2
+    assert alias in caplog.text
+    assert ssh.calls == []
+
+
+def test_add_accepts_a_plain_ssh_alias(cfg_path, monkeypatch) -> None:
+    monkeypatch.delenv(cli._SECRET_ENV, raising=False)
+    _no_privileged_seams(monkeypatch)
+    assert (
+        cli.main(["monitor", "add", "mt", "--method", "ssh", "--ssh", "mt-01.lan", "--ups", "cyberpower"])
+        == 0
+    )
+    assert _entry(cfg_path, "mt")["ssh"] == "mt-01.lan"
+
+
+# --- NEW-2: a push record's default shutdown_cmd is the ESCALATED form --------
+
+
+@pytest.mark.parametrize("method", ["serial", "ssh"])
+def test_add_push_defaults_to_the_escalated_shutdown_cmd(cfg_path, monkeypatch, method) -> None:
+    from ups_orchestrator.config import requires_root_escalation
+
+    monkeypatch.delenv(cli._SECRET_ENV, raising=False)
+    _no_privileged_seams(monkeypatch)
+    argv = ["monitor", "add", "mt", "--method", method, "--ups", "cyberpower"]
+    if method == "serial":
+        argv += ["--serial-device", "/dev/ttyUSB0", "--serial-baud", "9600"]
+    else:
+        argv += ["--ssh", "mt"]
+    assert cli.main(argv) == 0
+    cmd = _entry(cfg_path, "mt")["shutdown_cmd"]
+    assert cmd == "sudo /sbin/shutdown -h now"
+    assert not requires_root_escalation(cmd)
+
+
+def test_add_native_keeps_the_unescalated_shutdown_cmd(cfg_path, add_env, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_monitor_run_ssh", _add_ssh_all_ok(with_ip=True))
+    _native_add_env(add_env, monkeypatch)
+    rc = cli.main(["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "1.2.3.4"])
+    assert rc == 0
+    # upsmon runs SHUTDOWNCMD as root, so native's default is correct unescalated.
+    assert _entry(cfg_path, "mt")["shutdown_cmd"] == "/sbin/shutdown -h now"
+
+
+def test_add_push_shutdown_cmd_double_quote_still_rejected_rc2(cfg_path, monkeypatch) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--method",
+            "ssh",
+            "--ssh",
+            "mt",
+            "--ups",
+            "cyberpower",
+            "--shutdown-cmd",
+            'foo "bar"',
+        ]
+    )
+    assert rc == 2
