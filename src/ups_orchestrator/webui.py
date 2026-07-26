@@ -186,9 +186,33 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>ENT[c])}
 function num(v){return v==null?"—":Number(v)}
 function col(v,lo,hi){return v<=lo?"#ef4444":v<=hi?"#fbbf24":"#22c55e"}
 function fmtRt(s){if(s==null)return"—";return s>=3600?`${(s/3600|0)}h ${(s%3600/60|0)}m`:`${(s/60|0)}m`}
+// LO-07: the /api/status `degraded` payload was on the wire and never rendered — the
+// banner came only from the server-rendered `/`, so a dashboard left open across a
+// daemon restart showed one that was arbitrarily stale in either direction. Built with
+// textContent rather than a template string: these are config-authored values, and the
+// same standard MED-06 applies to the terminal applies here. The node is created and
+// removed rather than always present, so a healthy config still serves a page with no
+// banner in it at all.
+function degradedRow(n){
+ const row=document.createElement("div");row.className="item";
+ const sev=document.createElement("span");
+ sev.className="sev "+(n.severity==="error"?"error":"advisory");
+ sev.textContent=n.severity;
+ const sub=document.createElement("span");sub.className="subj";sub.textContent=n.subject;
+ row.append(sev,sub,document.createTextNode(": "+n.message));
+ return row;
+}
+function renderDegraded(items){
+ let el=document.getElementById("degraded");
+ if(!items||!items.length){if(el)el.remove();return}
+ if(!el){el=document.createElement("div");el.className="degraded";el.id="degraded";
+  const cards=document.getElementById("cards");cards.parentNode.insertBefore(el,cards)}
+ el.replaceChildren(...items.map(degradedRow));
+}
 async function refresh(){
  const st=await (await fetch("/api/status")).json();
  document.getElementById("sub").textContent=new Date(st.time*1000).toLocaleString()+" · live";
+ renderDegraded(st.degraded);
  const c=document.getElementById("cards"); c.innerHTML="";
  st.upses.forEach((u,i)=>{
   const nm=esc(u.label||u.name).split(" - ");

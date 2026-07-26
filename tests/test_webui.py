@@ -73,7 +73,9 @@ def test_served_page_has_no_banner_for_healthy_config(monkeypatch) -> None:
     monkeypatch.setattr(webui, "read_snapshot", lambda _n: _SNAP)
     cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
     page = webui._render_page(cfg)
-    assert 'id="degraded"' not in page
+    # The banner ELEMENT, not the id string — LO-07's client-side renderer names the
+    # same id when it creates the node on the fly.
+    assert '<div class="degraded"' not in page
 
 
 def test_history_payload_downsamples(tmp_path) -> None:
@@ -129,3 +131,22 @@ def test_http_endpoints_round_trip(monkeypatch, tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_the_degraded_payload_is_actually_rendered_client_side() -> None:
+    # LO-07: status_payload has carried `degraded` since 02-08 and the shipped
+    # refresh() ignored it — the banner came only from the server-rendered `/`, so a
+    # dashboard left open across a daemon restart showed one that was arbitrarily
+    # stale in either direction. The data was already on the wire.
+    page = webui._INDEX_HTML
+    assert "renderDegraded(st.degraded)" in page
+    # Built with textContent, not string-interpolated HTML: these are config-authored
+    # values and MED-06's standard applies here too.
+    assert "sub.textContent=n.subject" in page
+    assert "sev.textContent=n.severity" in page
+
+
+def test_the_banner_is_removed_client_side_when_the_config_becomes_healthy() -> None:
+    # The other direction, which is the one that matters: a banner left on screen for
+    # a degrade the operator has since fixed is worse than no banner at all.
+    assert "if(!items||!items.length){if(el)el.remove();return}" in webui._INDEX_HTML
