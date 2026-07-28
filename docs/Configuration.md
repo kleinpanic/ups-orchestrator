@@ -13,6 +13,14 @@ Local forensic logs are controlled by:
 - `$UPS_ORCH_SAMPLES`: high-frequency UPS samples.
 - `$UPS_ORCH_EVENT_LOG`: UPS event/transition/shutdown-gate records.
 - `$UPS_ORCH_NOTIFICATION_LOG`: Discord delivery attempts and results.
+- `$UPS_ORCH_MAINTENANCE_STATE`: the maintenance-window marker (default
+  `/var/lib/ups-orchestrator/maintenance.json`) — see
+  [Deployment](Deployment.md#maintenance-windows-planned-power-cuts).
+- `$UPS_ORCH_BOOT_AUDIT_STATE`: the per-boot marker that stops the boot audit
+  reporting the same boot twice.
+
+Each of those falls back to `<repo>/<name>` when the `/var/lib` directory does
+not exist, so a development checkout never writes to system paths.
 
 ## Top-level keys
 
@@ -429,8 +437,86 @@ so pair it with a reachability check on the device.
 ## Per-UPS
 
 Each key under `upses` is a NUT device name (whatever you called it in
-`ups.conf`). A UPS has a `label` (used in the embeds) and a list of
-`shutdown_targets`; see [Shutdown Targets](Shutdown-Targets.md).
+`ups.conf`). A UPS has a `label` (used in the embeds), an optional `devices`
+inventory (below), and a list of `shutdown_targets`; see
+[Shutdown Targets](Shutdown-Targets.md).
+
+### What else is on this UPS (`devices`)
+
+Before this existed, "what dies if this one fails" was answerable only from the
+operator's memory — and the memory went stale the moment the hardware was
+recabled. `devices` writes the answer down, in the file that already describes
+the UPS.
+
+It is **inventory only**. A `devices` entry is never a shutdown target and never
+grows one: nothing dispatches to it, nothing gates on it, and it reaches neither
+the firewall `saddr` set nor any command. It exists for the gear the
+orchestrator has no authority over — routers, switches, a modem, someone else's
+desktop — so that a UPS going down has a written blast radius.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `name` | — | What the thing is called. An entry with an empty or missing `name` is **dropped at load**, silently — it would name nothing |
+| `kind` | `other` | One of `server` \| `network` \| `desktop` \| `storage` \| `other`. Anything unrecognised falls back to `other` rather than failing the load; a typo costs you a category, not your monitoring |
+| `note` | `""` | Free text for the consequence — "loses the WAN for everything", "not enrolled, it just dies" |
+
+!!! warning "Do not repeat a monitored machine here"
+    Machines the orchestrator **does** shut down live in
+    [`monitored_machines`](#monitored-machines-monitored_machines) and must not
+    be listed again in `devices`. This is not a style rule — it is why the two
+    cannot disagree. `Config.ups_inventory(name)` returns
+    `(managed_names, devices)` and reads `managed_names` from
+    `monitored_machines`, filtered to the machines whose `ups` is this UPS,
+    **never** from `devices`. Both operator surfaces render that one call, so
+    the shutdown list is always the real shutdown list. Duplicating a machine
+    into `devices` would not add authority; it would only print the name twice
+    and start the drift the split was built to prevent.
+
+Two surfaces read it, so an inventory that is wrong is visibly wrong rather than
+quietly wrong:
+
+- **`ups-orchestrator status`** gains a `Shuts` row (managed machines) and a
+  `Powers` row (unmanaged devices) on each UPS card. Both elide to the terminal
+  width with a `+N more` suffix — the card is drawn in a box that never wraps,
+  and `--watch` assumes one logical line is one terminal row, so a long
+  inventory truncates instead of blowing the border out.
+- **The daily Discord report** gains `Shuts down on battery:` and `Also powers:`
+  lines in each UPS's field, and its summary body counts the machines set to
+  shut down automatically.
+
+Worked example — one UPS that the orchestrator shuts a machine down on, plus the
+gear on the same UPS that it can only name:
+
+```json
+{
+  "monitored_machines": [
+    { "name": "fileserver", "shutdown_method": "ssh", "ssh": "fileserver", "ups": "ups1" }
+  ],
+  "upses": {
+    "ups1": {
+      "label": "Rack UPS",
+      "devices": [
+        { "name": "edge-router", "kind": "network", "note": "loses the WAN for everything" },
+        { "name": "rack-switch", "kind": "network", "note": "uplink for the whole rack" }
+      ],
+      "shutdown_targets": []
+    }
+  }
+}
+```
+
+`fileserver` appears **once**, in `monitored_machines`. `status` still prints it
+on the `ups1` card's `Shuts` row, because that row is derived, not copied:
+
+```
+Shuts   fileserver
+Powers  edge-router, rack-switch
+```
+
+`config.example.json` ships the `devices` half of this and leaves
+`monitored_machines` empty on purpose — `install.sh` copies that file into
+`/etc` on a fresh box, and an example machine there would be a half-formed live
+enrollment. `devices` is safe to ship precisely because it is inert.
 
 ```json
 {
@@ -447,7 +533,11 @@ Each key under `upses` is a NUT device name (whatever you called it in
     "internal": { "enabled": false, "battery_below": 10, "runtime_below": 120 }
   },
   "upses": {
-    "rack": { "label": "Rack UPS", "shutdown_targets": [] },
+    "rack": {
+      "label": "Rack UPS",
+      "devices": [{ "name": "edge-router", "kind": "network" }],
+      "shutdown_targets": []
+    },
     "desk": { "label": "Desk UPS", "shutdown_targets": [] }
   }
 }

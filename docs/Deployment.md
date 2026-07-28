@@ -325,6 +325,130 @@ ups-orchestrator logs events      # tail durable local UPS event JSONL
 ups-orchestrator logs notifications
 ```
 
+## Maintenance windows (planned power cuts)
+
+```bash
+ups-orchestrator maintenance begin --hours 2 --reason "recabling the rack"
+ups-orchestrator maintenance status
+ups-orchestrator maintenance end
+```
+
+Declare one **before** you pull a plug on purpose.
+
+The reason is that a deliberate cut and a real outage are indistinguishable from
+this host. Both leave every UPS reporting `OL` right up to the instant the host
+dies — there is no in-band signal that says "a human did this". The boot audit
+therefore falls back to filesystem-recovery evidence in the boot journal, which
+fires on plenty of ordinary boots. Powering everything down on purpose to redo
+cabling produced three critical Discord alerts in one evening. Only the operator
+knows which it was, so the operator gets to say so in advance.
+
+While a window is open, `ups-orchestrator boot-audit` suppresses its critical
+power-loss alert and records why. It is the **last** of three suppression gates,
+which matters for what a window is actually for:
+
+1. the boot was already audited (the per-boot marker),
+2. the **previous** boot logged systemd's own shutdown sequence — a clean
+   `poweroff`/`reboot`, and no amount of fsck noise makes that an outage,
+3. an operator-declared maintenance window is open.
+
+Gate 2 already covers an orderly `sudo poweroff`. A window is what you need for
+the case gate 2 cannot see: the cut that leaves the journal stopping mid-line,
+because you really did pull the plug.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--hours` | `4` | Window length for `begin`. Must be greater than zero (rc 2 otherwise) |
+| `--reason` | `""` | Free text, echoed into the suppression record so a silent boot audit still says who silenced it and why |
+
+`begin` overwrites any open window rather than extending it, so re-running it is
+how you lengthen one. `end` prints `no window was open` and still exits 0 if
+there was nothing to clear — ending a window you are unsure about is always
+safe. `status` prints `no window open — power-loss alerts are ARMED` when
+nothing is set.
+
+!!! warning "The expiry is the safety feature — do not wish it away"
+    A window is time-bounded on purpose. A boolean "maintenance mode" flag that
+    an operator forgets to clear silences outage alerting **forever**, and that
+    failure is invisible precisely because nothing gets delivered: a silenced
+    monitor and a quiet month look identical from the outside. An expiry makes
+    the armed state the default one — the system re-arms itself whether or not
+    anyone remembers. Prefer a short window you re-open over a long one you
+    intend to close.
+
+The marker is `/var/lib/ups-orchestrator/maintenance.json` (override with
+`$UPS_ORCH_MAINTENANCE_STATE`), holding just the expiry and the reason. Anything
+unreadable — missing, truncated, not JSON, no `until` — is treated as **no
+window**, so a corrupt marker fails toward alerting rather than toward silence.
+Deleting the file by hand is equivalent to `maintenance end`.
+
+## Health checks and repair
+
+Three targets exist for the times something looks wrong. Run the read-only one
+first.
+
+```bash
+make nut-status                                  # read-only, NO sudo
+sudo make nut-repair-listen                      # restore upsd's loopback LISTEN
+sudo make install-config CONFIG=/path/to.json    # validate, then install into /etc
+```
+
+### `make nut-status`
+
+Read-only and unprivileged — it changes nothing, so it is always safe to run
+first and it will not mask the fault by restarting something. It prints, in one
+screen:
+
+- `is-active` for `nut-server`, `nut-monitor` and `nut-driver.target`, plus the
+  `--user` units `ups-orchestrator-recorder` and `ups-orchestrator-watch`;
+- the **active** (uncommented) `LISTEN` lines in `/etc/nut/upsd.conf`;
+- whether a bare `upsc -l` is answered — printing
+  `REFUSED (run: sudo make nut-repair-listen)` when it is not;
+- the most recent recorder sample, as a timestamp and each UPS's status, so you
+  can tell "no data" apart from "bad data".
+
+### `sudo make nut-repair-listen`
+
+Guarantees `/etc/nut/upsd.conf` keeps a **loopback** `LISTEN`, restarts
+`nut-server`, and verifies a bare `upsc -l` works before it exits non-zero.
+
+It exists because of a genuinely nasty default. `upsd` listens on localhost only
+when `upsd.conf` has **no `LISTEN` line at all**, and Debian ships the file with
+every `LISTEN` commented out. Writing the first explicit `LISTEN` — as LAN
+enrollment must — silently *replaces* that implicit default instead of adding to
+it. That broke this host twice:
+
+- every bare `upsc` was refused for two days, taking the local tooling with it;
+- then a boot where `eth0` had no DHCP lease yet left `upsd` with no bindable
+  address, so it exited, and systemd's restart limit killed `nut-server`
+  outright.
+
+Idempotent: if loopback is already listed it says so, skips the restart, and
+removes the backup it took. When it does rewrite, it backs the file up to
+`upsd.conf.bak-<epoch>` first and edits **in place** so the inode keeps its
+mode, owner and ACL. It reuses whatever LAN address is already configured, and
+the rewrite goes through the same tested function the daemon uses
+(`nutclient.upsert_upsd_listen`), so there is one implementation of the rule and
+no second one to drift. Needs the venv (`make venv`).
+
+### `sudo make install-config CONFIG=...`
+
+Never hand-copy a config into `/etc`. This target:
+
+1. **Validates that the file actually LOADS** before touching the live one, and
+   prints every load-time degrade notice it raises;
+2. prints the topology the file implies — for each UPS, what it *shuts down* and
+   what it *also powers* (the `devices` inventory above), so a recabling typo is
+   visible as the wrong blast radius rather than discovered during an outage;
+3. backs the live config up to `config.json.bak-<epoch>` if one exists;
+4. installs it `0640 root:nut` with a `u:<user>:r` ACL, then prints the
+   resulting mode and ACL.
+
+The validation is in front of the install, not after it, because a config that
+fails to parse is a monitoring-topology outage that looks healthy: `watch` would
+poll zero UPSes and report no problem. The user granted the read ACL is
+`$SUDO_USER`.
+
 ## Where things land
 
 | Path | What |
@@ -337,6 +461,8 @@ ups-orchestrator logs notifications
 | `/var/lib/ups-orchestrator/samples.jsonl` | high-frequency UPS samples |
 | `/var/lib/ups-orchestrator/events.jsonl` | UPS event/decision log |
 | `/var/lib/ups-orchestrator/notifications.jsonl` | Discord delivery outcomes |
+| `/var/lib/ups-orchestrator/maintenance.json` | open maintenance window (absent = alerts armed) |
+| `/var/lib/ups-orchestrator/boot-audit.json` | per-boot marker, so one boot alerts once |
 | `~/.config/systemd/user/ups-orchestrator-watch.service` | the poll loop |
 | `~/.config/systemd/user/ups-orchestrator-recorder.service` | telemetry recorder |
 | `~/.config/systemd/user/ups-orchestrator-report.timer` | daily UPS load report |

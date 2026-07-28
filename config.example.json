@@ -37,6 +37,19 @@
   "upses": {
     "ups1": {
       "label": "Rack UPS",
+      "devices__comment": "INVENTORY ONLY — never a shutdown target, never grows one. It answers 'what else dies with this UPS' for gear the orchestrator has no authority over: routers, switches, a modem, someone else's desktop. Machines it DOES shut down are NOT repeated here; `status` and the daily report read those from monitored_machines via Config.ups_inventory, so the two lists cannot drift apart. Safe to ship in this example precisely because it is inert: unlike a monitored_machines entry it reaches no nft set and issues no command. `kind` is one of server|network|desktop|storage|other and anything else falls back to `other`; an entry with no `name` is dropped at load. See docs/Configuration.md for the worked machines+devices example.",
+      "devices": [
+        {
+          "name": "edge-router",
+          "kind": "network",
+          "note": "loses the WAN for everything if this UPS drops"
+        },
+        {
+          "name": "rack-switch",
+          "kind": "network",
+          "note": "uplink for the whole rack"
+        }
+      ],
       "shutdown_targets__comment": "LEGACY, back-compat only. New enrollments use monitored_machines[].shutdown_method (none|native|serial|ssh) via `monitor add --method ...` instead. A machine cannot be both a monitored_machines entry with an active method AND an enabled shutdown_target — for a declared 'native' machine that holds on ANY configured UPS, not just the one it names, because its authority is that box's own upsmon reacting to this primary's FSD and is keyed to no UPS in this file; for a 'serial'/'ssh' machine it is scoped to its own UPS. Config.load degrades (disarms) whichever side is disarmable rather than refusing to load. See docs/Configuration.md and docs/Shutdown-Targets.md.",
       "shutdown_targets": [
         {
@@ -68,6 +81,13 @@
     },
     "ups2": {
       "label": "Desk UPS",
+      "devices": [
+        {
+          "name": "workstation",
+          "kind": "desktop",
+          "note": "not enrolled — no shutdown authority, it just dies"
+        }
+      ],
       "shutdown_targets": []
     },
     "ups3": {

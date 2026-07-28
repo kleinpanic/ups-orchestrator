@@ -276,6 +276,31 @@ sudo ups-orchestrator monitor add spark --method native --ssh spark --ups cyberp
 ups-orchestrator monitor list
 ```
 
+### What else is on a UPS (`devices`)
+
+Each entry under `upses` takes an optional `devices` list — **inventory only**,
+never a shutdown target and never gated on. It records the gear the orchestrator
+has no authority over (routers, switches, a modem, someone else's desktop) so
+that "what dies if this one fails" is answerable from config instead of from
+memory that goes stale the moment the hardware is recabled.
+
+```json
+"upses": {
+  "ups1": {
+    "label": "Rack UPS",
+    "devices": [
+      { "name": "edge-router", "kind": "network", "note": "loses the WAN for everything" },
+      { "name": "rack-switch", "kind": "network" }
+    ]
+  }
+}
+```
+
+`kind` is one of `server` / `network` / `desktop` / `storage` / `other`.
+Machines the orchestrator *does* shut down are **not** repeated here — they stay
+in `monitored_machines`, and `status` (`Shuts` / `Powers` rows) and the daily
+report derive both lists from one call, so the two cannot drift apart.
+
 Config path resolves to `$UPS_ORCH_CONFIG`, else `/etc/ups-orchestrator/config.json`,
 else `<repo>/config.json`. State resolves similarly via `$UPS_ORCH_STATE` /
 `/var/lib/ups-orchestrator/state.json`.
@@ -297,7 +322,19 @@ ups-orchestrator webui             # local web dashboard (stdlib http.server; lo
 ups-orchestrator audit             # summarize boot, UPS/NUT, local logs, state, and shutdown evidence
 ups-orchestrator logs events       # tail local UPS event/decision JSONL
 ups-orchestrator logs notifications
+ups-orchestrator maintenance begin --hours 2 --reason "recabling"  # expect a plug-pull
+ups-orchestrator maintenance status   # is outage alerting armed right now?
+ups-orchestrator maintenance end      # re-arm early
 ```
+
+**Maintenance windows.** A deliberate plug-pull and a real outage are
+indistinguishable from this host — both leave every UPS reporting `OL` right up
+to the cut — so the boot audit falls back to filesystem evidence and alerts on
+work you did on purpose. Declare a window first and `boot-audit` suppresses its
+critical power-loss alert while it is open. It is time-bounded (default 4 h) on
+purpose: a flag someone forgets to clear would silence outage alerting forever,
+and that failure is invisible because nothing gets delivered. See
+[docs/Deployment.md](https://kleinpanic.github.io/ups-orchestrator/Deployment/#maintenance-windows-planned-power-cuts).
 
 `control` and `selftest` run NUT instant commands, so they need admin creds in the
 environment (`UPS_NUT_ADMIN_USER` / `UPS_NUT_ADMIN_PASSWORD`) — never the config.
@@ -334,6 +371,26 @@ upsc -l                                            # expect your UPSes listed
 loginctl enable-linger "$USER"
 deploy/install-user-service.sh
 ```
+
+When something looks wrong, start with the read-only check — it changes nothing,
+so it cannot mask the fault:
+
+```bash
+make nut-status                                  # units, LISTEN lines, upsc reachability,
+                                                 # latest recorder sample (NO sudo)
+sudo make nut-repair-listen                      # restore upsd's loopback LISTEN, restart,
+                                                 # and prove a bare `upsc -l` works
+sudo make install-config CONFIG=/path/to.json    # validate + print topology, back up, then
+                                                 # install 0640 root:nut + user ACL
+```
+
+`nut-repair-listen` earns its place: `upsd` listens on localhost only when
+`upsd.conf` has **no** `LISTEN` line at all, and Debian ships every `LISTEN`
+commented out — so writing the first explicit one silently replaced that default,
+refused every bare `upsc` for two days, and later left `upsd` with no bindable
+address on a boot before `eth0` had a DHCP lease, killing `nut-server` via
+systemd's restart limit. It is idempotent. Details in
+[docs/Deployment.md](https://kleinpanic.github.io/ups-orchestrator/Deployment/#health-checks-and-repair).
 
 | Path | What |
 |------|------|
