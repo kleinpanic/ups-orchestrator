@@ -177,8 +177,8 @@ def test_boot_audit_sends_once_for_unclean_boot(
         lambda _name: UpsSnapshot("OL", 100, 1800, 10, 120.0, realpower_nominal=900),
     )
 
-    first = audit.send_boot_audit(cfg, notifier, marker_path=marker)
-    second = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    first = audit.send_boot_audit(cfg, notifier, marker_path=marker, clean_shutdown=False)
+    second = audit.send_boot_audit(cfg, notifier, marker_path=marker, clean_shutdown=False)
 
     assert first.sent is True
     assert second.sent is False
@@ -208,14 +208,163 @@ def test_boot_audit_retries_after_failed_send(
         lambda _name: UpsSnapshot("OL", 100, 1800, 10, 120.0, realpower_nominal=900),
     )
 
-    first = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    first = audit.send_boot_audit(cfg, notifier, marker_path=marker, clean_shutdown=False)
     assert first.sent is False
     assert not marker.exists()  # not marked → will retry
 
-    second = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    second = audit.send_boot_audit(cfg, notifier, marker_path=marker, clean_shutdown=False)
     assert second.sent is True
     assert marker.exists()  # delivered → now marked
 
-    third = audit.send_boot_audit(cfg, notifier, marker_path=marker)
+    third = audit.send_boot_audit(cfg, notifier, marker_path=marker, clean_shutdown=False)
     assert third.sent is False  # already delivered this boot
     assert notifier.calls == 2  # third short-circuits on the marker, no send
+
+
+# --- boot-audit false-positive gates -----------------------------------------
+#
+# Every line below is copied verbatim from eulerpi5's journal for boot
+# 8ed8db4a (2026-07-27 22:15), the boot that produced a bogus
+# "recovered from abrupt power loss" alert on a host the operator had powered
+# down on purpose to redo cabling.
+_REAL_BOOT_NOISE = [
+    "1785204918.0 eulerpi5 kernel: EXT4-fs (nvme0n1p2): orphan cleanup on readonly fs",
+    "1785204918.1 eulerpi5 systemd-fsck[394]: Dirty bit is set. Fs was not properly"
+    " unmounted and some data may be corrupt.",
+    "1785204919.0 eulerpi5 systemd-fsck[520]: disk3: recovering journal",
+]
+
+
+def _boot_cfg() -> Config:
+    return Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+
+
+def test_orphan_cleanup_alone_is_not_power_loss_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # ext4 logs orphan cleanup during the read-only root mount after CLEAN
+    # shutdowns too. On its own it must never raise a critical alert.
+    notifier = FakeNotifier()
+    monkeypatch.setattr(audit, "_current_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(
+        audit,
+        "_journal_current_boot",
+        lambda: [_REAL_BOOT_NOISE[0]],
+    )
+
+    result = audit.send_boot_audit(
+        _boot_cfg(),
+        notifier,
+        marker_path=tmp_path / "m.json",
+        clean_shutdown=False,
+    )
+
+    assert result.power_loss_count == 0
+    assert result.sent is False
+    assert notifier.sent == []
+
+
+def test_clean_previous_shutdown_suppresses_alert_despite_fsck_noise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The dirty-bit and recovering-journal lines DO match the power-loss
+    # patterns, but the previous boot logged systemd's shutdown sequence, so
+    # this was a clean reboot and no alert may go out.
+    notifier = FakeNotifier()
+    marker = tmp_path / "m.json"
+    monkeypatch.setattr(audit, "_current_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(audit, "_journal_current_boot", lambda: _REAL_BOOT_NOISE)
+
+    result = audit.send_boot_audit(_boot_cfg(), notifier, marker_path=marker, clean_shutdown=True)
+
+    assert result.power_loss_count > 0  # evidence WAS present...
+    assert result.sent is False  # ...and was correctly overruled
+    assert notifier.sent == []
+    assert marker.exists()  # evaluated, so don't re-evaluate this boot
+
+
+def test_open_maintenance_window_suppresses_alert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    notifier = FakeNotifier()
+    maintenance = tmp_path / "maintenance.json"
+    audit.write_maintenance(maintenance, until=2_000.0, reason="recabling the rack")
+    monkeypatch.setattr(audit, "_current_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(audit, "_journal_current_boot", lambda: _REAL_BOOT_NOISE)
+
+    result = audit.send_boot_audit(
+        _boot_cfg(),
+        notifier,
+        marker_path=tmp_path / "m.json",
+        maintenance_path=maintenance,
+        clean_shutdown=False,
+        now=1_000.0,
+    )
+
+    assert result.sent is False
+    assert "recabling the rack" in result.text
+    assert notifier.sent == []
+
+
+def test_expired_maintenance_window_does_not_suppress_alert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The whole point of an expiry: a window the operator forgot to close must
+    # stop silencing real outages rather than silencing them forever.
+    notifier = FakeNotifier()
+    maintenance = tmp_path / "maintenance.json"
+    audit.write_maintenance(maintenance, until=500.0, reason="recabling the rack")
+    monkeypatch.setattr(audit, "_current_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(audit, "_journal_current_boot", lambda: _REAL_BOOT_NOISE)
+    monkeypatch.setattr(
+        audit,
+        "read_snapshot",
+        lambda _name: UpsSnapshot("OL", 100, 1800, 10, 120.0, realpower_nominal=900),
+    )
+
+    result = audit.send_boot_audit(
+        _boot_cfg(),
+        notifier,
+        marker_path=tmp_path / "m.json",
+        maintenance_path=maintenance,
+        clean_shutdown=False,
+        now=1_000.0,
+    )
+
+    assert result.sent is True
+    assert len(notifier.sent) == 1
+
+
+def test_within_boot_window_drops_late_journald_rotation_noise() -> None:
+    # journald rotated a stale user journal an HOUR into a healthy boot and the
+    # line was counted as boot evidence. Only the opening seconds count.
+    lines = [
+        "1785204918.0 eulerpi5 kernel: mounting root",
+        "1785204919.0 eulerpi5 systemd-fsck[520]: disk3: recovering journal",
+        "1785208550.0 eulerpi5 systemd-journald[270]: File user-1001.journal"
+        " corrupted or uncleanly shut down, renaming and replacing.",
+    ]
+    kept = audit.within_boot_window(lines, window=120.0)
+    assert kept == [
+        "eulerpi5 kernel: mounting root",
+        "eulerpi5 systemd-fsck[520]: disk3: recovering journal",
+    ]
+
+
+def test_within_boot_window_keeps_lines_with_unparseable_timestamps() -> None:
+    # Losing real evidence to a format surprise is worse than an extra line.
+    lines = ["Jun 18 host kernel: something", "1785204918.0 host kernel: other"]
+    assert audit.within_boot_window(lines) == lines[:1] + ["host kernel: other"]
+
+
+def test_orphan_cleanup_is_not_a_power_loss_pattern() -> None:
+    # Signature-independent guard on the pattern list itself: ext4 emits this on
+    # clean shutdowns, so it must never rejoin _POWER_LOSS_PATTERNS.
+    line = "eulerpi5 kernel: EXT4-fs (nvme0n1p2): orphan cleanup on readonly fs"
+    assert not audit._contains_any(line, audit._POWER_LOSS_PATTERNS)
+
+
+def test_real_dirty_bit_line_is_still_power_loss_evidence() -> None:
+    # The complement: tightening the list must not blind it to genuine evidence.
+    line = "systemd-fsck[394]: Dirty bit is set. Fs was not properly unmounted."
+    assert audit._contains_any(line, audit._POWER_LOSS_PATTERNS)

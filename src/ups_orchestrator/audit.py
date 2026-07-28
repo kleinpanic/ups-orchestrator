@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,11 +21,29 @@ _POWER_LOSS_PATTERNS = tuple(
         r"corrupted or uncleanly shut down",
         r"\bDirty bit is set\b",
         r"\brecovering journal\b",
-        r"\borphan cleanup\b",
         r"not properly unmounted",
         r"some data may be corrupt",
     )
 )
+# `orphan cleanup on readonly fs` used to live in the list above and must not go
+# back. ext4 logs it during the initial read-only root mount whenever the previous
+# session had deleted-but-still-open inodes, which is ordinary on a CLEAN
+# shutdown. It fired on every boot of this host and was a pure false positive.
+
+_CLEAN_SHUTDOWN_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"systemd-shutdown\[1\]: Syncing filesystems and block devices",
+        r"systemd-shutdown\[1\]: (?:Powering off|Rebooting|Halting)",
+        r"systemd\[1\]: Reached target (?:System Power Off|Power-Off|Reboot|Halt)",
+    )
+)
+
+# Filesystem-recovery evidence is written while mounting, in the opening seconds of
+# a boot. Anything later is journald rotating a stale file from an EARLIER boot —
+# this host logged `corrupted or uncleanly shut down` for a user journal a full hour
+# into an otherwise healthy boot, and counting it alarmed on a machine that was fine.
+_BOOT_EVIDENCE_WINDOW_SECONDS = 120.0
 _UPS_EVENT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -79,6 +98,21 @@ class BootAuditResult:
 
 
 @dataclass(frozen=True)
+class MaintenanceWindow:
+    """An operator-declared window in which abrupt power cuts are EXPECTED.
+
+    Deliberately time-bounded. A boolean "maintenance mode" flag that an operator
+    forgets to clear silences outage alerting forever, and the failure is invisible
+    precisely because nothing is delivered; an expiry makes the safe state the
+    default one.
+    """
+
+    active: bool
+    until: float = 0.0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class SampleGapReport:
     """Interpretation of recorder samples across a boot boundary."""
 
@@ -116,7 +150,45 @@ def _list_boots() -> list[str]:
 
 
 def _journal_current_boot() -> list[str]:
-    return _run(["journalctl", "-b", "0", "--no-pager"], timeout=30.0)
+    return _run(["journalctl", "-b", "0", "--no-pager", "-o", "short-unix"], timeout=30.0)
+
+
+def within_boot_window(
+    lines: list[str], window: float = _BOOT_EVIDENCE_WINDOW_SECONDS
+) -> list[str]:
+    """Keep only ``short-unix`` lines logged within ``window`` of the boot's first line.
+
+    The unix-timestamp prefix is stripped from every line it keeps. A line whose
+    prefix will not parse is kept verbatim rather than dropped — losing real
+    evidence to a format surprise is far worse than carrying an extra line.
+    """
+    first: float | None = None
+    kept: list[str] = []
+    for line in lines:
+        stamp, _, rest = line.partition(" ")
+        try:
+            when = float(stamp)
+        except ValueError:
+            kept.append(line)
+            continue
+        if first is None:
+            first = when
+        if when - first <= window:
+            kept.append(rest)
+    return kept
+
+
+def previous_boot_ended_cleanly() -> bool:
+    """True when the PREVIOUS boot logged systemd's own shutdown sequence.
+
+    This is the signal filesystem forensics only approximate. A clean ``poweroff``
+    or ``reboot`` always writes these lines; an abrupt cut leaves the journal
+    simply stopping mid-line. Filesystem evidence, by contrast, fires routinely on
+    external USB disks and on a Pi's vfat ``/boot/firmware`` after shutdowns that
+    were perfectly clean, which is what made the old alert cry wolf.
+    """
+    lines = _run(["journalctl", "-b", "-1", "--no-pager", "-n", "300"], timeout=20.0)
+    return any(_contains_any(line, _CLEAN_SHUTDOWN_PATTERNS) for line in lines)
 
 
 def _current_boot_id() -> str:
@@ -531,6 +603,40 @@ def _read_marker(path: Path) -> str | None:
     return None
 
 
+def read_maintenance(path: Path | None, *, now: float) -> MaintenanceWindow:
+    """Read the maintenance marker, treating anything unreadable as "not active"."""
+    if path is None:
+        return MaintenanceWindow(active=False)
+    try:
+        raw = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, ValueError):
+        return MaintenanceWindow(active=False)
+    if not isinstance(raw, dict):
+        return MaintenanceWindow(active=False)
+    until = raw.get("until")
+    if not isinstance(until, (int, float)):
+        return MaintenanceWindow(active=False)
+    return MaintenanceWindow(
+        active=now < float(until),
+        until=float(until),
+        reason=str(raw.get("reason", "")),
+    )
+
+
+def write_maintenance(path: Path, *, until: float, reason: str) -> None:
+    """Declare a maintenance window ending at ``until`` (unix seconds)."""
+    write_json_preserving_metadata(path, {"until": until, "reason": reason}, indent=None)
+
+
+def clear_maintenance(path: Path) -> bool:
+    """End any maintenance window. Returns True if one was actually cleared."""
+    try:
+        path.unlink()
+    except (FileNotFoundError, OSError):
+        return False
+    return True
+
+
 def _write_marker(path: Path, boot_id: str) -> None:
     # IF-08: this was a bare `tmp.replace(path)` — the same pattern state.py
     # documents as destroying the destination inode's mode, owner and ACL (T-02-23).
@@ -548,10 +654,25 @@ def send_boot_audit(
     marker_path: Path,
     sample_path: Path | None = None,
     limit: int = 12,
+    maintenance_path: Path | None = None,
+    now: float | None = None,
+    clean_shutdown: bool | None = None,
 ) -> BootAuditResult:
-    """Send one Discord alert if the current boot looks like abrupt power loss."""
+    """Send one Discord alert if the current boot looks like abrupt power loss.
+
+    Three gates suppress the alert before any filesystem evidence is weighed, in
+    order of how strongly each says "this was intentional":
+
+    1. already reported for this boot (the marker),
+    2. the PREVIOUS boot logged systemd's shutdown sequence, so it was a clean
+       ``poweroff``/``reboot`` and no amount of fsck noise makes it an outage,
+    3. an operator-declared maintenance window was still open.
+
+    ``clean_shutdown`` and ``now`` are injectable so the gates are testable
+    without spawning ``journalctl`` or depending on the wall clock.
+    """
     boot_id = _current_boot_id()
-    journal = [_redact(line) for line in _journal_current_boot()]
+    journal = [_redact(line) for line in within_boot_window(_journal_current_boot())]
     power_loss = _matching(journal, _POWER_LOSS_PATTERNS, limit)
     shutdown_actions = _matching(journal, _SHUTDOWN_PATTERNS, limit)
 
@@ -573,6 +694,34 @@ def send_boot_audit(
             power_loss_count=0,
             shutdown_action_count=len(shutdown_actions),
             text="current boot does not show abrupt power-loss indicators",
+        )
+
+    was_clean = previous_boot_ended_cleanly() if clean_shutdown is None else clean_shutdown
+    if was_clean:
+        _write_marker(marker_path, boot_id)
+        return BootAuditResult(
+            sent=False,
+            boot_id=boot_id,
+            power_loss_count=len(power_loss),
+            shutdown_action_count=len(shutdown_actions),
+            text=(
+                "previous boot logged a clean systemd shutdown; filesystem recovery "
+                "evidence is not an outage"
+            ),
+        )
+
+    window = read_maintenance(maintenance_path, now=time.time() if now is None else now)
+    if window.active:
+        _write_marker(marker_path, boot_id)
+        return BootAuditResult(
+            sent=False,
+            boot_id=boot_id,
+            power_loss_count=len(power_loss),
+            shutdown_action_count=len(shutdown_actions),
+            text=(
+                "operator maintenance window is open"
+                + (f" ({window.reason})" if window.reason else "")
+            ),
         )
 
     fields: list[tuple[str, str]] = [
