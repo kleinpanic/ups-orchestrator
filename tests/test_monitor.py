@@ -1297,7 +1297,11 @@ def test_add_serial_records_device_and_baud_and_runs_no_privileged_step(
     assert MonitoredMachine.from_dict(entry).shutdown_method == "serial"
 
 
-def test_add_serial_missing_baud_rc2_names_9600(cfg_path, monkeypatch, caplog) -> None:
+def test_add_serial_missing_baud_rc2_points_at_the_far_end(cfg_path, monkeypatch, caplog) -> None:
+    # Was asserting the message names 9600. That number is this site's OLD guess and
+    # the Dell's console actually runs at 115200, so the tool was telling operators to
+    # declare a baud that would have written garbage and returned success. The message
+    # must point at the far end instead of naming any rate.
     monkeypatch.setenv(cli._SECRET_ENV, _PW)
     _no_privileged_seams(monkeypatch)
     with caplog.at_level("ERROR"):
@@ -1315,7 +1319,8 @@ def test_add_serial_missing_baud_rc2_names_9600(cfg_path, monkeypatch, caplog) -
             ]
         )
     assert rc == 2
-    assert "9600" in caplog.text
+    assert "getty rate" in caplog.text
+    assert "9600" not in caplog.text  # never name a rate we cannot know
     assert json.loads(cfg_path.read_text())["monitored_machines"] == []
 
 

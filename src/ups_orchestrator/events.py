@@ -115,7 +115,7 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
                 1,
                 "",
                 f"serial target {target.name} has no usable baud rate; declare a "
-                f"positive integer serial_baud (the live console here is 9600). "
+                f"positive integer serial_baud (must match the far end's getty rate). "
                 f"Nothing was sent to {target.device}.",
             )
         mode = os.stat(target.device).st_mode
@@ -764,7 +764,7 @@ def _machine_targets(
                     m,
                     deps,
                     "its declared serial_baud could not be parsed; declare a positive "
-                    "integer serial_baud (the live console here is 9600)",
+                    "integer serial_baud (must match the far end's getty rate)",
                 )
                 continue
             target = ShutdownTarget(

@@ -893,7 +893,10 @@ def test_rehearse_refuses_to_guess_a_baud(env_config, monkeypatch, caplog) -> No
     seen = _capture_runners(monkeypatch)
     with caplog.at_level("ERROR"):
         assert cli.main(["shutdown", "rehearse", "spark"]) == 2
-    assert "9600" in caplog.text
+    # Points at the far end rather than naming a rate: this site's console is
+    # 115200, and a wrong-but-valid baud is undetectable (stty returns 0).
+    assert "getty rate" in caplog.text
+    assert "9600" not in caplog.text
     assert seen == []
 
 

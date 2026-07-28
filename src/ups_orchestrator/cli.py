@@ -1259,7 +1259,9 @@ def _verify_serial(m: MonitoredMachine, stat_fn: Callable[[str], os.stat_result]
         _say(f"{m.name}: FAIL — {device} is not a character device ({stat.filemode(mode)})")
         return 1
     if m.serial_baud is None or m.serial_baud <= 0:
-        _say(f"{m.name}: FAIL — no usable declared serial_baud (the live console here is 9600)")
+        _say(
+            f"{m.name}: FAIL — no usable declared serial_baud (must match the far end's getty rate)"
+        )
         return 1
     _say(f"{m.name}: OK — serial {device} present at a declared {m.serial_baud} baud")
     return 0
@@ -1816,7 +1818,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
                 "monitor add: --method serial requires a positive integer --serial-baud "
                 "(got %r). The baud is the operator's to declare and is never assumed: a "
                 "mismatch writes garbage down the line and still returns rc 0, a silent "
-                "no-shutdown. The live console on this site is 9600.",
+                "no-shutdown. Declare the far end's ACTUAL getty rate.",
                 args.serial_baud,
             )
             return 2
@@ -2371,8 +2373,8 @@ def _cmd_shutdown(argv: list[str]) -> int:
             return 2
         if target.baud is None or target.baud <= 0:
             LOG.error(
-                "shutdown rehearse: %r has no usable declared baud (the live console "
-                "here is 9600); refusing to guess one",
+                "shutdown rehearse: %r has no usable declared baud (check the far end: "
+                "systemctl cat serial-getty@<tty> on that machine); refusing to guess one",
                 args.name,
             )
             return 2

@@ -668,9 +668,10 @@ class ShutdownTarget:
     host: str = ""
     user: str = ""
     device: str = ""  # serial: e.g. /dev/ttyUSB0
-    # Serial baud rate (matches the live line; never 115200 — P2-08). The 9600
-    # DATACLASS default is retained for P2-07 back-compat: an ABSENT key still yields
-    # 9600. Only a DECLARED-but-unparseable value yields None (LO-12).
+    # Serial baud rate (must match the far end's getty; 115200 is COMMON, not wrong —
+    # this project's own Dell console runs at 115200). The 9600 DATACLASS default is
+    # retained for P2-07 back-compat: an ABSENT key still yields 9600, which is why an
+    # absent key is dangerous. Only a DECLARED-but-unparseable value yields None (LO-12).
     baud: int | None = 9600
     cmd: str = "sudo /sbin/shutdown -h now"
     battery_below: int | None = None
@@ -920,7 +921,7 @@ def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
                         "declares shutdown_method='serial' with no serial_baud. The baud "
                         "is never assumed: a mismatch writes garbage down the line and "
                         "still returns rc 0, a silent no-shutdown. Declare serial_baud "
-                        "(the live console here is 9600).",
+                        "(must match the far end's getty rate).",
                     )
                 )
             else:
@@ -930,7 +931,7 @@ def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
                     (
                         "error",
                         f"declares serial_baud {declared!r}, which is not an integer. "
-                        f"Declare an integer serial_baud (the live console here is 9600).",
+                        f"Declare an integer serial_baud (must match the far end's getty rate).",
                     )
                 )
         elif m.serial_baud <= 0:
@@ -939,7 +940,7 @@ def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
                     "error",
                     f"declares serial_baud {m.serial_baud}; POSIX B0 means hang up the "
                     f"line, so stty would disconnect the console it was about to use. "
-                    f"Declare the live console's baud (9600 here).",
+                    f"Declare the far end's ACTUAL baud (must match the far end's getty rate).",
                 )
             )
     elif method == "ssh":
@@ -1062,7 +1063,7 @@ def validate_legacy_targets(
                             ups_key,
                             t.name,
                             "serial target with an unparseable baud; declare an integer "
-                            "baud matching the live console (9600 here).",
+                            "baud matching the far end's getty rate.",
                         )
                     )
                 elif t.baud <= 0:
@@ -1072,7 +1073,7 @@ def validate_legacy_targets(
                             t.name,
                             f"serial target with a non-positive baud {t.baud}; POSIX B0 "
                             f"hangs up the line, so stty would disconnect the console it "
-                            f"was about to use. Declare the live console's baud (9600 here).",
+                            f"was about to use. Declare the far end's ACTUAL getty rate.",
                         )
                     )
             elif kind == "remote":
