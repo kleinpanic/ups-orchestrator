@@ -431,15 +431,13 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/nutclient.py",
-        "    needed = [line for line in (loopback_line, lan_line) if line not in active]",
-        "    needed = [line for line in (lan_line,) if line not in active]  # mutated",
+        "    candidates = dict.fromkeys((loopback_line, lan_line))",
+        "    candidates = dict.fromkeys((lan_line,))  # mutated — loopback dropped",
         "nutclient: upsd.conf loses its loopback LISTEN — upsd dies on a boot before DHCP",
     ),
     (
         "src/ups_orchestrator/audit.py",
-        "    was_clean = previous_boot_ended_cleanly() if clean_shutdown is None else clean_shutdown\n"
         "    if was_clean:",
-        "    was_clean = previous_boot_ended_cleanly() if clean_shutdown is None else clean_shutdown\n"
         "    if False:  # mutated — a clean reboot alerts as an outage again",
         "audit: clean-shutdown gate dropped (deliberate poweroff pages as power loss)",
     ),

@@ -10,7 +10,9 @@ STATE_DIR      := /var/lib/$(PROJECT)
 
 ACTION ?= beeper-mute
 
-.PHONY: help venv lint type test coverage check deploy deploy-code deploy-user-service nut-snippets nut-control-user control
+CONFIG ?=
+
+.PHONY: help venv lint type test coverage check deploy deploy-code deploy-user-service nut-snippets nut-control-user control nut-repair-listen install-config nut-status
 
 help:
 	@echo "Targets:"
@@ -25,6 +27,9 @@ help:
 	@echo "  nut-control-user     Create least-priv NUT control user (root): sudo make nut-control-user"
 	@echo "  control ACTION=x     Run a control action on all UPSes (e.g. ACTION=beeper-mute)"
 	@echo "  nut-snippets         Print the NUT config changes to apply by hand"
+	@echo "  nut-status           Show NUT/orchestrator unit health + reachability (NO sudo)"
+	@echo "  nut-repair-listen    Restore upsd.conf's loopback LISTEN + restart nut-server (root)"
+	@echo "  install-config CONFIG=x  Validate then install a config.json into /etc (root)"
 
 venv:
 	python3 -m venv .venv
@@ -75,6 +80,31 @@ control:
 # Poll-loop as a systemd --user service (NO sudo).
 deploy-user-service:
 	@deploy/install-user-service.sh
+
+# Restore the loopback LISTEN upsd needs to survive a boot before DHCP, then
+# restart nut-server and prove a bare `upsc` works: sudo make nut-repair-listen
+nut-repair-listen:
+	@deploy/repair-upsd-listen.sh
+
+# Validate a config.json, then install it into /etc with the canonical
+# 0640 root:nut + u:$(USER):r ACL: sudo make install-config CONFIG=/path/to.json
+install-config:
+	@test -n "$(CONFIG)" || { echo "usage: sudo make install-config CONFIG=/path/to/config.json" >&2; exit 1; }
+	@deploy/install-config.sh "$(CONFIG)"
+
+# Read-only health check — what is running, and can anything actually be read.
+nut-status:
+	@echo "--- units ---"
+	@for u in nut-server nut-monitor nut-driver.target; do \
+	  printf '  %-34s %s\n' "$$u" "$$(systemctl is-active $$u 2>&1)"; done
+	@for u in ups-orchestrator-recorder ups-orchestrator-watch; do \
+	  printf '  %-34s %s\n' "$$u (--user)" "$$(systemctl --user is-active $$u 2>&1)"; done
+	@echo "--- active LISTEN lines in $(NUT_DIR)/upsd.conf ---"
+	@grep -E '^\s*LISTEN' $(NUT_DIR)/upsd.conf 2>/dev/null || echo "(none readable)"
+	@echo "--- upsc reachability ---"
+	@upsc -l >/dev/null 2>&1 && echo "localhost: OK" || echo "localhost: REFUSED (run: sudo make nut-repair-listen)"
+	@echo "--- latest recorder sample ---"
+	@tail -n1 $(STATE_DIR)/samples.jsonl 2>/dev/null | $(PY) -c 'import json,sys;r=json.load(sys.stdin);print(r.get("time"), {k:v.get("status") for k,v in r.get("upses",{}).items()})' 2>/dev/null || echo "(no readable samples)"
 
 nut-snippets:
 	@echo "Apply these to $(NUT_DIR) (back up first), then: systemctl restart nut-driver-enumerator nut-server nut-monitor"

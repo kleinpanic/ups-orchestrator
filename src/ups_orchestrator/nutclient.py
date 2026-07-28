@@ -285,7 +285,11 @@ def upsert_upsd_listen(text: str, lan_ip: str, port: int = 3493) -> tuple[str, b
     loopback_line = f"LISTEN 127.0.0.1 {port}"
     stripped = _strip_managed_block(text)
     active = _active_directives(stripped)
-    needed = [line for line in (loopback_line, lan_line) if line not in active]
+    # dict.fromkeys dedupes while keeping order: a caller that passes 127.0.0.1 as
+    # the LAN address (a single-homed host, or the repair path when no LAN LISTEN
+    # exists yet) makes both candidates the same string, and upsd would get it twice.
+    candidates = dict.fromkeys((loopback_line, lan_line))
+    needed = [line for line in candidates if line not in active]
     if not needed:
         return text, False
     block = f"{_UPSMON_BEGIN}\n" + "\n".join(needed) + f"\n{_UPSMON_END}\n"

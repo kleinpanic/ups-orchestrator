@@ -979,3 +979,12 @@ def test_apply_nft_keeps_the_file_when_the_reload_succeeds(tmp_path):
     assert rc == 0
     assert "192.168.1.114" in conf.read_text()
     assert restarted == [True]
+
+
+def test_upsd_listen_emits_loopback_once_when_lan_ip_is_loopback():
+    # A single-homed host (or the repair path on a conf with no LAN LISTEN) passes
+    # 127.0.0.1 as the LAN address, making both candidate lines identical. upsd
+    # must not be handed the same LISTEN twice.
+    text, changed = nutclient.upsert_upsd_listen("", "127.0.0.1")
+    assert changed is True
+    assert _active(text) == ["LISTEN 127.0.0.1 3493"]
