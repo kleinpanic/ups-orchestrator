@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import os
 
+import pytest
+
 from conftest import make_ups
 from ups_orchestrator import status
 from ups_orchestrator.config import Config, ConfigNotice
@@ -229,3 +231,41 @@ def test_control_characters_in_a_ups_label_are_neutralised(monkeypatch) -> None:
 
     assert "\x1b" not in rendered
     assert "CP?[2J" in rendered
+
+
+# --- per-UPS inventory line ---------------------------------------------------
+
+
+def test_fit_names_returns_full_list_when_it_fits() -> None:
+    assert status._fit_names(("router", "modem"), 80) == "router, modem"
+
+
+def test_fit_names_elides_and_counts_the_overflow() -> None:
+    # _panel never wraps, so an over-long line blows the box border out and
+    # desynchronises watch mode, which assumes one logical line is one row.
+    names = ("switch-one", "switch-two", "switch-three", "switch-four")
+    fitted = status._fit_names(names, 30)
+    assert len(fitted) <= 30
+    assert fitted.endswith("more")
+
+
+def test_fit_names_truncates_a_single_oversized_name() -> None:
+    fitted = status._fit_names(("a-very-long-single-device-name",), 12)
+    assert len(fitted) <= 12
+    assert fitted.endswith("…")
+
+
+def test_status_card_stays_inside_its_box_with_a_long_device_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(status, "_term_width", lambda: 80)
+    snap = UpsSnapshot("OL", 100, 600, 20, 120.0, 119.0, 900)
+    card = status._card(
+        "UPS 3",
+        snap,
+        [],
+        use_color=False,
+        devices=tuple(f"netgear-switch-{i}" for i in range(12)),
+    )
+    widths = {len(line) for line in card if line.startswith(("+", "|"))}
+    assert len(widths) == 1  # every border and body row is the same width

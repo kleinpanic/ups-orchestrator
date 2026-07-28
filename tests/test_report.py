@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from conftest import make_ups
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, MonitoredMachine, UpsConfig, UpsDevice
 from ups_orchestrator.notify import Level
 from ups_orchestrator.nut import UpsSnapshot
 from ups_orchestrator.report import build_report, render_text
@@ -80,3 +80,72 @@ def test_report_surfaces_battery_health_alarm_and_selftest() -> None:
     assert "Last self-test: Battery test failed" in text
     assert "⚠️ Alarm: Replace battery" in text
     assert "self-test FAILED" in text
+
+
+# --- inventory + summary body -------------------------------------------------
+
+
+def _inventory_cfg() -> Config:
+    ups = UpsConfig(
+        name="ups1",
+        label="Network UPS",
+        devices=(
+            UpsDevice(name="router", kind="network"),
+            UpsDevice(name="modem", kind="network"),
+        ),
+    )
+    return Config(
+        webhook_url="",
+        upses={"ups1": ups},
+        monitored_machines=(MonitoredMachine(name="spark", ups="ups1"),),
+    )
+
+
+def test_report_field_names_what_dies_with_the_ups() -> None:
+    # The operator's complaint about the old embed was that it never said what
+    # was actually at risk — only percentages.
+    cfg = _inventory_cfg()
+    snaps = {"ups1": UpsSnapshot("OL", 100, 600, 50, 120.1, 119.8, 900)}
+
+    note = build_report(cfg, snapshot_reader=snaps.__getitem__)
+
+    assert "Shuts down on battery: spark" in note.fields[0][1]
+    assert "Also powers: router, modem" in note.fields[0][1]
+
+
+def test_report_body_carries_live_numbers_not_boilerplate() -> None:
+    cfg = _inventory_cfg()
+    snaps = {"ups1": UpsSnapshot("OL", 100, 600, 50, 120.1, 119.8, 900)}
+
+    note = build_report(cfg, snapshot_reader=snaps.__getitem__)
+
+    assert "~450 W" in note.body
+    assert "1 machine(s) set to shut down automatically" in note.body
+
+
+def test_report_body_leads_with_total_comms_failure() -> None:
+    # This is the state the host was actually in for two days while the embed
+    # still read as a normal report.
+    cfg = _inventory_cfg()
+    snaps = {"ups1": UpsSnapshot(None, None, None, None, None)}
+
+    note = build_report(cfg, snapshot_reader=snaps.__getitem__)
+
+    assert "No communication with any UPS" in note.body
+    assert note.level is Level.WARNING
+
+
+def test_report_body_flags_on_battery_and_high_load() -> None:
+    cfg = Config(
+        webhook_url="",
+        upses={"ups1": make_ups("ups1"), "ups2": make_ups("ups2")},
+    )
+    snaps = {
+        "ups1": UpsSnapshot("OB DISCHRG", 80, 600, 50, 120.0, 119.0, 900),
+        "ups2": UpsSnapshot("OL", 100, 600, 95, 120.0, 119.0, 900),
+    }
+
+    note = build_report(cfg, snapshot_reader=snaps.__getitem__)
+
+    assert "ON BATTERY: ups1" in note.body
+    assert "High load: ups2" in note.body

@@ -82,6 +82,33 @@ def _panel(title: str, title_vlen: int, lines: list[str], *, use_color: bool) ->
     return out
 
 
+_INVENTORY_LABEL_WIDTH = 8  # "Shuts   " / "Powers  "
+
+
+def _fit_names(names: tuple[str, ...], budget: int) -> str:
+    """Join ``names`` to at most ``budget`` visible columns, eliding the overflow.
+
+    ``_panel`` sizes its box to the terminal but never wraps — a longer line
+    silently blows the border out, and ``run(watch=True)`` assumes one logical
+    line is one terminal row. So this elides rather than wrapping, and says how
+    many it dropped instead of pretending the list was short.
+    """
+    joined = ", ".join(names)
+    if len(joined) <= budget:
+        return joined
+    kept: list[str] = []
+    for index, name in enumerate(names):
+        more = len(names) - index - 1
+        candidate = ", ".join([*kept, name]) + (f" +{more} more" if more else "")
+        if len(candidate) > budget:
+            break
+        kept.append(name)
+    if not kept:
+        return joined[: budget - 1] + "…" if budget > 1 else "…"
+    dropped = len(names) - len(kept)
+    return ", ".join(kept) + (f" +{dropped} more" if dropped else "")
+
+
 def _classify(snap: UpsSnapshot) -> tuple[str, str]:
     """Return (state text, ANSI colour) for a snapshot."""
     if snap.status is None:
@@ -143,7 +170,13 @@ def _recent_watts(sample_path: Path | None, name: str, now: float, minutes: int 
 
 
 def _card(
-    ups_label: str, snap: UpsSnapshot, watts_hist: list[int], *, use_color: bool
+    ups_label: str,
+    snap: UpsSnapshot,
+    watts_hist: list[int],
+    *,
+    use_color: bool,
+    managed: tuple[str, ...] = (),
+    devices: tuple[str, ...] = (),
 ) -> list[str]:
     def c(text: str, code: str) -> str:
         return f"{code}{text}{_RESET}" if use_color else text
@@ -180,6 +213,11 @@ def _card(
     if spark:
         rng = f"{min(watts_hist)}–{max(watts_hist)} W, 30m"
         inner.append(f"Draw    {c(spark, _CYAN)} {c(rng, _DIM)}")
+    budget = max(10, _term_width() - 4 - _INVENTORY_LABEL_WIDTH)
+    if managed:
+        inner.append(f"Shuts   {c(_fit_names(managed, budget), _DIM)}")
+    if devices:
+        inner.append(f"Powers  {c(_fit_names(devices, budget), _DIM)}")
     return ["", *_panel(title, _vlen(title), inner, use_color=use_color)]
 
 
@@ -229,8 +267,16 @@ def render(
     lines.extend(_degraded_block(cfg.degraded, use_color=color))
     for name, ups in cfg.upses.items():
         snap = read_snapshot(name)
+        managed, devices = cfg.ups_inventory(name)
         lines.extend(
-            _card(_safe(ups.label), snap, _recent_watts(sample_path, name, now), use_color=color)
+            _card(
+                _safe(ups.label),
+                snap,
+                _recent_watts(sample_path, name, now),
+                use_color=color,
+                managed=tuple(_safe(machine) for machine in managed),
+                devices=tuple(_safe(device.name) for device in devices),
+            )
         )
     if not cfg.upses:
         lines.append(f"{_DIM}(no UPSes configured){_RESET}" if color else "(no UPSes configured)")

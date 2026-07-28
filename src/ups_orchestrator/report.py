@@ -115,6 +115,48 @@ def _field_value(snap: UpsSnapshot) -> str:
     return "\n".join(lines)
 
 
+def _inventory_text(cfg: Config, name: str) -> str | None:
+    """Name what actually dies with this UPS, from config rather than memory."""
+    managed, devices = cfg.ups_inventory(name)
+    lines = []
+    if managed:
+        lines.append(f"Shuts down on battery: {', '.join(managed)}")
+    if devices:
+        lines.append(f"Also powers: {', '.join(device.name for device in devices)}")
+    return "\n".join(lines) if lines else None
+
+
+def _summary_body(cfg: Config, snaps: dict[str, UpsSnapshot]) -> str:
+    """One line that changes day to day, instead of boilerplate that never does.
+
+    The operator's complaint about the old report was exact: the embed looked
+    good and said nothing, because the body was a fixed sentence and every real
+    number was buried in a field. Lead with total draw and whatever is wrong.
+    """
+    no_comm = [name for name, snap in snaps.items() if snap.status is None]
+    if no_comm and len(no_comm) == len(snaps):
+        return "❌ No communication with any UPS — NUT is not answering. Nothing below is live."
+
+    watts = [snap.estimated_load_watts for snap in snaps.values()]
+    known = [w for w in watts if w is not None]
+    parts = []
+    if known:
+        parts.append(f"Drawing ~{sum(known)} W across {len(known)} UPS(es).")
+    protected = sum(len(cfg.ups_inventory(name)[0]) for name in snaps)
+    if protected:
+        parts.append(f"{protected} machine(s) set to shut down automatically.")
+    if no_comm:
+        parts.append(f"❌ No communication with: {', '.join(no_comm)}.")
+
+    on_battery = [name for name, snap in snaps.items() if snap.on_battery]
+    if on_battery:
+        parts.append(f"⚠️ ON BATTERY: {', '.join(on_battery)}.")
+    high = [name for name, snap in snaps.items() if snap.load_is_high]
+    if high:
+        parts.append(f"⚠️ High load: {', '.join(high)}.")
+    return " ".join(parts)
+
+
 def build_report(
     cfg: Config,
     *,
@@ -122,18 +164,19 @@ def build_report(
 ) -> Notification:
     """Build a Discord-ready status report for every configured UPS."""
     fields: list[tuple[str, str]] = []
+    snaps: dict[str, UpsSnapshot] = {}
     degraded = False
     for name, ups in cfg.upses.items():
         snap = snapshot_reader(name)
+        snaps[name] = snap
         degraded = degraded or _is_degraded(snap)
-        fields.append((ups.label, _field_value(snap)))
+        value = _field_value(snap)
+        inventory = _inventory_text(cfg, name)
+        fields.append((ups.label, f"{value}\n{inventory}" if inventory else value))
 
     return Notification(
         title="📊 UPS load and runtime report",
-        body=(
-            "Current battery, expected time before 0%, load, voltage, and action flags "
-            "for configured UPSes."
-        ),
+        body=_summary_body(cfg, snaps),
         level=Level.WARNING if degraded else Level.INFO,
         fields=fields,
         footer=f"{len(fields)} UPS(es) configured",

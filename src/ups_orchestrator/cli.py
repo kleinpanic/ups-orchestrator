@@ -12,6 +12,9 @@ Modes::
     ups-orchestrator selftest [ups]      # run a NUT battery self-test and alert on failure
     ups-orchestrator control <action>    # beeper/battery-test instant commands (all UPSes)
     ups-orchestrator boot-audit          # one-shot post-boot abrupt-loss alert
+    ups-orchestrator maintenance begin|end|status
+                                         # declare that power cuts are expected, so a
+                                         # deliberate shutdown stops alerting as an outage
     ups-orchestrator record              # high-frequency UPS telemetry recorder
     ups-orchestrator power-dashboard     # render/post a live+history power image
     ups-orchestrator webui               # local web dashboard (live status + history)
@@ -98,6 +101,7 @@ _VAR_SAMPLES = Path("/var/lib/ups-orchestrator/samples.jsonl")
 _VAR_EVENTS = Path("/var/lib/ups-orchestrator/events.jsonl")
 _VAR_NOTIFICATIONS = Path("/var/lib/ups-orchestrator/notifications.jsonl")
 _BOOT_AUDIT_MARKER = Path("/var/lib/ups-orchestrator/boot-audit.json")
+_MAINTENANCE_MARKER = Path("/var/lib/ups-orchestrator/maintenance.json")
 
 
 def _say(text: str) -> None:
@@ -171,6 +175,15 @@ def _boot_audit_marker_path() -> Path:
     if _BOOT_AUDIT_MARKER.parent.is_dir():
         return _BOOT_AUDIT_MARKER
     return _BASE / "boot-audit.json"
+
+
+def _maintenance_path() -> Path:
+    env = os.environ.get("UPS_ORCH_MAINTENANCE_STATE")
+    if env:
+        return Path(env).expanduser()
+    if _MAINTENANCE_MARKER.parent.is_dir():
+        return _MAINTENANCE_MARKER
+    return _BASE / "maintenance.json"
 
 
 def _load_config() -> Config | None:
@@ -764,12 +777,62 @@ def _cmd_boot_audit(argv: list[str]) -> int:
         marker_path=_boot_audit_marker_path(),
         sample_path=_sample_path(),
         limit=max(1, args.limit),
+        maintenance_path=_maintenance_path(),
     )
     LOG.info(
-        "boot-audit: sent=%s power_loss=%d shutdown_evidence=%d",
+        "boot-audit: sent=%s power_loss=%d shutdown_evidence=%d (%s)",
         result.sent,
         result.power_loss_count,
         result.shutdown_action_count,
+        result.text,
+    )
+    return 0
+
+
+def _cmd_maintenance(argv: list[str]) -> int:
+    """Declare or clear a window in which abrupt power loss is expected.
+
+    Exists because the boot audit cannot tell a deliberate plug-pull from an
+    outage — both leave the host dead with every UPS reporting OL right up to
+    the cut. Only the operator knows which it was, so they get to say so.
+    """
+    parser = argparse.ArgumentParser(prog="ups-orchestrator maintenance")
+    parser.add_argument("action", choices=("begin", "end", "status"))
+    parser.add_argument(
+        "--hours", type=float, default=4.0, help="window length for 'begin' (default 4)"
+    )
+    parser.add_argument("--reason", default="", help="free text shown when an alert is suppressed")
+    args = parser.parse_args(argv)
+
+    path = _maintenance_path()
+    now = time.time()
+
+    if args.action == "begin":
+        if args.hours <= 0:
+            _say("maintenance: --hours must be greater than 0")
+            return 2
+        until = now + args.hours * 3600.0
+        audit.write_maintenance(path, until=until, reason=args.reason)
+        _say(
+            f"maintenance window open until "
+            f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))} "
+            f"({args.hours:g}h){f' — {args.reason}' if args.reason else ''}"
+        )
+        _say("boot-audit power-loss alerts are suppressed until then.")
+        return 0
+
+    if args.action == "end":
+        _say("maintenance window closed" if audit.clear_maintenance(path) else "no window was open")
+        return 0
+
+    window = audit.read_maintenance(path, now=now)
+    if not window.active:
+        _say("maintenance: no window open — power-loss alerts are ARMED")
+        return 0
+    _say(
+        f"maintenance: window open until "
+        f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(window.until))}"
+        f"{f' — {window.reason}' if window.reason else ''}"
     )
     return 0
 
@@ -2336,7 +2399,7 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error(
             "usage: ups-orchestrator "
             "<event|tick|watch|status|report|audit|baseline|selftest|boot-audit|record|"
-            "power-dashboard|webui|control|monitor|remote-shutdown|shutdown|"
+            "power-dashboard|webui|control|monitor|maintenance|remote-shutdown|shutdown|"
             "notify-test|logs> [...]"
         )
         return 0
@@ -2358,6 +2421,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_webui(args[1:])
     if mode == "boot-audit":
         return _cmd_boot_audit(args[1:])
+    if mode == "maintenance":
+        return _cmd_maintenance(args[1:])
     if mode == "notify-test":
         return _cmd_notify_test(args[1:])
     if mode == "logs":

@@ -714,12 +714,42 @@ class ShutdownTarget:
         )
 
 
+_DEVICE_KINDS = ("server", "network", "desktop", "storage", "other")
+
+
+@dataclass(frozen=True)
+class UpsDevice:
+    """A thing plugged into a UPS that the orchestrator does NOT manage.
+
+    Inventory only — this is never a shutdown target and never grows one. It
+    exists so "what is actually at risk on this UPS" is answerable from config
+    instead of from the operator's memory: routers, switches, a modem, someone
+    else's desktop. Machines the orchestrator DOES shut down are not repeated
+    here; renderers read those from ``monitored_machines`` so the two lists
+    cannot drift apart.
+    """
+
+    name: str
+    kind: str = "other"
+    note: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> UpsDevice:
+        kind = str(data.get("kind", "other")).strip().lower()
+        return cls(
+            name=str(data.get("name", "")).strip(),
+            kind=kind if kind in _DEVICE_KINDS else "other",
+            note=str(data.get("note", "")).strip(),
+        )
+
+
 @dataclass(frozen=True)
 class UpsConfig:
     """Per-UPS behaviour, keyed in config by its NUT device name."""
 
     name: str
     label: str
+    devices: tuple[UpsDevice, ...] = ()
     shutdown_targets: tuple[ShutdownTarget, ...] = ()
     # Legacy pre-policy scope value, still parsed so old config files load.
     shutdown_scope: str = "remote"
@@ -743,9 +773,20 @@ class UpsConfig:
             if isinstance(raw_targets, list)
             else ()
         )
+        raw_devices = data.get("devices", [])
+        devices = (
+            tuple(
+                device
+                for device in (UpsDevice.from_dict(d) for d in raw_devices if isinstance(d, dict))
+                if device.name
+            )
+            if isinstance(raw_devices, list)
+            else ()
+        )
         return cls(
             name=name,
             label=str(data.get("label", name)),
+            devices=devices,
             shutdown_targets=targets,
             shutdown_scope=_norm_scope(data.get("shutdown_scope"), default_scope),
             shutdown_policy=shutdown_policy or ShutdownPolicy(),
@@ -1572,6 +1613,19 @@ class Config:
     def ups(self, name: str) -> UpsConfig | None:
         """Look up a UPS by NUT name, returning ``None`` if it is not configured."""
         return self.upses.get(normalize_ups_name(name))
+
+    def ups_inventory(self, name: str) -> tuple[tuple[str, ...], tuple[UpsDevice, ...]]:
+        """Return ``(managed machine names, unmanaged devices)`` plugged into ``name``.
+
+        Managed names come from ``monitored_machines`` rather than from the UPS's
+        own ``devices`` list so the two can never disagree about who shuts a box
+        down. ``devices`` carries only the gear the orchestrator has no authority
+        over — the answer to "what else dies with this UPS".
+        """
+        key = normalize_ups_name(name)
+        managed = tuple(machine.name for machine in self.monitored_machines if machine.ups == key)
+        entry = self.upses.get(key)
+        return managed, entry.devices if entry else ()
 
     @classmethod
     def load(cls, path: Path | str, env: Mapping[str, str] | None = None) -> Config:
