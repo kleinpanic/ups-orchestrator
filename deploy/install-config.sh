@@ -30,6 +30,9 @@ fi
 [ -L "$SRC" ] && { echo "refusing: $SRC is a symlink" >&2; exit 1; }
 [ -f "$SRC" ] || { echo "refusing: $SRC is not a regular file" >&2; exit 1; }
 
+# Both mktemp -p and install (no -D) need the directory to already exist, so a
+# first-ever install into a fresh /etc/ups-orchestrator would otherwise fail.
+install -d -o root -g nut -m 0750 "$(dirname "$DEST")"
 STAGE="$(mktemp -p "$(dirname "$DEST")" .config.stage.XXXXXX)"
 trap 'rm -f "$STAGE"' EXIT
 chmod 0600 "$STAGE"

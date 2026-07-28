@@ -154,6 +154,11 @@ def _summary_body(cfg: Config, snaps: dict[str, UpsSnapshot]) -> str:
     high = [name for name, snap in snaps.items() if snap.load_is_high]
     if high:
         parts.append(f"⚠️ High load: {', '.join(high)}.")
+    # A UPS with no realpower.nominal, nothing monitored, on line and not
+    # overloaded produces no parts at all. Discord drops an empty description,
+    # so the daily embed would lose its body entirely rather than say "fine".
+    if not parts:
+        return f"All {len(snaps)} UPS(es) online and within limits."
     return " ".join(parts)
 
 

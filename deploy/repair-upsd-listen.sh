@@ -28,11 +28,11 @@ fi
 # T-03-08: UPSD_LAN_IP is written verbatim into a NUT config as root. A newline
 # would inject an arbitrary directive, so reject anything that is not a bare
 # address before it can reach the file.
+# Delegates to the stdlib rather than a character-class guess: the earlier
+# `case` accepted `...`, `::::` and `1.2.3.4.5.6` while its error message claimed
+# they were not bare IPs, and it rejected a legitimate IPv6 zone id.
 _valid_addr() {
-  case "$1" in
-    *[!0-9a-fA-F.:]*|"") return 1 ;;
-    *) return 0 ;;
-  esac
+  "$PY" -P -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1].split("%")[0])' "$1" 2>/dev/null
 }
 
 # Reuse whatever LAN address is already configured. If there is none, pass
@@ -73,8 +73,9 @@ PYEOF
 rc=$?
 set -e
 
+CHANGED=0
 case "$rc" in
-  0)  echo "upsd.conf: loopback LISTEN added (backup: $BACKUP)" ;;
+  0)  CHANGED=1; echo "upsd.conf: loopback LISTEN added (backup: $BACKUP)" ;;
   10) rm -f "$BACKUP"; echo "upsd.conf: loopback LISTEN already present — nothing to do" ;;
   *)  cp -p "$BACKUP" "$CONF"
       echo "rewrite FAILED (rc=$rc) — $CONF restored from $BACKUP, nut-server NOT restarted" >&2
@@ -84,9 +85,17 @@ esac
 echo "--- active LISTEN lines ---"
 grep -E '^\s*LISTEN' "$CONF" || echo "(none)"
 
-systemctl reset-failed nut-server 2>/dev/null || true
-systemctl restart nut-server
-sleep 2
+# Restart only when the file actually changed, or when nut-server is not
+# currently up. The header promised this and the first version restarted
+# unconditionally — dropping every upsmon connection on a host whose restart
+# limit had already killed nut-server once.
+if [ "$CHANGED" -eq 1 ] || ! systemctl is-active nut-server >/dev/null 2>&1; then
+  systemctl reset-failed nut-server 2>/dev/null || true
+  systemctl restart nut-server
+  sleep 2
+else
+  echo "nut-server: already active and config unchanged — not restarting"
+fi
 
 echo "--- verification ---"
 systemctl is-active nut-server >/dev/null 2>&1 \

@@ -416,18 +416,22 @@ def test_write_maintenance_refuses_to_follow_a_symlink(tmp_path: Path) -> None:
     assert victim.read_text() == "original"
 
 
-def test_clear_maintenance_raises_rather_than_reporting_no_window(tmp_path: Path) -> None:
+def test_clear_maintenance_raises_rather_than_reporting_no_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Swallowing the error returned the same False as "nothing was open", so the
     # CLI told the operator alerts were ARMED while suppression was still live.
-    marker = tmp_path / "sub" / "maintenance.json"
-    marker.parent.mkdir()
+    # The failure is injected rather than staged with chmod, because root ignores
+    # a read-only parent directory and the test would invert under `sudo pytest`.
+    marker = tmp_path / "maintenance.json"
     marker.write_text(json.dumps({"until": 2_000.0}))
-    marker.parent.chmod(0o500)  # unlink will fail, the file still exists
-    try:
-        with pytest.raises(OSError):
-            audit.clear_maintenance(marker)
-    finally:
-        marker.parent.chmod(0o700)
+
+    def _boom(_self: Path) -> None:
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+    with pytest.raises(OSError):
+        audit.clear_maintenance(marker)
 
 
 def test_clear_maintenance_returns_false_when_absent(tmp_path: Path) -> None:
@@ -440,3 +444,78 @@ def test_boolean_until_is_not_treated_as_a_timestamp(tmp_path: Path) -> None:
     marker.write_text(json.dumps({"until": True}))
 
     assert audit.read_maintenance(marker, now=0.0).active is False
+
+
+def test_shutdown_evidence_is_not_limited_to_the_boot_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The 120s window scopes FILESYSTEM evidence. The orchestrator's own shutdown
+    # actions happen at arbitrary uptime, so windowing them pinned the count to
+    # zero — and with it pinned the alert body to "no killpower evidence found"
+    # no matter what had actually happened.
+    monkeypatch.setattr(audit, "_current_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(
+        audit,
+        "_journal_current_boot",
+        lambda: [
+            "1785204918.0 host systemd-fsck[1]: Dirty bit is set.",
+            "1785299999.0 host ups-orchestrator: shutdown sent to spark",
+        ],
+    )
+    monkeypatch.setattr(
+        audit,
+        "read_snapshot",
+        lambda _n: UpsSnapshot("OL", 100, 1800, 10, 120.0, realpower_nominal=900),
+    )
+
+    result = audit.send_boot_audit(
+        _boot_cfg(),
+        FakeNotifier(),
+        marker_path=tmp_path / "m.json",
+        clean_shutdown=False,
+    )
+
+    assert result.power_loss_count == 1  # windowed
+    assert result.shutdown_action_count == 1  # NOT windowed
+
+
+def test_previous_boot_ended_cleanly_reads_the_real_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every other test injects clean_shutdown=, so the detector itself had no
+    # coverage at all and would survive being replaced with `return False`.
+    captured: dict[str, list[str]] = {}
+
+    def _fake_run(args: list[str], timeout: float = 0.0) -> list[str]:
+        captured["args"] = args
+        return ["Jul 27 host systemd-shutdown[1]: Syncing filesystems and block devices."]
+
+    monkeypatch.setattr(audit, "_run", _fake_run)
+    assert audit.previous_boot_ended_cleanly() is True
+    assert "-b" in captured["args"] and "-1" in captured["args"]
+
+
+def test_previous_boot_ended_cleanly_is_false_on_an_abrupt_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An abrupt cut leaves the journal simply stopping mid-line: ordinary
+    # traffic, no shutdown sequence.
+    monkeypatch.setattr(
+        audit, "_run", lambda *_a, **_k: ["Jul 27 host NetworkManager: device usb0 activated"]
+    )
+    assert audit.previous_boot_ended_cleanly() is False
+
+
+def test_write_maintenance_rejects_a_non_finite_end(tmp_path: Path) -> None:
+    # --hours nan passed both the <=0 and >max guards, wrote the marker, then
+    # crashed in time.localtime(nan) — a traceback on a safety control.
+    with pytest.raises(ValueError):
+        audit.write_maintenance(tmp_path / "m.json", until=float("nan"), reason="x")
+
+
+def test_write_maintenance_creates_its_parent_directory(tmp_path: Path) -> None:
+    # The writer this replaced did mkdir(parents=True); a relocated
+    # $UPS_ORCH_MAINTENANCE_STATE must keep working.
+    marker = tmp_path / "fresh" / "maintenance.json"
+    audit.write_maintenance(marker, until=2_000.0, reason="x")
+    assert audit.read_maintenance(marker, now=1_000.0).active is True

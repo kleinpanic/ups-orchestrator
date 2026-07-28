@@ -149,3 +149,16 @@ def test_report_body_flags_on_battery_and_high_load() -> None:
 
     assert "ON BATTERY: ups1" in note.body
     assert "High load: ups2" in note.body
+
+
+def test_report_body_is_never_empty() -> None:
+    # No realpower.nominal, nothing monitored, online and not overloaded produced
+    # no parts at all — and Discord drops an empty description, so the daily
+    # embed would silently lose its body.
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")})
+    snaps = {"ups1": UpsSnapshot("OL", 100, 600, 20, 120.0, 119.0, None)}
+
+    note = build_report(cfg, snapshot_reader=snaps.__getitem__)
+
+    assert note.body.strip() != ""
+    assert "online" in note.body.lower()

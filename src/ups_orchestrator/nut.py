@@ -73,10 +73,13 @@ def upsc_var(ups_name: str, key: str, timeout: float = 10.0) -> str | None:
             text=True,
             timeout=timeout,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        _note_upsc_failure(f"{ups_name} {key}", str(exc))
         return None
     if result.returncode != 0:
+        _note_upsc_failure(f"{ups_name} {key}", result.stderr.strip())
         return None
+    _note_upsc_success(f"{ups_name} {key}")
     return result.stdout.strip() or None
 
 

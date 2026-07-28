@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -159,6 +160,20 @@ def _list_boots() -> list[str]:
 
 def _journal_current_boot() -> list[str]:
     return _run(["journalctl", "-b", "0", "--no-pager", "-o", "short-unix"], timeout=30.0)
+
+
+def _strip_unix_prefix(lines: list[str]) -> list[str]:
+    """Drop the ``-o short-unix`` timestamp prefix, keeping every line."""
+    out: list[str] = []
+    for line in lines:
+        stamp, _, rest = line.partition(" ")
+        try:
+            float(stamp)
+        except ValueError:
+            out.append(line)
+        else:
+            out.append(rest)
+    return out
 
 
 def within_boot_window(
@@ -660,7 +675,12 @@ def write_maintenance(path: Path, *, until: float, reason: str) -> None:
     wrong for a marker in a directory a less-privileged account can write. A
     planted symlink must fail this call, not be followed through (T-03-04).
     """
+    if not math.isfinite(until):
+        raise ValueError(f"maintenance window end must be a finite timestamp, got {until!r}")
     payload = json.dumps({"until": until, "reason": reason}, sort_keys=True)
+    # The metadata-preserving writer this replaced created the parent directory;
+    # a $UPS_ORCH_MAINTENANCE_STATE pointing somewhere new must keep working.
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(payload + "\n")
@@ -716,9 +736,14 @@ def send_boot_audit(
     without spawning ``journalctl`` or depending on the wall clock.
     """
     boot_id = _current_boot_id()
-    journal = [_redact(line) for line in within_boot_window(_journal_current_boot())]
-    power_loss = _matching(journal, _POWER_LOSS_PATTERNS, limit)
-    shutdown_actions = _matching(journal, _SHUTDOWN_PATTERNS, limit)
+    journal = [_redact(line) for line in _journal_current_boot()]
+    # The window scopes FILESYSTEM-RECOVERY evidence only, which is written while
+    # mounting. Shutdown/killpower evidence is the orchestrator's own actions and
+    # happens at arbitrary uptime, so windowing it pinned shutdown_action_count to
+    # zero — which in turn pinned the alert body to "No target shutdown or UPS
+    # killpower evidence was found", regardless of what had actually happened.
+    power_loss = _matching(within_boot_window(journal), _POWER_LOSS_PATTERNS, limit)
+    shutdown_actions = _matching(_strip_unix_prefix(journal), _SHUTDOWN_PATTERNS, limit)
 
     if _read_marker(marker_path) == boot_id:
         return BootAuditResult(

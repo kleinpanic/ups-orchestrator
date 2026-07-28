@@ -449,7 +449,7 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/audit.py",
-        "        active=now < float(until),",
+        "        active=now < until,",
         "        active=True,  # mutated — window never expires",
         "audit: maintenance window never expires (a forgotten window silences real outages)",
     ),
@@ -458,6 +458,31 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "        if when - first <= window:",
         "        if True:  # mutated — late journald rotation counts as boot evidence",
         "audit: boot-evidence window dropped (stale journal lines alarm a healthy host)",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "    shutdown_actions = _matching(_strip_unix_prefix(journal), _SHUTDOWN_PATTERNS, limit)",
+        "    shutdown_actions = _matching(within_boot_window(journal), _SHUTDOWN_PATTERNS, limit)",
+        "audit: shutdown evidence windowed to 120s — count pinned to 0, body always"
+        " claims no killpower evidence",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "    return any(_contains_any(line, _CLEAN_SHUTDOWN_PATTERNS) for line in lines)",
+        "    return False  # mutated — the clean-shutdown detector never fires",
+        "audit: previous_boot_ended_cleanly always False (gate 2 inert)",
+    ),
+    (
+        "src/ups_orchestrator/report.py",
+        "    if not parts:",
+        "    if False:  # mutated — body may render empty",
+        "report: daily embed can lose its description entirely",
+    ),
+    (
+        "src/ups_orchestrator/nut.py",
+        "        _note_upsc_failure(ups_name, result.stderr.strip())",
+        "        pass  # mutated — a refused upsc goes back to being silent",
+        "nut: upsc failure silent again (the two-day outage's invisibility)",
     ),
 ]
 
