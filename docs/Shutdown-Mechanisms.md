@@ -1,97 +1,19 @@
-# Shutdown mechanisms: native NUT vs. ssh vs. serial
+# Shutdown mechanisms: SSH push vs. native NUT
 
-## The problem all three solve
-
-**Every UPS data cable plugs into one machine** — the NUT primary. It is the
-only host that can read a battery percentage or a runtime estimate, because it
-is the only one physically wired to a UPS. No other machine can see a UPS at
-all.
-
-**So every other machine has to be *told* to shut down.** It cannot work out on
-its own that the power is failing; nothing it can see has changed. Each enrolled
-machine (`monitored_machines[]`, see [Configuration](Configuration.md)) carries
-exactly one **effective `shutdown_method`** — `none`, `native`, `serial` or
-`ssh` — and that field is nothing more than the choice of **how the machine is
-told**:
-
-| `shutdown_method` | Who issues the poweroff | How the machine learns | What the far end needs | Survives a dead LAN |
-|---|---|---|---|---|
-| **`native`** | the machine itself | its own `upsmon` reads the primary's `upsd` over the LAN | `nut-client` and a working network | ❌ |
-| **`ssh`** | the primary | it doesn't — it just receives a command | `sshd`, an authorised key, passwordless `sudo shutdown` | ❌ |
-| **`serial`** | the primary | it doesn't — it just receives a command | a console cable and an auto-login getty | ✅ |
-| **`none`** | nobody | — | — | — |
-
-A machine holds exactly one. They are alternatives, not layers.
-
-!!! tip "`native` does not need a USB cable on the remote machine"
-    The most commonly misunderstood point in the whole design. A `native`
-    machine runs its own `upsmon`, which opens a **TCP connection over the LAN**
-    to the primary's `upsd` on **port 3493**, reads the UPS status from there,
-    and powers **itself** off when that status goes critical. The primary pushes
-    nothing at it and runs no command on it.
-
-    It is a *network subscription* to the primary's view of a UPS, not a local
-    reading of one. That is exactly why `monitor add --method native` sets up a
-    `LISTEN` line, an `upsd.users` account and an nftables rule: **all of that
-    machinery exists to open TCP 3493 to that one host safely.** None of it is
-    about cabling.
-
-`ssh` and `serial` are the opposite shape — the primary makes the decision and
-**pushes** a command out. `ssh` runs `ssh <alias> '<shutdown_cmd>'`; `serial`
-writes the command down a USB-serial cable into the far end's console getty and
-needs nothing but that cable.
-
-(The legacy per-UPS `shutdown_targets[]` array, described in
+Every enrolled machine (`monitored_machines[]`, see
+[Configuration](Configuration.md)) carries exactly one **effective
+`shutdown_method`**: `none`, `native`, `serial`, or `ssh`. `native` wraps NUT's
+own primary/secondary model (below); `serial` and `ssh` are the orchestrator's
+own **push** transports — it reaches out to the machine over a console cable or
+an SSH connection and sends the shutdown command itself. (The legacy
+per-UPS `shutdown_targets[]` array, described in
 [Shutdown Targets](Shutdown-Targets.md), predates the per-machine model and is
 kept only for back-compat; its `remote`/`serial`/`local` kinds map onto
 `shutdown_method` `ssh`/`serial`/(the local host, which has no
-`monitored_machines` entry at all).)
-
-## Which one should I pick?
-
-| If the machine… | Use |
-|---|---|
-| must shut down even when the LAN is dark | **`serial`** — run a console cable to it |
-| can run `nut-client`, and you'd rather not hand out shutdown credentials | **`native`** |
-| is reachable over SSH and losing it in a network outage is acceptable | **`ssh`** |
-| should never be powered off automatically | **`none`**, or list it under [`devices`](Configuration.md#what-else-is-on-this-ups-devices) as inventory |
-
-**The decision driver in this deployment is the wiring.** The router, the modem
-and all three network switches are on **one UPS**. If that UPS drops, the LAN
-drops with it — and `native` and `ssh` both die at that instant, because both of
-them *are* the network. `native` loses its subscription to `upsd`; `ssh` times
-out at `ConnectTimeout=10`. Serial is point-to-point copper between two boxes
-and keeps working with every switch in the rack dark.
-
-**So serial is the robust choice and ssh is the convenient one.** For a machine
-that must die cleanly during a network outage, run the cable.
-
-!!! danger "The serial baud trap — a wrong baud is undetectable"
-    `stty -F <device> <rate>` returns **exit 0** for 9600, 19200, 115200 and 0
-    alike. A wrong-but-valid baud therefore cannot be detected: the orchestrator
-    configures the local line, writes the shutdown command down the wire as
-    garbage, reports success (rc 0), and the machine never shuts down. Nothing
-    logs a problem, anywhere. What *is* caught is a malformed rate or a local
-    line that could not be configured — never a far-end mismatch.
-
-    The baud must match the far end's getty **exactly**. Read it off *that*
-    machine:
-
-    ```bash
-    systemctl cat serial-getty@ttyS0.service                  # full unit + overrides
-    systemctl show serial-getty@ttyS0 -p ExecStart --value    # just the agetty line
-    ```
-
-    The rate is the bare number in the `agetty` arguments (`-L %I 115200
-    $TERM`); substitute the tty your cable is actually attached to. **Every baud
-    printed in this documentation is an example, never a value to copy.**
-
-    Then prove the cable without shutting anything down:
-    `ups-orchestrator shutdown rehearse <machine>` pushes a harmless hard-coded
-    `logger` line — never the recorded `shutdown_cmd` — over the real transport.
-
-The rest of this page is the detail behind that table: what fires each
-authority, in what order, and the failure modes of each.
+`monitored_machines` entry at all).) The SSH push path is the convenient one,
+and it is also the one with the most failure modes. This page describes that
+pathology honestly and asks whether NUT's own distributed-shutdown model is a
+better fit.
 
 ## Ordering: serial before ssh, and per-machine push vs. per-UPS native
 
@@ -282,22 +204,19 @@ It removes pathologies 2–5 outright — but it introduces **one new gap of its
 
 ## The honest trade-off
 
-| | `ssh` push | `native` (NUT secondary) | `serial` push |
+| | SSH push (current) | Native NUT (secondary + FSD) | Serial |
 |---|---|---|---|
-| Survives a dead network | ❌ | ❌ (`upsd` is reached over TCP) | ✅ |
-| Needs a USB cable on the far end | no | **no** | no (a *console* cable, not USB-to-UPS) |
-| Credential surface | keys + sudo on every box | read-only MONITOR creds | none (getty) |
-| Coordinated with NUT | no | yes | no |
+| Survives a dead network | ❌ | ❌ (upsd is over TCP) | ✅ |
+| Credential surface | keys + sudo on every box | read MONITOR creds only | none (getty) |
+| Coordinated with NUT | no | yes (native) | no |
 | Per-**box** threshold on one UPS | ✅ | ❌ (FSD is per-UPS) | ✅ |
-| Works on non-NUT appliances | ✅ | ❌ (needs `nut-client`) | ✅ (any console) |
-| Agent required on target | `sshd` + sudo | `nut-client` | auto-login getty |
-| Fires if `watch` isn't running | ❌ | ✅ (nothing here is involved) | ❌ |
+| Works on non-NUT appliances | ✅ | ❌ (needs nut-client) | ✅ (any console) |
+| Agent required on target | sshd + sudo | nut-client | auto-login getty |
 
-`native` does **not** fix the network problem — `upsd` is reached over TCP, so a
-secondary is as blind as SSH when the switch is dark. Only **serial** is
-network-independent. What `native` fixes is the *credential inversion*, the
-*coordination gap*, and the *reimplementation* — for boxes that can run
-`nut-client`.
+Native NUT does **not** fix the network pathology — `upsd` is reached over TCP, so
+a secondary is as blind as SSH when the switch is dark. Only **serial** is
+network-independent. What native NUT fixes is the *credential inversion*, the
+*coordination gap*, and the *reimplementation* — for boxes that can run nut-client.
 
 ## Recommended shape
 

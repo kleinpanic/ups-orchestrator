@@ -20,12 +20,12 @@ The host running the daemon is protected separately by NUT's own
 `upsmon SHUTDOWNCMD`; orchestrator targets are optional extra actions for the
 devices a UPS feeds.
 
-!!! note "Which mechanism is right is decided elsewhere"
-    Whether a machine should be told to shut down over `native`, `ssh` or
-    `serial` — and why the answer here is usually `serial`, because the router
-    and every switch sit on one UPS — is covered in
-    [Shutdown mechanisms](Shutdown-Mechanisms.md). Read that first; this page is
-    only the shape of the legacy array.
+!!! note "SSH is the fallback, not the primary path"
+    Native NUT (upsmon secondary, enrolled via `monitor add`) is the primary
+    graceful-shutdown mechanism; the `remote` (SSH) / `serial` targets here are a
+    configurable, **default-off** backup. See
+    [SSH vs. native NUT](Shutdown-Mechanisms.md) for the full analysis, the
+    failure modes, and when each path applies.
 
 **Deferred:** a native-plus-deadman regime, where a legacy target fired only as
 a last resort strictly below a native secondary's own LB point, was scoped for
@@ -81,21 +81,14 @@ bypass disabled groups or the close-to-empty gate.
 
 ## Example
 
-!!! danger "Match the far end's ACTUAL baud — a wrong value is silent"
-    `stty -F <device> <rate>` returns **exit 0** for 9600, 19200, 115200 and 0
-    alike, so a wrong-but-valid `baud` here is **undetectable**: it sends
-    garbage down the wire, the orchestrator reports success (rc 0), and the
-    machine never shuts down. Only a rejected *local* line configuration is
-    caught — never a far-end speed mismatch.
-
-    Read the real rate off the machine you are wiring to:
-
-    ```bash
-    systemctl show serial-getty@ttyS0 -p ExecStart --value   # the agetty line
-    ```
-
-    The rate is the bare number in the `agetty` arguments. **The `115200` in
-    the example below is an example, not a value to copy.**
+!!! danger "Match your console's ACTUAL baud — a wrong value is silent"
+    Read the real rate off the far end: `systemctl cat serial-getty@<tty>.service`
+    on that machine. `stty` only configures the local
+    tty and returns success at essentially any recognised rate on the same
+    physical line, so a wrong `baud` here sends garbage down the wire and the
+    orchestrator reports success (rc 0) anyway — it cannot detect a far-end
+    speed mismatch, only a rejected local line configuration. Declare the real
+    speed of the console you are wiring to, not a value copied from an example.
 
 ```json
 {
@@ -103,7 +96,7 @@ bypass disabled groups or the close-to-empty gate.
   "kind": "serial",
   "enabled": true,
   "device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0",
-  "baud": 115200,
+  "baud": 9600,
   "cmd": "sudo /sbin/shutdown -h now"
 }
 ```
