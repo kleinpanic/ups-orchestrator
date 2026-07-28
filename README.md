@@ -19,24 +19,116 @@
 
 It turns [Network UPS Tools](https://networkupstools.org/) power events into
 **per-UPS Discord embeds** for on-battery alerts, a runtime-remaining countdown,
-power-restored summaries, and low-battery warnings. NUT's own `upsmon` still
-handles the host's protective shutdown. Each machine you enroll gets exactly
-one shutdown authority (`monitor add --method {native|serial|ssh|none}`):
-**native** wraps NUT's own primary/secondary model, and **serial**/**ssh** are
-the orchestrator's own opt-in push transports, gated by a central policy that
-requires the UPS to be both on battery and close to empty.
+power-restored summaries, and low-battery warnings — and, if you turn it on, it
+makes sure every machine on a dying UPS gets shut down cleanly.
 
 Works with any NUT-supported UPS and monitors **any number** of them. Nothing is
 hard-coded to a model.
 
 📖 **Full docs: the [project wiki](https://github.com/kleinpanic/ups-orchestrator/wiki) · [GitHub Pages site](https://kleinpanic.github.io/ups-orchestrator/).**
 
+## How this actually works — read this first
+
+**Every UPS data cable plugs into one machine.** All three UPS USB cables land
+on a single host — the **NUT primary** (a Raspberry Pi 5 in this deployment).
+That machine is the only one on the network that can read a battery percentage
+or a runtime estimate, because it is the only one physically wired to a UPS.
+
+**So every other machine has to be *told* to shut down.** It cannot work out on
+its own that the power is failing; nothing it can see has changed. That single
+fact is what the whole shutdown side of this project is about, and
+`shutdown_method` is nothing more than the choice of **how a machine is told**:
+
+| `shutdown_method` | Who issues the poweroff | How the machine learns | What the far end needs | Survives a dead LAN |
+|---|---|---|---|---|
+| **`native`** | the machine itself | its own `upsmon` reads the primary's `upsd` over the LAN | `nut-client` and a working network | ❌ |
+| **`ssh`** | the primary | it doesn't — it just receives a command | `sshd`, an authorised key, passwordless `sudo shutdown` | ❌ |
+| **`serial`** | the primary | it doesn't — it just receives a command | a console cable and an auto-login getty | ✅ |
+| **`none`** | nobody | — | — | — |
+
+A machine holds **exactly one** of these. They are alternatives, not layers.
+
+### `native` does *not* need a USB cable on the remote machine
+
+This is the single most misunderstood point in the whole design. A `native`
+machine runs its own `upsmon`, and that `upsmon` opens a **TCP connection over
+the LAN** to the primary's `upsd` on **port 3493**. It reads the UPS status from
+the primary and, when that status goes critical, powers **itself** off. The
+primary pushes nothing at it and does not run any command on it.
+
+It is a *network subscription* to the primary's view of a UPS — not a local
+reading of one. That is why `monitor add --method native` sets up a `LISTEN`
+line, an `upsd.users` account and an nftables rule: **all of that machinery
+exists for one purpose, opening TCP 3493 to that one host safely.** None of it
+has anything to do with cabling.
+
+`ssh` and `serial` are the opposite shape. The primary makes the decision, and
+pushes a command out:
+
+- **`ssh`** — the primary runs `ssh <alias> '<shutdown_cmd>'`. Needs the LAN up,
+  a key in place, and passwordless `sudo` on the far end.
+- **`serial`** — the primary writes the command down a USB-serial cable into the
+  far end's console getty. Needs **nothing but the cable** — no network, no
+  keys, no accounts, no agent.
+
+### Why the choice matters here
+
+The router, the modem and all three network switches in this deployment are on
+**one UPS**. If that UPS drops, the LAN drops with it — and both `native` and
+`ssh` die at the same instant, because both of them are the network. Serial is
+point-to-point copper between two boxes: it keeps working with every switch in
+the rack dark.
+
+So: **for a machine that must die cleanly during a network outage, `serial` is
+the robust choice. `ssh` is the convenient one.** `native` is the
+credential-minimal one, and the only one that still works when this host's own
+poll loop isn't running — but it needs the network just as much as `ssh` does.
+
+Which to pick:
+
+| If the machine… | Use |
+|---|---|
+| must shut down even when the LAN is dark | **`serial`** (run a console cable to it) |
+| can run `nut-client` and you'd rather not hand out shutdown credentials | **`native`** |
+| is reachable over SSH and losing it in a network outage is acceptable | **`ssh`** |
+| is inventory you never want powered off automatically | **`none`** (or list it under `devices`, below) |
+
+Full analysis of the trade-offs, including the primary-dies-first hole:
+[Shutdown mechanisms](https://kleinpanic.github.io/ups-orchestrator/Shutdown-Mechanisms/).
+
+### ⚠️ The serial baud trap
+
+`stty -F <device> <rate>` returns **exit 0** for 9600, 19200, 115200 and 0
+alike. A wrong-but-valid baud is therefore **undetectable**: the orchestrator
+configures the local line, writes the shutdown command down the wire as garbage,
+reports success (rc 0), and the machine never shuts down. Nothing anywhere logs
+a problem.
+
+The baud you declare must match the far end's getty **exactly**. Find it *on the
+machine you are wiring to*:
+
+```bash
+systemctl cat serial-getty@ttyS0.service                  # the full unit + overrides
+systemctl show serial-getty@ttyS0 -p ExecStart --value    # just the agetty line
+```
+
+The rate is the bare number in the `agetty` arguments (`-L %I 115200 $TERM`).
+Substitute the tty your cable is actually attached to. Any baud printed anywhere
+in this repo's documentation is an **example** — never a value to copy.
+
+Once wired, prove the cable end-to-end without shutting anything down:
+
+```bash
+ups-orchestrator shutdown rehearse <machine>   # pushes a harmless logger line,
+                                               # never the real shutdown_cmd
+```
+
 ## Architecture
 
 ```mermaid
 flowchart LR
   subgraph HW["Power"]
-    UPS[("UPS × N<br/>(USB/serial)")]
+    UPS[("UPS × N<br/>every data cable<br/>lands on THIS host")]
   end
   subgraph NUT["Network UPS Tools"]
     DRV[driver] --> UPSD[upsd]
@@ -57,7 +149,8 @@ flowchart LR
   WATCH --> EVENTS
   EVENTS -->|embeds| DISCORD["Discord webhook"]
   CTL -->|embeds| DISCORD
-  EVENTS -->|gated policy| SHUT["shutdown targets<br/>serial · SSH · local"]
+  EVENTS -->|gated policy| SHUT["pushes: serial · SSH<br/>then this host, last"]
+  UPSD -.->|"TCP 3493 subscription"| NATIVE["native secondaries<br/>halt themselves"]
   REC --> STORE[("samples · state · JSONL logs<br/>/var/lib")]
   WATCH --> STORE
 ```
@@ -71,22 +164,24 @@ flowchart LR
   `deploy/upssched-cmd.sh` to `ups-orchestrator <event> $UPSNAME`, which posts a
   labeled embed for that UPS.
 - **Opt-in shutdown policy, local last.** The top-level `shutdown` policy is the
-  single place that enables or disables orchestrator-managed shutdowns. It is
-  off by default. `shutdown.external` controls SSH/serial targets, and
-  `shutdown.internal` controls the local host. A target command only runs when
-  the policy is enabled, the relevant group is enabled, the UPS is on battery
+  single place that enables or disables orchestrator-managed pushes. It is
+  **off by default**, and it gates only the pushes (`serial` / `ssh`) plus this
+  host's own poweroff. `shutdown.external` controls the pushes,
+  `shutdown.internal` controls the local host. A command only runs when the
+  policy is enabled, the relevant group is enabled, the UPS has been on battery
   long enough, and the UPS is close to empty by the central battery/runtime
-  thresholds:
-  - `remote`: over SSH (`host` may be an `ssh_config` alias; omit `user`).
-  - `serial`: over a serial console (`device`+`baud`) to a passwordless/
-    auto-login getty. **Network-independent**, so it still works during an outage
-    when SSH can't reach the box. That makes it the right primary path for power
-    loss.
-  - `local`: this host; always runs *after* every enabled remote/serial target on
-    the UPS, so the watcher host dies last.
+  thresholds. Serial fires before ssh (serial doesn't need the network that is
+  probably dying), and this host powers off **last**, after every push on that
+  UPS has been attempted.
 
-  NUT's `upsmon SHUTDOWNCMD` stays as a low-battery backstop. All orchestrator
-  shutdowns are disabled by default.
+  **`native` machines are not in this picture at all.** They are not pushed to,
+  so nothing here gates them — their `upsmon` reacts to NUT's own low-battery
+  condition on the primary, with thresholds configured in NUT, not here. Turning
+  `shutdown.enabled` off does not disarm a native secondary; only
+  `monitor remove` does, because that is what runs the real teardown on the
+  remote box.
+
+  NUT's `upsmon SHUTDOWNCMD` stays as this host's own low-battery backstop.
 - **Configurable poll loop, decoupled from webhooks.** A `systemd --user` service
   (`ups-orchestrator watch`) polls every `poll_seconds` to evaluate the central
   shutdown policy; the on-battery countdown posts on its own `countdown_every_seconds`
@@ -95,8 +190,8 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    PWR["⚡ Utility power"] -->|USB| UPS["🔋 UPS(es)"]
-    UPS --> HOST["Host · NUT server"]
+    PWR["⚡ Utility power"] -->|mains| UPS["🔋 UPS × 3"]
+    UPS -->|"USB data cable<br/>(ALL of them, to this one host)"| HOST["NUT primary<br/>· the only box that sees a UPS"]
     HOST --> UPSD["upsd"] --> UPSMON["upsmon"]
 
     UPSMON -->|low battery| SDC["SHUTDOWNCMD<br/>(protects this host)"]
@@ -105,36 +200,38 @@ flowchart LR
     WATCH["watch loop<br/>(poll every poll_seconds)"] -->|"shutdown policy"| ORCH
 
     ORCH -->|"alerts + countdown"| DISCORD["🟦 Discord embeds"]
-    ORCH --> SER["serial → console"]
-    ORCH --> SSHX["ssh → host / alias"]
-    ORCH --> LOC["local · last"]
+    ORCH -->|"pushes a command"| SER["serial → console cable<br/>(no network needed)"]
+    ORCH -->|"pushes a command"| SSHX["ssh → alias<br/>(needs the LAN)"]
+    ORCH --> LOC["this host · last"]
+
+    UPSD -.->|"TCP 3493 — the remote SUBSCRIBES<br/>and halts ITSELF"| NAT["native secondary<br/>its own upsmon"]
 
     classDef nut fill:#0b3d2e,stroke:#34d399,color:#d1fae5;
     classDef orch fill:#1e1b4b,stroke:#a5b4fc,color:#eef2ff;
     classDef sink fill:#0c4a6e,stroke:#38bdf8,color:#e0f2fe;
-    class UPSD,UPSMON,SCHED,SDC nut
+    class UPSD,UPSMON,SCHED,SDC,NAT nut
     class ORCH,WATCH orch
     class DISCORD,SER,SSHX,LOC sink
 ```
 
 Two paths run independently: Discord *alerts* come from **NUT events**
-(`upssched`), while policy-gated *shutdowns* come from the **poll loop**
-(`watch`). Each shutdown target picks its own transport: serial console
-(network-independent, best during an outage), SSH (a host or `ssh_config`
-alias), or the local host. The shutdown order is fixed below:
+(`upssched`), while policy-gated *pushes* come from the **poll loop** (`watch`).
+Note the dotted line — a `native` secondary hangs off `upsd`, not off the
+orchestrator, and fires with no involvement from anything in this repo. The
+order in which the rest fires is fixed:
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant W as watch (poll)
     participant U as UPS
-    participant R as serial / ssh targets
-    participant L as local host
+    participant R as pushed machines (serial, then ssh)
+    participant L as this host
     Note over W,U: every poll_seconds while on battery
     U-->>W: on battery long enough + close to empty
-    W->>R: shut down external targets, if enabled
-    U-->>W: internal group also enabled + close to empty
-    W->>L: shut down local — only after every remote was sent
+    W->>R: push the shutdown command, if shutdown.external is on
+    U-->>W: shutdown.internal also on + close to empty
+    W->>L: power off — only after every push was attempted
 ```
 
 ## Notifications
@@ -191,89 +288,87 @@ export UPS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
   "onbatt_notify_grace_seconds": 20, // a transfer must persist this long before it
                                  // pages (suppresses grid blips + self-test transfers)
   "shutdown": {
-    "enabled": false,            // master switch for orchestrator shutdowns
+    "enabled": false,            // master switch for PUSHES (serial/ssh) + this host.
+                                 // Does NOT affect a native secondary — see below.
     "require_power_outage": true,
     "min_on_battery_seconds": 120,
     "notify": true,              // Discord attempt/result messages
-    "external": {                // serial + SSH targets
+    "external": {                // the serial + ssh pushes
       "enabled": false,
       "battery_below": 15,
       "runtime_below": 300
     },
-    "internal": {                // local host target
+    "internal": {                // this host's own poweroff
       "enabled": false,
       "battery_below": 10,
       "runtime_below": 120
     }
   },
+  "monitored_machines": [],      // written by `monitor add`, not by hand
   "upses": {
-    "ups1": {
-      "label": "Rack UPS",
-      "shutdown_targets": [
-        { "name": "bigserver", "kind": "serial", "enabled": false,
-          "device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0",
-          "baud": 9600,   // MATCH YOUR CONSOLE'S ACTUAL BAUD — see warning below
-          "cmd": "sudo /sbin/shutdown -h now" },
-        { "name": "fileserver", "kind": "remote", "enabled": false,
-          "host": "mt", "cmd": "sudo /sbin/shutdown -h now" },
-        { "name": "this-host", "kind": "local", "enabled": false,
-          "cmd": "sudo /sbin/shutdown -h now" }
-      ]
-    },
-    "ups2": { "label": "Desk UPS", "shutdown_targets": [] }
+    "ups1": { "label": "Rack UPS" },
+    "ups2": { "label": "Desk UPS" }
   }
 }
 ```
 
-> **⚠️ Baud is yours to declare, and a wrong value is silent.** `stty` only
-> configures the *local* tty — it returns success at essentially any
-> recognised rate on the same physical line, so a mismatched baud sends
-> garbage down the wire and the orchestrator reports success anyway (rc 0, no
-> shutdown). It cannot detect a far-end speed mismatch, only a rejected local
-> line configuration. Declare the real speed of the console you're wiring to
-> (`9600` above matches this project's own rpi5 console — do not copy it
-> blindly).
-
-Shutdown policy:
-- `shutdown.enabled` is the master switch. If it is false, no external or
-  internal target command runs.
+Shutdown policy — what it does and does **not** control:
+- `shutdown.enabled` is the master switch for everything this host *pushes*. If
+  it is false, no `serial` or `ssh` command runs and this host does not power
+  itself off.
+- **It has no effect on a `native` machine.** A native secondary's authority
+  lives in that box's own `/etc`, reacting to NUT's low-battery condition with
+  thresholds configured in NUT. Nothing here arms or disarms it; only
+  `monitor remove <name>` does, because that is what runs the real teardown on
+  the remote host.
 - `require_power_outage` and `min_on_battery_seconds` prevent short utility
-  blips from triggering machine shutdowns.
-- If both battery and runtime readings exist, both must be at or below their
-  group thresholds before a target fires. That prevents a percentage threshold
-  from shutting machines down while the UPS still reports healthy runtime.
-- `external.enabled` covers `serial` and `remote`; `internal.enabled` covers
-  `local`. Local targets run only after enabled external targets have been sent.
+  blips from shutting machines down.
+- If both battery and runtime readings exist, **both** must be at or below the
+  group thresholds before anything fires. That stops a percentage threshold
+  from acting while the UPS still reports healthy runtime. A UPS that reports
+  neither reading never opens the gate at all — deliberately, since firing on a
+  bad read would power off every box on that UPS.
+- `external.enabled` covers the `serial`/`ssh` pushes; `internal.enabled`
+  covers this host, which always goes last.
 
-Per target transport (`shutdown_targets[]` is **LEGACY** — see
-`monitored_machines` below for the current per-machine model):
-- **`kind`**: `serial` (`device`+`baud`, to a passwordless/auto-login getty;
-  network-independent), `remote` (`host` is a hostname *or* `ssh_config` alias;
-  omit `user` for `ssh <alias>`), or `local`.
-- **Ordering**: `local` targets always run *after* every enabled serial/remote
-  target on the UPS, so the watcher host dies last; serial fires before ssh
-  when both are due, since serial doesn't depend on the network being up.
-- `local` targets need passwordless shutdown (set up by `deploy/install.sh`);
-  `serial`/`remote` need a passwordless console/SSH on the far end.
+<details>
+<summary><code>shutdown_targets[]</code> — the legacy per-UPS array (back-compat only)</summary>
+
+Before the per-machine model, each UPS carried a `shutdown_targets[]` array of
+transports: `kind` `serial` (`device`+`baud`), `remote` (SSH; `host` may be an
+`ssh_config` alias), or `local` (this host). It is still parsed so existing
+configs keep loading, but new enrollments go through `monitor add`. `serial`
+maps onto `shutdown_method: serial`, `remote` onto `ssh`; `local` has no
+per-machine equivalent, since this host is never enrolled as a machine. Full
+reference: [docs/Shutdown-Targets.md](https://kleinpanic.github.io/ups-orchestrator/Shutdown-Targets/).
+
+</details>
 
 ### Monitored machines (`monitored_machines`)
 
-The current, non-legacy way to enroll a machine's shutdown authority. Each
-entry carries exactly one `shutdown_method`: `none` (default), `native` (a
-real NUT secondary — `upsmon` on that box shuts it down when the primary
-raises FSD), `serial` (push over a console cable), or `ssh` (push over SSH).
-A machine can never hold two authorities on the same UPS at once — see
-[docs/Configuration.md](https://kleinpanic.github.io/ups-orchestrator/Configuration/)
+The current, non-legacy way to enroll a machine's shutdown authority — one
+entry per machine, carrying exactly one `shutdown_method` (see the table at the
+top of this README for what each one means). A machine can never hold two
+authorities at once; `monitor add` refuses the transition rather than leaving
+two live. See
+[Configuration](https://kleinpanic.github.io/ups-orchestrator/Configuration/)
 for the full field reference, the mutual-exclusion/degrade behaviour, the
-per-transport `shutdown_cmd` rule, and the `monitor add/list/verify/remove`
-CLI.
+per-transport `shutdown_cmd` rule, and the `monitor add/list/verify/remove` CLI.
 
 ```bash
+# serial: record-only, no --ssh needed. The baud below is an EXAMPLE — read the
+# real one off the far end (systemctl show serial-getty@<tty> -p ExecStart --value).
 sudo ups-orchestrator monitor add mt --method serial \
      --serial-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0 \
-     --serial-baud 9600 --ups cyberpower
+     --serial-baud 115200 --ups cyberpower
+
+# native: bootstraps a real NUT secondary on that box over the ssh alias, and
+# opens TCP 3493 to it. The alias is used at ENROLLMENT time, not at outage time.
 sudo ups-orchestrator monitor add spark --method native --ssh spark --ups cyberpower3
-ups-orchestrator monitor list
+
+ups-orchestrator monitor list           # declared vs. effective method, plus any degrade notices
+ups-orchestrator monitor verify spark   # "will this machine actually shut down?"
+ups-orchestrator remote-shutdown --dry-run   # every target + its CURRENT gate verdict; touches nothing
 ```
 
 ### What else is on a UPS (`devices`)
@@ -300,6 +395,10 @@ memory that goes stale the moment the hardware is recabled.
 Machines the orchestrator *does* shut down are **not** repeated here — they stay
 in `monitored_machines`, and `status` (`Shuts` / `Powers` rows) and the daily
 report derive both lists from one call, so the two cannot drift apart.
+
+This is where you record the fact that decides everything above: **the UPS that
+carries the router, the modem and the switches.** When that one goes, `native`
+and `ssh` go with it, and only `serial` still reaches anything.
 
 Config path resolves to `$UPS_ORCH_CONFIG`, else `/etc/ups-orchestrator/config.json`,
 else `<repo>/config.json`. State resolves similarly via `$UPS_ORCH_STATE` /

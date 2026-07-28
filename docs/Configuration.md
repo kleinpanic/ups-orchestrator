@@ -115,8 +115,12 @@ entries are added by `monitor add`, not by hand.
 | `backup` | `{enabled: false, kind: "remote"}` | **LEGACY.** Still parsed for back-compat; drop it from new entries — see below |
 
 !!! danger "Baud is yours to declare — and a wrong value is invisible to the orchestrator"
-    The live rpi5 console line here runs at **9600**. Declare the *real* baud of
-    the machine you are enrolling; do not copy a value from another console.
+    There is no default worth trusting and no rate this document can tell you.
+    Declare the *real* baud of the machine you are enrolling — read it off the
+    far end with `systemctl cat serial-getty@<tty>.service` on that machine.
+    Never copy a value from another console: this deployment's own Dell runs at
+    **115200**, and an earlier revision of these docs claimed 9600, which would
+    have written garbage down the wire and reported success.
     `stty -F <device> <baud>` only configures the **local** tty — it returns
     success for 9600, 19200, 115200, and effectively any recognised rate on the
     same physical line, and the byte write completes regardless of whether the
@@ -161,7 +165,7 @@ scoped for this phase and **dropped**; it may return in a future phase.
     "name": "mt",
     "shutdown_method": "serial",
     "serial_device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0",
-    "serial_baud": 9600,
+    "serial_baud": 9600,   // EXAMPLE ONLY — read yours off the far end
     "ups": "cyberpower"
   },
   {
@@ -205,7 +209,7 @@ scoped for this phase and **dropped**; it may return in a future phase.
 # event, so the CLI refuses the dead-letter record up front.
 sudo ups-orchestrator monitor add mt --method serial \
      --serial-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0 \
-     --serial-baud 9600 --ups cyberpower
+     --serial-baud 9600 --ups cyberpower   # 9600 is an EXAMPLE — use the far end's real rate
 
 sudo ups-orchestrator monitor add spark --method native --ssh spark --ups cyberpower3 --os ubuntu
 

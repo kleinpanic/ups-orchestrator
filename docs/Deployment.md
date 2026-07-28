@@ -222,12 +222,13 @@ tty only** — none of this should loosen SSH or the physical console login:
    ```ini
    [Service]
    ExecStart=
-   ExecStart=-/sbin/agetty --autologin youruser -L %I 9600 $TERM
+   ExecStart=-/sbin/agetty --autologin youruser -L %I 9600 $TERM   # 9600 = EXAMPLE
    ```
 
    (The exact flags depend on your distro's `agetty` version — treat this as
    a starting point to verify against `man agetty` on the target, not a
-   drop-in guarantee.) The baud given here (`9600` above) **must match** what
+   drop-in guarantee.) The baud given here (`9600` is only an EXAMPLE — this deployment's Dell
+   console actually runs at 115200) **must match** what
    the primary declares as `serial_baud` for this machine — see the baud
    call-out in [Configuration](Configuration.md). A mismatch here is exactly
    the silent failure mode described there: the write still "succeeds" (rc 0)

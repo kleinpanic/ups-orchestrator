@@ -65,6 +65,7 @@
           "kind": "serial",
           "enabled": false,
           "device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART-if00-port0",
+          "baud__comment": "EXAMPLE ONLY - must equal the far end getty rate; read it with systemctl cat serial-getty@<tty>",
           "baud": 9600,
           "cmd": "sudo /sbin/shutdown -h now"
         },
