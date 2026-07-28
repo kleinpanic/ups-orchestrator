@@ -2,12 +2,45 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 
 UPSC_BIN = shutil.which("upsc") or "/bin/upsc"
 UPSCMD_BIN = shutil.which("upscmd") or "/bin/upscmd"
+
+LOG = logging.getLogger("ups_orchestrator.nut")
+
+# Throttled per UPS: the recorder polls every few seconds, so an unthrottled
+# warning would bury the journal during the very outage it exists to surface.
+_FAILURE_LOG_INTERVAL_SECONDS = 300.0
+_last_failure_log: dict[str, float] = {}
+
+
+def _note_upsc_failure(ups_name: str, detail: str) -> None:
+    """Record that ``upsc`` could not be read, at most once per interval per UPS.
+
+    This module used to swallow every failure and return an empty result. That
+    silence is what let a two-day outage pass unnoticed: upsd stopped listening
+    on localhost, ``upsc`` was refused on every poll, the recorder wrote nulls,
+    and every renderer printed "unknown" — so a total communications loss and a
+    genuinely idle UPS produced identical output. Nothing anywhere said "I could
+    not read this". A log line is the cheapest thing that would have caught it.
+    """
+    now = time.monotonic()
+    last = _last_failure_log.get(ups_name)
+    if last is not None and now - last < _FAILURE_LOG_INTERVAL_SECONDS:
+        return
+    _last_failure_log[ups_name] = now
+    LOG.warning("upsc %s: read failed — %s", ups_name, detail or "no detail")
+
+
+def _note_upsc_success(ups_name: str) -> None:
+    """Clear the throttle, and say so if this UPS had been failing."""
+    if _last_failure_log.pop(ups_name, None) is not None:
+        LOG.info("upsc %s: communication restored", ups_name)
 
 
 def upscmd(
@@ -61,10 +94,13 @@ def upsc_vars(ups_name: str, timeout: float = 10.0) -> dict[str, str]:
             text=True,
             timeout=timeout,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        _note_upsc_failure(ups_name, str(exc))
         return {}
     if result.returncode != 0:
+        _note_upsc_failure(ups_name, result.stderr.strip())
         return {}
+    _note_upsc_success(ups_name)
     values: dict[str, str] = {}
     for raw in result.stdout.splitlines():
         key, separator, value = raw.partition(":")

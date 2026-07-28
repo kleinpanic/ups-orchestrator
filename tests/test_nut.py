@@ -195,3 +195,80 @@ def test_numeric_parsers_reject_garbage() -> None:
     assert nut._as_int(None) is None
     assert nut._as_float("nope") is None
     assert nut._as_float(None) is None
+
+
+# --- upsc failure is no longer silent ----------------------------------------
+
+
+def _failing_run(stderr: str = "Connection failure: Connection refused"):
+    class _Result:
+        returncode = 1
+        stdout = ""
+
+    def _run(*_a, **_k):
+        result = _Result()
+        result.stderr = stderr
+        return result
+
+    return _run
+
+
+def test_upsc_failure_is_logged(monkeypatch, caplog) -> None:
+    # Two days of monitoring were lost because every failure path returned an
+    # empty dict in silence: a total comms loss and an idle UPS rendered
+    # identically as "unknown", and nothing anywhere said "I could not read this".
+    nut._last_failure_log.clear()
+    monkeypatch.setattr(nut.subprocess, "run", _failing_run())
+    with caplog.at_level("WARNING", logger="ups_orchestrator.nut"):
+        assert nut.upsc_vars("ups1") == {}
+    assert any("read failed" in r.getMessage() for r in caplog.records)
+
+
+def test_repeated_upsc_failures_are_throttled(monkeypatch, caplog) -> None:
+    # The recorder polls every few seconds; unthrottled this would bury the
+    # journal during the very outage it exists to surface.
+    nut._last_failure_log.clear()
+    monkeypatch.setattr(nut.subprocess, "run", _failing_run())
+    monkeypatch.setattr(nut.time, "monotonic", lambda: 1000.0)
+    with caplog.at_level("WARNING", logger="ups_orchestrator.nut"):
+        for _ in range(5):
+            nut.upsc_vars("ups1")
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+
+def test_upsc_failure_logs_again_after_the_interval(monkeypatch, caplog) -> None:
+    nut._last_failure_log.clear()
+    monkeypatch.setattr(nut.subprocess, "run", _failing_run())
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(nut.time, "monotonic", lambda: clock["t"])
+    with caplog.at_level("WARNING", logger="ups_orchestrator.nut"):
+        nut.upsc_vars("ups1")
+        clock["t"] += nut._FAILURE_LOG_INTERVAL_SECONDS + 1
+        nut.upsc_vars("ups1")
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2
+
+
+def test_recovery_after_failure_is_logged(monkeypatch, caplog) -> None:
+    nut._last_failure_log.clear()
+    monkeypatch.setattr(nut.subprocess, "run", _failing_run())
+    nut.upsc_vars("ups1")
+
+    class _Ok:
+        returncode = 0
+        stdout = "ups.status: OL\n"
+        stderr = ""
+
+    monkeypatch.setattr(nut.subprocess, "run", lambda *_a, **_k: _Ok())
+    with caplog.at_level("INFO", logger="ups_orchestrator.nut"):
+        assert nut.upsc_vars("ups1") == {"ups.status": "OL"}
+    assert any("communication restored" in r.getMessage() for r in caplog.records)
+
+
+def test_each_ups_is_throttled_independently(monkeypatch, caplog) -> None:
+    nut._last_failure_log.clear()
+    monkeypatch.setattr(nut.subprocess, "run", _failing_run())
+    monkeypatch.setattr(nut.time, "monotonic", lambda: 1000.0)
+    with caplog.at_level("WARNING", logger="ups_orchestrator.nut"):
+        nut.upsc_vars("ups1")
+        nut.upsc_vars("ups2")
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2
