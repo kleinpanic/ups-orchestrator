@@ -429,6 +429,38 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         '        deps,\n        "shutdown_result",',
         "events: shutdowns_sent append gated on success (T-02-24 local starvation)",
     ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    needed = [line for line in (loopback_line, lan_line) if line not in active]",
+        "    needed = [line for line in (lan_line,) if line not in active]  # mutated",
+        "nutclient: upsd.conf loses its loopback LISTEN — upsd dies on a boot before DHCP",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "    was_clean = previous_boot_ended_cleanly() if clean_shutdown is None else clean_shutdown\n"
+        "    if was_clean:",
+        "    was_clean = previous_boot_ended_cleanly() if clean_shutdown is None else clean_shutdown\n"
+        "    if False:  # mutated — a clean reboot alerts as an outage again",
+        "audit: clean-shutdown gate dropped (deliberate poweroff pages as power loss)",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "    if window.active:",
+        "    if False:  # mutated — maintenance window no longer suppresses",
+        "audit: maintenance window ignored (operator-declared downtime still pages)",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "        active=now < float(until),",
+        "        active=True,  # mutated — window never expires",
+        "audit: maintenance window never expires (a forgotten window silences real outages)",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "        if when - first <= window:",
+        "        if True:  # mutated — late journald rotation counts as boot evidence",
+        "audit: boot-evidence window dropped (stale journal lines alarm a healthy host)",
+    ),
 ]
 
 
