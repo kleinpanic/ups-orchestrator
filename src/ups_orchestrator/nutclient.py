@@ -253,19 +253,42 @@ def _strip_managed_block(text: str) -> str:
     return text[:start] + text[end:]
 
 
-def upsert_upsd_listen(text: str, lan_ip: str, port: int = 3493) -> tuple[str, bool]:
-    """Add a LAN ``LISTEN`` line inside the MANAGED block, idempotently. PURE.
+def _active_directives(text: str) -> list[str]:
+    """Return the non-comment, non-blank directive lines of ``text``, stripped."""
+    lines = (raw.strip() for raw in text.splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
 
-    Returns ``(new_text, changed)``. If ``LISTEN <lan_ip> <port>`` is already
-    present anywhere, returns ``(text, False)`` — the operator's own localhost
-    LISTEN lines are never touched. Otherwise the LAN line is (re)rendered inside
-    a ``# BEGIN/END ups-orchestrator MANAGED`` block appended to the file.
+
+def upsert_upsd_listen(text: str, lan_ip: str, port: int = 3493) -> tuple[str, bool]:
+    """Add loopback + LAN ``LISTEN`` lines inside the MANAGED block, idempotently. PURE.
+
+    Returns ``(new_text, changed)``. Only the lines that are not already ACTIVE
+    outside the MANAGED block are rendered, so an operator's own ``LISTEN`` lines
+    are honoured rather than duplicated.
+
+    The loopback line is not optional. ``upsd`` listens on ``localhost:3493``
+    when the file contains NO ``LISTEN`` statement at all, and Debian ships the
+    file with every ``LISTEN`` commented out — so a file that reads as "no LISTEN
+    configured" is really "listening on localhost". Writing the first explicit
+    LISTEN REPLACES that implicit default, which cost two failures:
+
+    1. Every bare ``upsc <name>`` (localhost) was refused, silently zeroing the
+       recorder, the daily report, ``audit``, ``baseline`` and the dashboard.
+    2. Worse, on a boot where ``eth0`` had no DHCP lease yet, the LAN address was
+       the ONLY candidate; ``upsd`` logged "no listening interface available" and
+       exited, and systemd's restart limit then left nut-server dead entirely.
+
+    Loopback always exists before networking does, so keeping it in the block
+    makes ``upsd`` survive an early boot and keeps local clients working.
     """
-    listen_line = f"LISTEN {lan_ip} {port}"
-    if listen_line in text:
-        return text, False
+    lan_line = f"LISTEN {lan_ip} {port}"
+    loopback_line = f"LISTEN 127.0.0.1 {port}"
     stripped = _strip_managed_block(text)
-    block = f"{_UPSMON_BEGIN}\n{listen_line}\n{_UPSMON_END}\n"
+    active = _active_directives(stripped)
+    needed = [line for line in (loopback_line, lan_line) if line not in active]
+    if not needed:
+        return text, False
+    block = f"{_UPSMON_BEGIN}\n" + "\n".join(needed) + f"\n{_UPSMON_END}\n"
     if stripped == "" or stripped.endswith("\n"):
         new_text = stripped + block
     else:

@@ -510,6 +510,40 @@ def test_upsd_listen_respects_custom_port():
     assert "LISTEN 192.168.1.125 3494" in text
 
 
+def _active(text: str) -> list[str]:
+    lines = (raw.strip() for raw in text.splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def test_upsd_listen_keeps_loopback_when_file_has_no_active_listen():
+    # THE REGRESSION. Debian ships upsd.conf with every LISTEN commented out,
+    # and upsd reads "no LISTEN at all" as "listen on localhost". Writing only
+    # the LAN line replaced that implicit default: bare `upsc` was refused for
+    # two days, and a boot before eth0 had a DHCP lease left upsd with no
+    # bindable address at all, so it exited and systemd gave up on nut-server.
+    conf = "# LISTEN 127.0.0.1 3493\n# LISTEN ::1 3493\n"
+    text, changed = nutclient.upsert_upsd_listen(conf, "192.168.1.125")
+    assert changed is True
+    assert "LISTEN 127.0.0.1 3493" in _active(text)
+    assert "LISTEN 192.168.1.125 3493" in _active(text)
+
+
+def test_upsd_listen_adds_loopback_to_a_lan_only_managed_block():
+    # Repairs a host already damaged by the old behaviour: the LAN line is
+    # present inside the MANAGED block, loopback is missing, and re-running
+    # must add loopback WITHOUT dropping the LAN line while restripping.
+    damaged = f"{nutclient._UPSMON_BEGIN}\nLISTEN 192.168.1.125 3493\n{nutclient._UPSMON_END}\n"
+    text, changed = nutclient.upsert_upsd_listen(damaged, "192.168.1.125")
+    assert changed is True
+    assert _active(text) == ["LISTEN 127.0.0.1 3493", "LISTEN 192.168.1.125 3493"]
+
+
+def test_upsd_listen_does_not_duplicate_an_operators_own_loopback_line():
+    conf = "LISTEN 127.0.0.1 3493\n"
+    text, _ = nutclient.upsert_upsd_listen(conf, "192.168.1.125")
+    assert _active(text).count("LISTEN 127.0.0.1 3493") == 1
+
+
 # --- upsert_upsd_users (pure, rotation-aware) --------------------------------
 
 
