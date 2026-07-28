@@ -25,19 +25,38 @@ fi
 [ -x "$PY" ] || { echo "no venv at $PY — run 'make venv' first" >&2; exit 1; }
 [ -f "$CONF" ] || { echo "$CONF does not exist" >&2; exit 1; }
 
+# T-03-08: UPSD_LAN_IP is written verbatim into a NUT config as root. A newline
+# would inject an arbitrary directive, so reject anything that is not a bare
+# address before it can reach the file.
+_valid_addr() {
+  case "$1" in
+    *[!0-9a-fA-F.:]*|"") return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Reuse whatever LAN address is already configured. If there is none, pass
 # loopback as the LAN address too — upsert_upsd_listen dedupes, so the result is
 # a single loopback LISTEN rather than a bogus second line.
 LAN_IP="${UPSD_LAN_IP:-$(awk '$1=="LISTEN" && $2!="127.0.0.1" && $2!="::1" {print $2; exit}' "$CONF")}"
 LAN_IP="${LAN_IP:-127.0.0.1}"
+_valid_addr "$LAN_IP" || { echo "refusing: LAN address $LAN_IP is not a bare IP" >&2; exit 1; }
+case "$PORT" in ''|*[!0-9]*) echo "refusing: port $PORT is not numeric" >&2; exit 1 ;; esac
 
 BACKUP="$CONF.bak-$(date +%s)"
 cp -p "$CONF" "$BACKUP"
 
 # Written in place (not via a temp + rename) so the destination inode keeps its
 # mode, owner and ACL — the metadata-destroying replace this repo already had to
-# fix once in state.py. The backup above covers a crash mid-write.
-if "$PY" - "$CONF" "$LAN_IP" "$PORT" <<'PYEOF'
+# fix once in state.py (T-02-23). The backup above covers a crash mid-write, and
+# T-03-05 is why the exit codes below are distinct: an exception and a no-op both
+# exited non-zero before, so a TRUNCATED file took the "nothing to do" branch,
+# deleted its own backup, and then restarted nut-server against the wreckage.
+#
+# `-P` (T-03-01) keeps CWD off sys.path. Without it root imports from whatever
+# directory the caller happened to be in — including ones uid `nut` owns.
+set +e
+"$PY" -P - "$CONF" "$LAN_IP" "$PORT" <<'PYEOF'
 import pathlib
 import sys
 
@@ -45,17 +64,22 @@ from ups_orchestrator.nutclient import upsert_upsd_listen
 
 conf, lan_ip, port = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 new_text, changed = upsert_upsd_listen(conf.read_text(), lan_ip, port)
-if changed:
-    with conf.open("w") as handle:
-        handle.write(new_text)
-sys.exit(0 if changed else 1)
+if not changed:
+    sys.exit(10)
+with conf.open("w") as handle:
+    handle.write(new_text)
+sys.exit(0)
 PYEOF
-then
-  echo "upsd.conf: loopback LISTEN added (backup: $BACKUP)"
-else
-  rm -f "$BACKUP"
-  echo "upsd.conf: loopback LISTEN already present — nothing to do"
-fi
+rc=$?
+set -e
+
+case "$rc" in
+  0)  echo "upsd.conf: loopback LISTEN added (backup: $BACKUP)" ;;
+  10) rm -f "$BACKUP"; echo "upsd.conf: loopback LISTEN already present — nothing to do" ;;
+  *)  cp -p "$BACKUP" "$CONF"
+      echo "rewrite FAILED (rc=$rc) — $CONF restored from $BACKUP, nut-server NOT restarted" >&2
+      exit 1 ;;
+esac
 
 echo "--- active LISTEN lines ---"
 grep -E '^\s*LISTEN' "$CONF" || echo "(none)"

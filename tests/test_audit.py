@@ -368,3 +368,75 @@ def test_real_dirty_bit_line_is_still_power_loss_evidence() -> None:
     # The complement: tightening the list must not blind it to genuine evidence.
     line = "systemd-fsck[394]: Dirty bit is set. Fs was not properly unmounted."
     assert audit._contains_any(line, audit._POWER_LOSS_PATTERNS)
+
+
+# --- maintenance marker hardening (T-03-04 / T-03-06) -------------------------
+
+
+def test_forged_far_future_window_is_ignored(tmp_path: Path) -> None:
+    # /var/lib/ups-orchestrator is group-writable and owned by uid `nut`, which
+    # runs the LAN-facing upsd. A marker planted there must not be able to
+    # silence outage alerting forever, so the READER caps the horizon.
+    marker = tmp_path / "maintenance.json"
+    marker.write_text(json.dumps({"until": 9_000_000_000.0, "reason": "pwned"}))
+
+    window = audit.read_maintenance(marker, now=1_000.0)
+
+    assert window.active is False
+
+
+def test_window_inside_the_cap_is_honoured(tmp_path: Path) -> None:
+    # The complement: capping must not break a legitimate declaration.
+    marker = tmp_path / "maintenance.json"
+    audit.write_maintenance(marker, until=1_000.0 + audit.MAX_MAINTENANCE_SECONDS - 1, reason="ok")
+
+    assert audit.read_maintenance(marker, now=1_000.0).active is True
+
+
+def test_symlinked_marker_is_ignored_on_read(tmp_path: Path) -> None:
+    real = tmp_path / "elsewhere.json"
+    real.write_text(json.dumps({"until": 2_000.0, "reason": "planted"}))
+    marker = tmp_path / "maintenance.json"
+    marker.symlink_to(real)
+
+    assert audit.read_maintenance(marker, now=1_000.0).active is False
+
+
+def test_write_maintenance_refuses_to_follow_a_symlink(tmp_path: Path) -> None:
+    # The metadata-preserving writer resolves symlinks on purpose; that is right
+    # for a root-owned /etc config and wrong for a marker in a directory a
+    # less-privileged account can write to.
+    victim = tmp_path / "victim.json"
+    victim.write_text("original")
+    marker = tmp_path / "maintenance.json"
+    marker.symlink_to(victim)
+
+    with pytest.raises(OSError):
+        audit.write_maintenance(marker, until=2_000.0, reason="x")
+    assert victim.read_text() == "original"
+
+
+def test_clear_maintenance_raises_rather_than_reporting_no_window(tmp_path: Path) -> None:
+    # Swallowing the error returned the same False as "nothing was open", so the
+    # CLI told the operator alerts were ARMED while suppression was still live.
+    marker = tmp_path / "sub" / "maintenance.json"
+    marker.parent.mkdir()
+    marker.write_text(json.dumps({"until": 2_000.0}))
+    marker.parent.chmod(0o500)  # unlink will fail, the file still exists
+    try:
+        with pytest.raises(OSError):
+            audit.clear_maintenance(marker)
+    finally:
+        marker.parent.chmod(0o700)
+
+
+def test_clear_maintenance_returns_false_when_absent(tmp_path: Path) -> None:
+    assert audit.clear_maintenance(tmp_path / "nope.json") is False
+
+
+def test_boolean_until_is_not_treated_as_a_timestamp(tmp_path: Path) -> None:
+    # bool is a subclass of int; True would otherwise read as until=1.0.
+    marker = tmp_path / "maintenance.json"
+    marker.write_text(json.dumps({"until": True}))
+
+    assert audit.read_maintenance(marker, now=0.0).active is False

@@ -19,11 +19,26 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "must run as root: sudo make install-config CONFIG=..." >&2
   exit 1
 fi
-[ -f "$SRC" ] || { echo "no such config: $SRC" >&2; exit 1; }
 [ -x "$PY" ] || { echo "no venv at $PY — run 'make venv' first" >&2; exit 1; }
+[ -e "$SRC" ] || { echo "no such config: $SRC" >&2; exit 1; }
+
+# T-03-03: validate-then-install across two dereferences of an attacker-supplied
+# path is a TOCTOU. `install` and `[ -f ]` both follow symlinks, so swapping $SRC
+# between the two steps landed any root-readable file in /etc as the live config.
+# Refuse a symlink outright, then stage the bytes into a root-owned file and
+# validate and install THAT — so what was checked is what lands, always.
+[ -L "$SRC" ] && { echo "refusing: $SRC is a symlink" >&2; exit 1; }
+[ -f "$SRC" ] || { echo "refusing: $SRC is not a regular file" >&2; exit 1; }
+
+STAGE="$(mktemp -p "$(dirname "$DEST")" .config.stage.XXXXXX)"
+trap 'rm -f "$STAGE"' EXIT
+chmod 0600 "$STAGE"
+cat -- "$SRC" >"$STAGE"
 
 echo "--- validating $SRC ---"
-UPS_ORCH_CONFIG="$SRC" "$PY" - "$SRC" <<'PYEOF'
+# `-P` (T-03-01) keeps CWD off sys.path so root cannot be made to import an
+# attacker's module from whatever directory the caller happened to be in.
+UPS_ORCH_CONFIG="$STAGE" "$PY" -P - "$STAGE" <<'PYEOF'
 import sys
 
 from ups_orchestrator.config import Config
@@ -38,14 +53,28 @@ for name in cfg.upses:
           f"also powers {[d.name for d in devices] or 'nothing recorded'}")
 PYEOF
 
+# T-03-02: `install` unlinks the destination and creates a NEW inode, which drops
+# every ACL entry — the same class as T-02-23, which state.py fixed on the Python
+# side only. Capture the destination's real ACL and restore it, rather than
+# re-deriving a single entry from ambient $SUDO_USER and silently losing the rest.
+ACL_SAVE=""
 if [ -f "$DEST" ]; then
+  ACL_SAVE="$(getfacl -p -- "$DEST" 2>/dev/null || true)"
   BACKUP="$DEST.bak-$(date +%s)"
   cp -p "$DEST" "$BACKUP"
   echo "backed up live config to $BACKUP"
 fi
 
-install -o root -g nut -m 0640 "$SRC" "$DEST"
-setfacl -m "u:$RUN_USER:r" "$DEST"
+install -o root -g nut -m 0640 "$STAGE" "$DEST"
+
+if [ -n "$ACL_SAVE" ]; then
+  printf '%s\n' "$ACL_SAVE" | setfacl --restore=- \
+    || { echo "ACL restore failed; falling back to u:$RUN_USER:r" >&2
+         setfacl -m "u:$RUN_USER:r" "$DEST"; }
+else
+  setfacl -m "u:$RUN_USER:r" "$DEST"
+fi
+
 echo "installed $SRC -> $DEST"
 ls -l "$DEST"
 getfacl -p "$DEST" 2>/dev/null | grep -E "^user:" || true

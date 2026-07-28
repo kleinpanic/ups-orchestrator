@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import subprocess
 import time
@@ -44,6 +46,12 @@ _CLEAN_SHUTDOWN_PATTERNS = tuple(
 # this host logged `corrupted or uncleanly shut down` for a user journal a full hour
 # into an otherwise healthy boot, and counting it alarmed on a machine that was fine.
 _BOOT_EVIDENCE_WINDOW_SECONDS = 120.0
+
+LOG = logging.getLogger("ups_orchestrator.audit")
+
+# The longest suppression any marker can buy, enforced on read. See
+# read_maintenance for why the reader and not just the writer enforces it.
+MAX_MAINTENANCE_SECONDS = 24 * 3600.0
 _UPS_EVENT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -604,8 +612,20 @@ def _read_marker(path: Path) -> str | None:
 
 
 def read_maintenance(path: Path | None, *, now: float) -> MaintenanceWindow:
-    """Read the maintenance marker, treating anything unreadable as "not active"."""
+    """Read the maintenance marker, treating anything unreadable as "not active".
+
+    The bound below is enforced by the READER, deliberately, because the writer
+    is not the only thing that can create this file. ``/var/lib/ups-orchestrator``
+    is group-writable so the ``--user`` recorder can write there, and uid ``nut``
+    — which runs the LAN-facing ``upsd`` — owns it. A lower-privileged account can
+    therefore plant a marker, and this file suppresses outage alerting. Capping
+    the horizon on read means a forged ``until: 9e9`` expires immediately instead
+    of silencing power-loss alerts forever (T-03-04).
+    """
     if path is None:
+        return MaintenanceWindow(active=False)
+    if path.is_symlink():
+        LOG.warning("maintenance marker %s is a symlink; ignoring it", path)
         return MaintenanceWindow(active=False)
     try:
         raw = json.loads(path.read_text())
@@ -614,25 +634,49 @@ def read_maintenance(path: Path | None, *, now: float) -> MaintenanceWindow:
     if not isinstance(raw, dict):
         return MaintenanceWindow(active=False)
     until = raw.get("until")
-    if not isinstance(until, (int, float)):
+    if not isinstance(until, (int, float)) or isinstance(until, bool):
+        return MaintenanceWindow(active=False)
+    until = float(until)
+    if until - now > MAX_MAINTENANCE_SECONDS:
+        LOG.warning(
+            "maintenance marker %s ends %.0fs from now, beyond the %.0fs cap; ignoring it",
+            path,
+            until - now,
+            MAX_MAINTENANCE_SECONDS,
+        )
         return MaintenanceWindow(active=False)
     return MaintenanceWindow(
-        active=now < float(until),
-        until=float(until),
+        active=now < until,
+        until=until,
         reason=str(raw.get("reason", "")),
     )
 
 
 def write_maintenance(path: Path, *, until: float, reason: str) -> None:
-    """Declare a maintenance window ending at ``until`` (unix seconds)."""
-    write_json_preserving_metadata(path, {"until": until, "reason": reason}, indent=None)
+    """Declare a maintenance window ending at ``until`` (unix seconds).
+
+    Opened ``O_NOFOLLOW``: the metadata-preserving writer used elsewhere resolves
+    symlinks on purpose (MED-03), which is right for a root-owned /etc config and
+    wrong for a marker in a directory a less-privileged account can write. A
+    planted symlink must fail this call, not be followed through (T-03-04).
+    """
+    payload = json.dumps({"until": until, "reason": reason}, sort_keys=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(payload + "\n")
 
 
 def clear_maintenance(path: Path) -> bool:
-    """End any maintenance window. Returns True if one was actually cleared."""
+    """End any maintenance window. Returns False if there was none to clear.
+
+    Deliberately lets an OSError propagate. Swallowing it returned the same
+    ``False`` as "no window existed", so the CLI printed "no window was open"
+    while suppression remained in force — a security control reporting a
+    success-shaped failure (T-03-06).
+    """
     try:
         path.unlink()
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
         return False
     return True
 

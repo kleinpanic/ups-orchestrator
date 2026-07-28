@@ -789,6 +789,29 @@ def _cmd_boot_audit(argv: list[str]) -> int:
     return 0
 
 
+def _log_maintenance(event: str, *, until: float = 0.0, reason: str = "") -> None:
+    """Record that outage alerting was suppressed or re-armed, and by whom.
+
+    The marker file carries no actor and is overwritten by the next call, so
+    without this there is no trace that alerting was ever silenced — for a
+    control whose whole effect is that nothing gets delivered, that is the one
+    record worth having (T-03-07). Never fatal: failing to log must not stop an
+    operator closing a window.
+    """
+    actor = os.environ.get("SUDO_USER") or os.environ.get("USER") or f"uid:{os.getuid()}"
+    try:
+        append_event(
+            _event_log_path(),
+            event,
+            ups_name="-",
+            ups_label="maintenance",
+            message=reason,
+            data={"actor": actor, "until": until},
+        )
+    except OSError as exc:
+        LOG.warning("maintenance: could not write the audit record: %s", exc)
+
+
 def _cmd_maintenance(argv: list[str]) -> int:
     """Declare or clear a window in which abrupt power loss is expected.
 
@@ -807,12 +830,19 @@ def _cmd_maintenance(argv: list[str]) -> int:
     path = _maintenance_path()
     now = time.time()
 
+    max_hours = audit.MAX_MAINTENANCE_SECONDS / 3600.0
     if args.action == "begin":
         if args.hours <= 0:
             _say("maintenance: --hours must be greater than 0")
             return 2
+        # Bounded because this suppresses outage alerting; read_maintenance
+        # enforces the same cap, so asking for more would silently do nothing.
+        if args.hours > max_hours:
+            _say(f"maintenance: --hours must be at most {max_hours:g} (re-run to extend)")
+            return 2
         until = now + args.hours * 3600.0
         audit.write_maintenance(path, until=until, reason=args.reason)
+        _log_maintenance("maintenance_begin", until=until, reason=args.reason)
         _say(
             f"maintenance window open until "
             f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))} "
@@ -822,7 +852,16 @@ def _cmd_maintenance(argv: list[str]) -> int:
         return 0
 
     if args.action == "end":
-        _say("maintenance window closed" if audit.clear_maintenance(path) else "no window was open")
+        try:
+            cleared = audit.clear_maintenance(path)
+        except OSError as exc:
+            # Never report this as "no window was open" — that reads as ARMED.
+            LOG.error("maintenance: could not clear %s: %s", path, exc)
+            _say(f"maintenance: FAILED to close the window ({exc}) — alerts are STILL suppressed")
+            return 1
+        if cleared:
+            _log_maintenance("maintenance_end")
+        _say("maintenance window closed" if cleared else "no window was open")
         return 0
 
     window = audit.read_maintenance(path, now=now)
