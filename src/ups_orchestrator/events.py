@@ -23,12 +23,16 @@ import fcntl
 import json
 import logging
 import os
+import secrets
+import select
 import shlex
 import stat
 import subprocess
+import termios
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from ups_orchestrator.config import (
@@ -93,6 +97,41 @@ def _default_local_shutdown(cmd: str) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+# A line configurator's contract: ``(device, baud) -> (returncode, stderr)``. Extracted
+# so the read-back probe below can be unit-tested against a pty WITHOUT reaching a real
+# `stty` — `tests/conftest.py` arms a tripwire on every process-spawning entry point and
+# allows only getfacl/setfacl, and the right answer to that is an injected seam (the shape
+# ``Deps`` already uses everywhere else), not an `allow_subprocess` exemption.
+LineConfigurator = Callable[[str, int], tuple[int, str]]
+
+
+def _configure_serial_line(device: str, baud: int) -> tuple[int, str]:
+    """Configure the LOCAL tty. Returns ``(returncode, stderr)``; never raises usefully.
+
+    HI-04: `raw` touches ignbrk/brkint/…/icanon/opost/isig and NOTHING in c_cflag, so it
+    sets neither clocal nor -crtscts. `clocal` is the correct setting for the 3-wire
+    TX/RX/GND console this transport targets — it never asserts DCD — and makes the
+    carrier question moot for the blocking write and the close() that follow, rather than
+    only for the open(). Without -crtscts a cable with no CTS can block the write, and
+    close() can block in tty_wait_until_sent for closing_wait (30 s) inside the poll loop.
+    `raw` additionally clears `icanon`, which is what lets the probe's reads return bytes
+    as they arrive instead of one line at a time.
+
+    What a zero return code proves is LOCAL only: `stty -F <dev> <rate>` returns 0 for
+    9600, 19200, 115200 and 0 alike. It catches a MALFORMED rate, never a mismatched far
+    end. `serial_liveness_probe` is the only thing in this module that can observe the
+    far end.
+    """
+    proc = subprocess.run(
+        ["stty", "-F", device, str(baud), "raw", "-echo", "clocal", "-crtscts"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    return proc.returncode, proc.stderr.strip()
+
+
 def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
     """Send ``cmd`` to a serial console (assumes a passwordless/auto-login getty).
 
@@ -131,38 +170,18 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
                 f"(mode {stat.filemode(mode)}); refusing to write to it. Check the "
                 f"serial_device path for a typo.",
             )
-        # HI-04: `raw` touches ignbrk/brkint/…/icanon/opost/isig and NOTHING in
-        # c_cflag, so it sets neither clocal nor -crtscts. `clocal` is the correct
-        # setting for the 3-wire TX/RX/GND console this transport targets — it never
-        # asserts DCD — and makes the carrier question moot for the blocking write and
-        # the close() that follow, rather than only for the open(). Without -crtscts a
-        # cable with no CTS can block the write, and close() can block in
-        # tty_wait_until_sent for closing_wait (30 s) inside the poll loop.
-        stty = subprocess.run(
-            [
-                "stty",
-                "-F",
-                target.device,
-                str(target.baud),
-                "raw",
-                "-echo",
-                "clocal",
-                "-crtscts",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if stty.returncode != 0:
-            # check=False keeps this the single decision point; raising
-            # CalledProcessError instead would just escape into the handler below.
+        # The stty invocation itself moved to `_configure_serial_line` so the probe can
+        # share it through an injected seam. The argv, the timeout and the check=False
+        # decision are unchanged — check=False keeps this the single decision point;
+        # raising CalledProcessError instead would just escape into the handler below.
+        stty_rc, stty_err = _configure_serial_line(target.device, target.baud)
+        if stty_rc != 0:
             return (
                 1,
                 "",
                 f"could not configure the local serial line {target.device} at "
-                f"{target.baud} baud (stty rc={stty.returncode}: "
-                f"{stty.stderr.strip() or '(no stderr)'}); the shutdown command was "
+                f"{target.baud} baud (stty rc={stty_rc}: "
+                f"{stty_err or '(no stderr)'}); the shutdown command was "
                 f"NOT sent. This says nothing about the far end's line speed.",
             )
         # T-02-25: open NON-BLOCKING, then clear the flag. `stty raw` does not set
@@ -206,6 +225,226 @@ def _default_serial_shutdown(target: ShutdownTarget) -> tuple[int, str, str]:
     except Exception as exc:  # noqa: BLE001 - the runner's contract is a tuple, never a raise
         # OSError alone let subprocess.TimeoutExpired escape straight past this.
         return 1, "", f"serial transport to {target.device} failed: {exc}"
+
+
+# --- serial read-back liveness probe ------------------------------------------
+#
+# Deliberately ALONGSIDE `_default_serial_shutdown`, never inside it. Every existing
+# caller of the write transport depends on its narrow contract and on its documented
+# honesty about what a zero return code means (`_fire_target` below, `shutdown rehearse`
+# in cli.py). The probing path may make a stronger claim; the plain transport keeps
+# saying only what it can prove.
+
+
+class ProbeOutcome(Enum):
+    """What the probe OBSERVED — never what should be done about it.
+
+    The names are observations on purpose. "ALIVE"/"SILENT" would smuggle an inference
+    into this module, and the inference is contested: a silent line can mean the far end
+    halted (the native shutdown took) or that a pager is sitting on its console (the far
+    end is fine and about to be power-cut). Mapping an outcome to an action is a policy
+    decision that belongs to the fallback caller, taken explicitly.
+    """
+
+    SEEN = "seen"  # the token came back: the far end EXECUTED something
+    NOT_SEEN = "not_seen"  # the line worked; the token did not come back in time
+    NO_TRANSPORT = "no_transport"  # there was no usable line to probe down at all
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    outcome: ProbeOutcome
+    elapsed_seconds: float
+    detail: str
+
+
+# The whole probe, including its retry, must fit inside this — it runs from the poll
+# loop, and the bound that matters is on handle_tick, not on one attempt. 3.0 s with one
+# retry is the research's budget (~6 ms of wire time at 115200, plus bash readline, plus
+# the settle); it is an ASSUMPTION (research A2), not a measurement on this link.
+SERIAL_PROBE_DEADLINE_SECONDS = 3.0
+# One retry, to cover a getty respawning at exactly the wrong moment.
+SERIAL_PROBE_RETRIES = 1
+# The same nudge-then-settle the write transport uses to get bash to a fresh prompt.
+SERIAL_PROBE_SETTLE_SECONDS = 0.5
+# A chatty console must not make the probe allocate unboundedly. Only the most recent
+# bytes are kept, so a token that just arrived is always intact inside the window.
+_PROBE_BUFFER_CAP = 8192
+# The token, in two halves. The typed text joins them with an empty-string literal that
+# only the far end's shell removes, so the joined form exists in the far end's OUTPUT and
+# never in our INPUT. Keep them separate: deriving the expected match from the typed text
+# by stripping the quotes is exactly the refactor that silently destroys the design.
+_PROBE_TOKEN_HEAD = "UPSPRO"
+_PROBE_TOKEN_TAIL = "BE-"
+
+
+def _probe_write(fd: int, payload: bytes, deadline_at: float) -> None:
+    """Write every byte, or raise. Non-blocking, so short writes are the normal case."""
+    view = memoryview(payload)
+    while view:
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"only {len(payload) - len(view)}/{len(payload)} bytes written")
+        _r, writable, _x = select.select([], [fd], [], remaining)
+        if not writable:
+            continue  # select timed out; the deadline check above ends the loop
+        try:
+            view = view[os.write(fd, view) :]
+        except BlockingIOError:
+            continue
+
+
+def _probe_scan(fd: int, expect: bytes, deadline_at: float) -> bool:
+    """Read until ``expect`` appears or the deadline passes."""
+    buf = bytearray()
+    while True:
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            return False
+        readable, _w, _x = select.select([fd], [], [], remaining)
+        if not readable:
+            return False
+        try:
+            chunk = os.read(fd, 4096)
+        except BlockingIOError:
+            continue  # select can wake spuriously
+        if not chunk:
+            return False  # the far end closed the line
+        buf += chunk
+        del buf[:-_PROBE_BUFFER_CAP]  # keep the most RECENT bytes, never the oldest
+        # Rescan the whole retained window after every read: the token routinely arrives
+        # split across two reads, and console spew routinely arrives between the two.
+        if expect in buf:
+            return True
+
+
+def serial_liveness_probe(
+    device: str,
+    baud: int,
+    *,
+    deadline_seconds: float = SERIAL_PROBE_DEADLINE_SECONDS,
+    retries: int = SERIAL_PROBE_RETRIES,
+    settle_seconds: float = SERIAL_PROBE_SETTLE_SECONDS,
+    configure_line: LineConfigurator = _configure_serial_line,
+) -> ProbeResult:
+    r"""Ask the far end to run something, and watch for the answer on the same line.
+
+    Network-independent by construction: nothing here touches an IP. That is the point —
+    the failure this exists for is a dead switch, which kills ICMP, ssh and upsd's own
+    client list alike, and kills them in the direction that reads as "the far end is
+    gone" when the far end is in fact fine.
+
+    **The split token is the whole design.** The typed text is
+    ``echo UPSPRO""BE-<nonce>``; the string matched in the read-back is
+    ``UPSPROBE-<nonce>``. The shell concatenates the two halves only when it EXECUTES the
+    line, so the matched form is never among the bytes written. A match therefore proves
+    execution rather than echo — a bash at a prompt echoes the typed line before running
+    it, so a plain-nonce probe matches its own keystrokes — and it is immune to a
+    TX-to-RX loopback or a shorted cable, which can only ever return what was sent. A
+    prompt regex was rejected for a different reason: ``PS1`` belongs to the operator, and
+    coupling the orchestrator to a string it does not own is the trap ``safe_text``
+    exists to defuse. DCD/CTS was rejected because this cable is the 3-wire TX/RX/GND
+    console documented in ``_configure_serial_line`` that never asserts DCD, which is
+    precisely why ``clocal`` is set.
+
+    A match proves four things at once: bytes reached the far end at the right rate, came
+    BACK at the right rate, a shell exists at a prompt, and the far-end kernel is still
+    scheduling userspace — i.e. the box is not merely powered, it is running.
+
+    **This is the bidirectional acknowledgement OQ-02 named.** ``stty -F <dev> <rate>``
+    returns 0 for 9600, 19200, 115200 and 0 alike, so a MISMATCHED far-end baud has been
+    undetectable, and the project locked that as an invariant no doc or log line may
+    claim otherwise. A mismatched rate garbles the read-back and the token never matches,
+    so for the first time the condition is observable here. Retiring that invariant is a
+    deliberate amendment owned by a later plan; until it lands, the write transport's
+    docstring above still says only what the write transport can prove.
+
+    Returns an OBSERVATION. It decides nothing, fires nothing, and is not reachable from
+    any shutdown path.
+    """
+    started = time.monotonic()
+
+    def _result(outcome: ProbeOutcome, detail: str) -> ProbeResult:
+        return ProbeResult(outcome, round(time.monotonic() - started, 3), detail)
+
+    try:
+        # Cheapest and most destructive-to-get-wrong check first, and NOT redundant with
+        # the config-side /dev/ prefix check: a path under /dev/ can still be a regular
+        # file, which an unguarded write would truncate and then report success for.
+        mode = os.stat(device).st_mode
+        if not stat.S_ISCHR(mode):
+            return _result(
+                ProbeOutcome.NO_TRANSPORT,
+                f"{device} is not a character device (mode {stat.filemode(mode)}); "
+                f"nothing was written to it",
+            )
+        rc, err = configure_line(device, baud)
+        if rc != 0:
+            return _result(
+                ProbeOutcome.NO_TRANSPORT,
+                f"could not configure the local serial line {device} at {baud} baud "
+                f"(stty rc={rc}: {err or '(no stderr)'}); nothing was probed",
+            )
+        # Three flags, three separate reasons. Two of them differ from the write path
+        # above ON PURPOSE — if you are here to make them match, read this first.
+        #
+        # O_RDWR, not O_WRONLY: `os.read` on a write-only descriptor raises EBADF. The
+        #   entire point of this function is the read. Mandatory, not stylistic.
+        # O_NOCTTY, same as the write path: systemd puts the service in its own session,
+        #   so this process is a session leader with no controlling terminal, and under
+        #   POSIX such a process opening a tty WITHOUT O_NOCTTY acquires it as its
+        #   controlling terminal — after which a carrier transition delivers SIGHUP and
+        #   kills the daemon mid-outage. That applies MORE strongly to a long-lived read
+        #   than to a short write.
+        # O_NONBLOCK, and — unlike the write path — NEVER CLEARED: the write path clears
+        #   it to restore the blocking-write semantics its short-write guard depends on.
+        #   Clearing it here would be the T-02-25 hang class this project graded
+        #   CRITICAL: a blocking read on a line nothing answers never returns, handle_tick
+        #   never returns, the poll loop wedges, every UPS stops being polled, and
+        #   Restart=always never fires because the process is still alive. The probe also
+        #   *wants* non-blocking, so `select` can enforce a deadline at all.
+        fd = os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            attempts = max(1, retries + 1)
+            for attempt in range(attempts):
+                left = deadline_seconds - (time.monotonic() - started)
+                if left <= 0:
+                    break
+                # Split what is left evenly over the attempts still to come, so a first
+                # attempt against a silent line cannot eat the whole budget and starve
+                # the retry — the retry exists for a getty respawning at exactly the
+                # wrong moment, which is a sub-second window.
+                deadline_at = time.monotonic() + left / (attempts - attempt)
+                # Queued console spew can push the token out of the scan window, and the
+                # tty's input queue is finite — once it is full the kernel DISCARDS what
+                # arrives next, which would include the answer.
+                termios.tcflush(fd, termios.TCIFLUSH)
+                nonce = secrets.token_hex(6)
+                # Two separate expressions, never one derived from the other.
+                typed = f'echo {_PROBE_TOKEN_HEAD}""{_PROBE_TOKEN_TAIL}{nonce}\r'.encode()
+                expect = f"{_PROBE_TOKEN_HEAD}{_PROBE_TOKEN_TAIL}{nonce}".encode()
+                _probe_write(fd, b"\r", deadline_at)  # nudge the shell to a fresh prompt
+                time.sleep(max(0.0, min(settle_seconds, deadline_at - time.monotonic())))
+                _probe_write(fd, typed, deadline_at)
+                if _probe_scan(fd, expect, deadline_at):
+                    return _result(
+                        ProbeOutcome.SEEN,
+                        f"the far end executed the probe on attempt {attempt + 1} of {attempts}",
+                    )
+        finally:
+            # In a `finally`, not an `except`: this probe runs on EVERY poll for the
+            # whole grace window, so a descriptor leaked on the SUCCESS path exhausts the
+            # daemon's fd table just as surely as one leaked on a failure path.
+            os.close(fd)
+        return _result(
+            ProbeOutcome.NOT_SEEN,
+            f"nothing on {device} executed the probe within {deadline_seconds:g}s "
+            f"({attempts} attempt(s))",
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe returns an observation, never raises
+        # The runner contract in this module is a returned value. A raise here would
+        # unwind the poll loop from inside a grace window.
+        return _result(ProbeOutcome.NO_TRANSPORT, f"probing {device} failed: {exc}")
 
 
 def _noop_event_log(

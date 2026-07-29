@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import fcntl
+import inspect
 import json
 import logging
 import os
+import re
+import select
 import stat
 import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
 from dataclasses import replace
 
 import pytest
@@ -1762,3 +1770,536 @@ def test_the_LB_flag_alone_does_not_open_the_push_gate() -> None:
     )
     dispatch("tick", ups, UpsState(onbatt_since=1, onbatt_notified=True), deps2)
     assert calls2 == ["spark"]
+
+
+# ==============================================================================
+# The network-independent read-back liveness probe
+# ==============================================================================
+#
+# WHY A PTY AND NOT THE REAL LINE. The conftest tripwire covers PROCESS SPAWNS —
+# `subprocess.run`/`Popen` and the `os` system/popen/spawn/exec families. It does NOT
+# cover `open`, `os.open` or sockets, so a test that reached a real character device
+# would sail straight past it and land in a root-capable auto-login shell on a live
+# PowerEdge. The two things that actually prevent that are (a) every probe test running
+# against a `pty` pair, and (b) the injected line-configuration seam, which is also why
+# no `@pytest.mark.allow_subprocess` appears anywhere below. Both are deliberate.
+#
+# The far end is scripted rather than mocked because the distinctions under test are
+# distinctions between real far-end BEHAVIOURS — a shell that executes, a terminal that
+# only echoes, a cable that loops back — and a mock of the probe's own reads would just
+# assert the implementation back at itself.
+
+# Checked by `test_no_probe_test_names_the_real_serial_device` against the source of
+# everything below this line. Assembled from fragments so the check does not trip on
+# its own needles.
+_REAL_DEVICE_NEEDLES = ("tty" + "USB", "by-" + "id", "/dev/" + "serial")
+
+_PERSONALITIES = ("executing", "echoing", "loopback", "silent", "chatty")
+
+
+class _FarEnd:
+    """A scripted far end on the master side of a pty.
+
+    ``executing`` — a bash at an auto-login prompt: readline ECHOES the typed line
+        first, and only then does the shell run it and emit its output. Echoing as well
+        as executing is the point; a far end that only executed would let a much weaker
+        probe pass.
+    ``echoing`` — the typed line comes back verbatim and nothing else. This is a real
+        terminal with no scheduler behind it, and the case a naive nonce probe calls
+        alive.
+    ``loopback`` — exactly the bytes received, byte for byte: a shorted or looped cable.
+    ``silent`` — reads, answers nothing.
+    ``chatty`` — executes, but buries the answer under twice the probe's buffer cap of
+        console spew and splits the token across two writes.
+    """
+
+    def __init__(self, master_fd: int, personality: str, *, ignore_first: int = 0) -> None:
+        assert personality in _PERSONALITIES
+        self.master_fd = master_fd
+        self.personality = personality
+        self.ignore_first = ignore_first
+        self.received = bytearray()
+        self.commands = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        pending = bytearray()
+        while not self._stop.is_set():
+            readable, _w, _x = select.select([self.master_fd], [], [], 0.02)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(self.master_fd, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.received += chunk
+            if self.personality == "loopback":
+                os.write(self.master_fd, chunk)
+                continue
+            pending += chunk
+            while True:
+                ends = [i for i in (pending.find(b"\r"), pending.find(b"\n")) if i >= 0]
+                if not ends:
+                    break
+                cut = min(ends)
+                line, pending = bytes(pending[:cut]), pending[cut + 1 :]
+                if line.strip():
+                    self._answer(line)
+
+    def _answer(self, line: bytes) -> None:
+        if self.personality == "silent":
+            return
+        self.commands += 1
+        if self.commands <= self.ignore_first:
+            return  # a getty respawning at exactly the wrong moment: no reader at all
+        os.write(self.master_fd, line + b"\r\n")  # readline echoes before it runs
+        if self.personality == "echoing":
+            return
+        out = _shell_output(line)
+        if out is None:
+            return
+        if self.personality == "chatty":
+            # Spew first, then the answer split across two writes with a gap, so the
+            # token can only be found by scanning an ACCUMULATED buffer that is capped
+            # from the OLD end.
+            os.write(self.master_fd, b"kernel: console noise\r\n" * 700)
+            half = len(out) // 2
+            os.write(self.master_fd, out[:half])
+            time.sleep(0.02)
+            os.write(self.master_fd, out[half:] + b"\r\n")
+            return
+        os.write(self.master_fd, out + b"\r\n")
+
+
+def _shell_output(line: bytes) -> bytes | None:
+    """What a shell would PRINT for ``line`` — quote removal is the whole point.
+
+    ``echo UPSPRO""BE-x`` prints ``UPSPROBE-x``: the two halves are joined only by the
+    shell, at execution time, which is why the joined form cannot appear in the input.
+    """
+    if not line.startswith(b"echo "):
+        return None
+    return line[len(b"echo ") :].replace(b'""', b"").replace(b"''", b"")
+
+
+class _PtyLine:
+    """A pty standing in for the console cable, plus the injected configuration seam."""
+
+    def __init__(self) -> None:
+        self.master_fd, self.slave_fd = os.openpty()
+        self.device = os.ttyname(self.slave_fd)
+        self.configured: list[tuple[str, int]] = []
+        self.far_end: _FarEnd | None = None
+
+    def configure_line(self, device: str, baud: int) -> tuple[int, str]:
+        self.configured.append((device, baud))
+        # TCSANOW, not the `tty.setraw` default of TCSAFLUSH: TCSAFLUSH DISCARDS queued
+        # input, which would silently pre-empt the probe's own drain and make the
+        # queued-junk test assert nothing.
+        tty.setraw(self.slave_fd, termios.TCSANOW)
+        return 0, ""
+
+    def start(self, personality: str, *, ignore_first: int = 0) -> _FarEnd:
+        self.far_end = _FarEnd(self.master_fd, personality, ignore_first=ignore_first)
+        return self.far_end
+
+    def preload(self, payload: bytes) -> int:
+        """Queue bytes on the probe's INPUT side, as a console that spewed before we ran."""
+        os.set_blocking(self.master_fd, False)
+        written = 0
+        try:
+            while written < len(payload):
+                try:
+                    written += os.write(self.master_fd, payload[written:])
+                except BlockingIOError:
+                    break
+        finally:
+            os.set_blocking(self.master_fd, True)
+        return written
+
+    def close(self) -> None:
+        if self.far_end is not None:
+            self.far_end.stop()
+        os.close(self.master_fd)
+        os.close(self.slave_fd)
+
+
+@pytest.fixture
+def pty_line():
+    line = _PtyLine()
+    try:
+        yield line
+    finally:
+        line.close()
+
+
+def _probe(
+    line: _PtyLine,
+    *,
+    deadline_seconds: float = 1.0,
+    settle_seconds: float = 0.01,
+    retries: int = 0,
+    configure_line=None,
+) -> events_mod.ProbeResult:
+    """Run the probe against the pty, at test-scale timings."""
+    return events_mod.serial_liveness_probe(
+        line.device,
+        115200,
+        deadline_seconds=deadline_seconds,
+        settle_seconds=settle_seconds,
+        retries=retries,
+        configure_line=configure_line or line.configure_line,
+    )
+
+
+def test_executing_far_end_is_seen(pty_line) -> None:
+    # The positive control. Without it, every NOT_SEEN assertion below would pass for a
+    # probe that reports NOT_SEEN unconditionally.
+    # Kills: a probe that never matches (inverted comparison, expected token never built).
+    pty_line.start("executing")
+
+    result = _probe(pty_line)
+
+    assert result.outcome is events_mod.ProbeOutcome.SEEN
+    assert result.elapsed_seconds >= 0
+
+
+def test_split_token_defeats_a_far_end_that_only_echoes(pty_line) -> None:
+    # The single most important test here. The echoing far end sends the typed line back
+    # verbatim — which is what a real bash does BEFORE it runs anything — so the nonce
+    # itself is present in the read-back under BOTH branches. Asserting on the nonce
+    # would therefore pass either way; the assertion has to be on the OUTCOME under a far
+    # end that echoes and does not execute.
+    # Kills: building the expected match from the typed line (i.e. reunifying the split
+    #        by stripping the quotes), which is the one refactor that destroys the design
+    #        while leaving every other test green.
+    pty_line.start("echoing")
+
+    result = _probe(pty_line)
+
+    assert result.outcome is events_mod.ProbeOutcome.NOT_SEEN
+    # ...and prove the echo really happened, so this is not passing because nothing came
+    # back at all.
+    assert bytes(pty_line.far_end.received).count(b"echo ") >= 1
+
+
+def test_written_bytes_never_contain_the_joined_token(pty_line) -> None:
+    # The structural companion to the test above: without it, a mutant that wrote the
+    # JOINED token would make that test pass spuriously, because the echoing far end
+    # would then be echoing a matching token back.
+    # Kills: writing the joined token down the line.
+    pty_line.start("silent")
+
+    _probe(pty_line)
+
+    wire = bytes(pty_line.far_end.received)
+    assert b'UPSPRO""BE-' in wire  # the split form is what is typed
+    assert b"UPSPROBE-" not in wire  # the joined form is never on the wire
+
+
+def test_loopback_cable_does_not_produce_a_match(pty_line) -> None:
+    # Kills: the same reunification, from the other direction — a shorted or looped
+    #        cable returns exactly what was sent, so any probe whose expected match is
+    #        derivable from its own output declares a length of wire alive.
+    pty_line.start("loopback")
+
+    result = _probe(pty_line)
+
+    assert result.outcome is events_mod.ProbeOutcome.NOT_SEEN
+    assert bytes(pty_line.far_end.received)  # the loopback really did see the bytes
+
+
+def test_silent_far_end_returns_within_the_deadline(pty_line) -> None:
+    # T-03-49, graded CRITICAL. A blocking read on a line nothing answers never returns:
+    # handle_tick never returns, the poll loop wedges, every UPS stops being polled, and
+    # Restart=always never fires because the process is still alive.
+    # Kills: clearing O_NONBLOCK after the open (as the WRITE path deliberately does) —
+    #        which makes this test hang rather than fail, and a hang is caught by the
+    #        harness timeout, so the mutant dies either way.
+    pty_line.start("silent")
+    started = time.monotonic()
+
+    result = _probe(pty_line, deadline_seconds=0.5)
+
+    elapsed = time.monotonic() - started
+    assert result.outcome is events_mod.ProbeOutcome.NOT_SEEN
+    assert elapsed < 1.0, f"probe overran its 0.5s deadline: {elapsed:.3f}s"
+    assert result.elapsed_seconds < 1.0
+
+
+def test_probe_opens_read_write_and_never_clears_the_non_blocking_flag(
+    monkeypatch, pty_line
+) -> None:
+    # The three divergences from the write path, asserted on the flag word — the same
+    # technique, and for the same reason, as the write path's own flag test: the failure
+    # is only observable on real hardware, and a regression manifests as a HANG rather
+    # than as a wrong answer, which no ordinary assertion can catch.
+    #
+    # This is the test that discriminates on the flag itself. The deadline test below is
+    # NOT: with a `select` guarding every read, clearing O_NONBLOCK alone changes no
+    # observable behaviour, so it survives that test. What clearing the flag destroys is
+    # the SAFETY MARGIN — it is only harmless for as long as the select stays, and the
+    # refactor that removes the select is precisely the one that would "restore" the
+    # write path's shape. Assert the flag directly rather than rely on a hang.
+    #
+    # Kills: O_WRONLY (os.read would raise EBADF); dropping O_NOCTTY (the daemon
+    #        acquires the console as its controlling terminal and dies on SIGHUP);
+    #        clearing O_NONBLOCK after the open, as the write path deliberately does.
+    fds: list[int] = []
+    flags_seen: list[int] = []
+    blocking_at_read_time: list[bool] = []
+    real_open, real_select = os.open, select.select
+
+    def spy_open(path, flags, *a):
+        fd = real_open(path, flags, *a)
+        if path == pty_line.device:
+            flags_seen.append(flags)
+            fds.append(fd)
+        return fd
+
+    def spy_select(rlist, wlist, xlist, timeout=None):
+        if fds:
+            blocking_at_read_time.append(os.get_blocking(fds[-1]))
+        return real_select(rlist, wlist, xlist, timeout)
+
+    monkeypatch.setattr(events_mod.os, "open", spy_open)
+    monkeypatch.setattr(events_mod.select, "select", spy_select)
+    # No far end at all: nothing reads the master, so nothing answers. A far-end thread
+    # would also be calling select and would pollute the recording.
+
+    _probe(pty_line, deadline_seconds=0.2)
+
+    assert flags_seen == [os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK]
+    assert blocking_at_read_time  # the probe really did reach a select
+    assert not any(blocking_at_read_time), "the probe cleared O_NONBLOCK"
+
+
+def test_the_probe_retries_once_when_the_first_attempt_is_unanswered(pty_line) -> None:
+    # A getty respawning at exactly the wrong moment leaves a sub-second window with no
+    # reader on the far end. The far end here ignores the first command outright and
+    # answers the second.
+    # Kills: dropping the retry; and giving the first attempt the whole budget, which
+    #        leaves nothing for the second and reads identically to having no retry.
+    far = pty_line.start("executing", ignore_first=1)
+
+    result = _probe(pty_line, retries=1, deadline_seconds=2.0)
+
+    assert result.outcome is events_mod.ProbeOutcome.SEEN
+    assert far.commands >= 2
+    assert "attempt 2" in result.detail
+
+
+def test_the_probe_drains_the_input_queue_before_it_writes(monkeypatch, pty_line) -> None:
+    # T-03-48/T-03-50. The tty's input queue is finite: once it is full the kernel
+    # DISCARDS what arrives next, and what arrives next is the answer. Draining first is
+    # also what stops a replayed buffer from an earlier probe satisfying a later one.
+    # Asserted on ORDER rather than on an outcome, because a probe with no drain still
+    # empties the queue incidentally through its own reads, so an outcome assertion
+    # would not discriminate.
+    # Kills: dropping the drain; moving the drain after the write; flushing the OUTPUT
+    #        queue (TCOFLUSH) instead of the input queue.
+    queues: list[int] = []
+    wire_had_bytes_at_flush_time: list[bool] = []
+    real_tcflush = termios.tcflush
+
+    def spy(fd: int, queue: int) -> None:
+        queues.append(queue)
+        readable, _w, _x = select.select([pty_line.master_fd], [], [], 0)
+        wire_had_bytes_at_flush_time.append(bool(readable))
+        real_tcflush(fd, queue)
+
+    monkeypatch.setattr(events_mod.termios, "tcflush", spy)
+    pty_line.start("silent")
+
+    _probe(pty_line, deadline_seconds=0.2)
+
+    assert queues == [termios.TCIFLUSH]
+    assert wire_had_bytes_at_flush_time == [False]  # not even the \r nudge yet
+
+
+def test_queued_junk_does_not_prevent_a_match(pty_line) -> None:
+    # Junk both BEFORE the probe (a console that spewed while we were not looking) and
+    # DURING it (twice the buffer cap, with the answer split across two writes).
+    # Kills: capping the buffer from the wrong end (`del buf[CAP:]` keeps the OLDEST
+    #        bytes and throws the answer away); and scanning only the chunk just read
+    #        instead of the accumulated window, which loses a token split across reads.
+    preloaded = pty_line.preload(b"stale console output\r\n" * 200)
+    assert preloaded > 0
+    pty_line.start("chatty")
+
+    result = _probe(pty_line, deadline_seconds=2.0)
+
+    assert result.outcome is events_mod.ProbeOutcome.SEEN
+
+
+def test_regular_file_is_no_transport_and_is_not_truncated(tmp_path) -> None:
+    # T-03-51. The config-side /dev/ prefix check does not cover this: a path under
+    # /dev/ can still be a regular file, and a hand-built call never passes through the
+    # validator at all. The second assertion is what makes this discriminating — a
+    # mutant that drops the guard changes the FILE, not just the outcome.
+    # Kills: dropping the S_ISCHR guard.
+    victim = tmp_path / "not-a-device"
+    victim.write_bytes(b"important bytes\n")
+    configured: list[tuple[str, int]] = []
+
+    result = events_mod.serial_liveness_probe(
+        str(victim),
+        115200,
+        deadline_seconds=0.2,
+        settle_seconds=0.0,
+        configure_line=lambda d, b: (configured.append((d, b)), (0, ""))[1],
+    )
+
+    assert result.outcome is events_mod.ProbeOutcome.NO_TRANSPORT
+    assert victim.read_bytes() == b"important bytes\n"
+    assert configured == []  # the guard runs first: not even the line is configured
+
+
+def test_line_configuration_failure_is_no_transport_and_writes_nothing(pty_line) -> None:
+    # Kills: proceeding past a failed line configuration — at which point the baud is
+    #        whatever the line happened to be set to, and the bytes go out garbled.
+    pty_line.start("executing")
+
+    result = _probe(pty_line, configure_line=lambda _d, _b: (1, "stty: invalid argument"))
+
+    assert result.outcome is events_mod.ProbeOutcome.NO_TRANSPORT
+    assert "invalid argument" in result.detail
+    assert bytes(pty_line.far_end.received) == b""
+
+
+def test_probe_leaks_no_file_descriptor(tmp_path, pty_line) -> None:
+    # T-03-52. This runs on EVERY poll for the whole grace window, so a descriptor
+    # leaked here exhausts the daemon's fd table mid-outage — including one leaked on
+    # the SUCCESS path, which is why `finally` and not `except` is the right shape.
+    # Kills: moving the close out of the finally; closing only on the failure paths.
+    regular = tmp_path / "plain"
+    regular.write_bytes(b"x")
+    pty_line.start("executing")
+    before = len(os.listdir("/proc/self/fd"))
+
+    _probe(pty_line)  # SEEN
+    _probe(pty_line, configure_line=lambda _d, _b: (1, "no"))  # NO_TRANSPORT (config)
+    events_mod.serial_liveness_probe(  # NO_TRANSPORT (not a character device)
+        str(regular), 115200, deadline_seconds=0.1, settle_seconds=0.0
+    )
+    pty_line.far_end.stop()
+    _probe(pty_line, deadline_seconds=0.2)  # NOT_SEEN
+
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_probe_never_raises(pty_line) -> None:
+    # The runner contract in this module is a RETURNED value. A raise out of here would
+    # unwind the poll loop from inside the grace window, which is the T-02-24 class.
+    # Every seam the probe touches is failed in turn, and two of them are failed with
+    # exceptions that are NOT OSError subclasses, because those are the ones a narrowed
+    # catch lets through and both are reachable in production: `stty` hanging raises
+    # subprocess.TimeoutExpired (a SubprocessError — the same trap the write transport's
+    # own timeout test pins), and draining a character device that is not a tty raises
+    # termios.error, which descends straight from Exception. TimeoutError is NOT one of
+    # them: it is an OSError subclass, so the write deadline would not discriminate here.
+    # Kills: narrowing the catch to OSError; removing the catch altogether.
+    pty_line.start("silent")
+    boom = OSError(5, "Input/output error")
+    real_stat, real_open, real_write, real_read = os.stat, os.open, os.write, os.read
+
+    def _for_device(real):
+        def _f(path, *a, **k):
+            if path == pty_line.device:
+                raise boom
+            return real(path, *a, **k)
+
+        return _f
+
+    def _for_our_fd(real):
+        def _f(fd, *a, **k):
+            if fd not in (0, 1, 2):
+                raise boom
+            return real(fd, *a, **k)
+
+        return _f
+
+    def _boom_configure(_device: str, _baud: int) -> tuple[int, str]:
+        raise subprocess.TimeoutExpired(cmd="stty", timeout=5)
+
+    def _boom_drain(_fd: int, _queue: int) -> None:
+        raise termios.error(25, "Inappropriate ioctl for device")
+
+    for seam in ("stat", "configure", "open", "write", "read", "drain"):
+        with pytest.MonkeyPatch.context() as ctx:
+            configure = None
+            if seam == "stat":
+                ctx.setattr(events_mod.os, "stat", _for_device(real_stat))
+            elif seam == "configure":
+                configure = _boom_configure
+            elif seam == "open":
+                ctx.setattr(events_mod.os, "open", _for_device(real_open))
+            elif seam == "write":
+                ctx.setattr(events_mod.os, "write", _for_our_fd(real_write))
+            elif seam == "read":
+                ctx.setattr(events_mod.os, "read", _for_our_fd(real_read))
+            elif seam == "drain":
+                ctx.setattr(events_mod.termios, "tcflush", _boom_drain)
+            result = _probe(pty_line, deadline_seconds=0.2, configure_line=configure)
+
+        assert isinstance(result, events_mod.ProbeResult), seam
+        assert result.outcome in tuple(events_mod.ProbeOutcome), seam
+
+
+def test_each_probe_uses_a_fresh_nonce(pty_line) -> None:
+    # T-03-48. A module-level constant nonce would let console bytes replayed from an
+    # earlier probe — or a buffer that was never drained — satisfy a later one.
+    # Kills: a constant or otherwise reused nonce.
+    pty_line.start("silent")
+
+    _probe(pty_line, deadline_seconds=0.2)
+    _probe(pty_line, deadline_seconds=0.2)
+
+    nonces = re.findall(rb'UPSPRO""BE-([0-9a-f]+)', bytes(pty_line.far_end.received))
+    assert len(nonces) == 2
+    assert nonces[0] != nonces[1]
+
+
+def test_the_write_only_shutdown_transport_is_unchanged(monkeypatch) -> None:
+    # A behaviour lock. Every existing caller of the write transport depends on its
+    # narrow contract and on its documented honesty about what rc=0 means: bytes were
+    # written, and nothing whatever about the far end. Retrofitting read-back into it
+    # would silently change what a zero return code means at `_fire_target` and at
+    # `shutdown rehearse`.
+    # Kills: "helpfully" giving the write path a read-back; opening it O_RDWR.
+    reads: list[int] = []
+    real_read = os.read
+    monkeypatch.setattr(
+        events_mod.os, "read", lambda fd, n: (reads.append(fd), real_read(fd, n))[1]
+    )
+    wiring = _wire_serial(monkeypatch, cmd_written=len(b"poweroff\n"))
+
+    result = _default_serial_shutdown(_serial_target())
+
+    assert result == (0, "", "")  # a 3-tuple, not a ProbeResult
+    assert reads == []  # nothing was read back
+    (_path, flags) = wiring.opened[0]
+    assert flags & os.O_ACCMODE == os.O_WRONLY
+    assert not flags & os.O_RDWR
+
+
+def test_no_probe_test_names_the_real_serial_device() -> None:
+    # T-03-53, graded CRITICAL: a test that opened the live console would be typing into
+    # a root-capable auto-login shell on a running PowerEdge. The conftest tripwire
+    # covers process spawns, NOT `os.open`, so it would not stop one. This is the
+    # structural check that does — the plan specified it as a grep over a dedicated
+    # probe module; these tests share `test_events.py` with the write-transport tests,
+    # which legitimately name a device, so the check is scoped to the probe section.
+    source = inspect.getsource(sys.modules[__name__])
+    section = source[source.index("# The network-independent read-back liveness probe") :]
+
+    for needle in _REAL_DEVICE_NEEDLES:
+        assert needle not in section, f"a probe test names the real console: {needle}"
