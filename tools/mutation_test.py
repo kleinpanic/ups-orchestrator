@@ -6,8 +6,10 @@ explicit harness instead: each entry patches one source expression, runs the
 full test suite, and expects it to FAIL (the mutant is "killed"). A surviving
 mutant means the tests don't actually pin that behaviour — a real coverage gap.
 
-Run: ``python tools/mutation_test.py`` (or ``make mutation``). Exits non-zero if
-any mutant survives. Add a mutation whenever you add behaviour worth pinning.
+Run: ``python tools/mutation_test.py`` (or ``make mutation``). Exits non-zero if any
+mutant survives OR is skipped — a skipped entry is one whose pattern stopped matching
+the source, which silently unpins the behaviour it was there to guard. Add a mutation
+whenever you add behaviour worth pinning.
 """
 
 from __future__ import annotations
@@ -695,9 +697,9 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/cli.py",
-        "    rc = _monitor_verify_machine(cfg, argv, stat_fn)\n"
+        "    rc = _monitor_verify_machine(cfg, argv, stat_fn, serial_probe)\n"
         "    _say_firewall_counters()\n    return rc",
-        "    rc = _monitor_verify_machine(cfg, argv, stat_fn)\n"
+        "    rc = _monitor_verify_machine(cfg, argv, stat_fn, serial_probe)\n"
         "    readable, _c = nutclient.read_nft_counters(_NFT_TABLE, _monitor_run_nft_read)\n"
         "    _say_firewall_counters()\n    return rc if readable else 2",
         "cli: a firewall diagnostic failure changes monitor verify's exit code",
@@ -769,15 +771,27 @@ def _run() -> int:
             print(f"  SURVIVED {desc}   <-- add a test that pins this")
             survived += 1
 
-    total = killed + survived
+    # The denominator is every REGISTERED mutant, not just the ones that ran. Scoring
+    # against the ones that ran printed "87/87 killed (100%)" on a run where one had
+    # silently stopped matching its source — a perfect score that was hiding a hole.
+    total = killed + survived + skipped
     pct = 100 * killed // max(1, total)
     print(
         f"\nMutation score: {killed}/{total} killed ({pct}%), "
         f"{survived} survived, {skipped} skipped"
     )
     if skipped:
-        print("NOTE: skipped mutants mean the source moved — refresh the patterns.")
-    return 1 if survived else 0
+        print(
+            "FAIL: a skipped mutant is a DISABLED one. Its pattern no longer matches the\n"
+            "source, so the behaviour it used to pin is now unpinned and nothing said so.\n"
+            "Refresh the pattern against the current source, or delete the entry if the\n"
+            "behaviour is genuinely gone."
+        )
+    # A skip fails the run. This used to exit 0, which made `make mutation` report green
+    # while a mutant sat disabled -- the same "a test that cannot fail" failure this whole
+    # harness exists to catch, one level up. It is exactly how the entry for
+    # `_monitor_verify_machine`'s signature went quiet when that signature changed.
+    return 1 if (survived or skipped) else 0
 
 
 if __name__ == "__main__":
