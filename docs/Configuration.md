@@ -53,6 +53,24 @@ When battery and runtime readings are both available, both must be at or below
 their group thresholds. That prevents a high battery-percent threshold from
 shutting machines down while the UPS still reports healthy runtime.
 
+!!! tip "A percentage may be the wrong trigger — check your runtime first"
+    The full gate is `enabled` **and** the group flag **and** on-battery **and**
+    `min_on_battery_seconds` elapsed **and** the group thresholds met. Which of
+    those is the *binding* one depends on your hardware, and it is worth
+    measuring rather than assuming.
+
+    A big server on a modest UPS can have only a few minutes of runtime, and
+    battery percent barely moves in that time — so a percentage gate fires far
+    too late, or never. Where that is the case, make the **timer** the binding
+    constraint: set `min_on_battery_seconds` to the delay you actually want and
+    set `battery_below: 100` so the charge test is always true.
+
+    Check the other direction too. If the UPS carrying your **network** gear has
+    a shorter runtime than the one carrying the machine you are shutting down,
+    then `ssh` and native NUT both stop working when the network UPS dies — both
+    need the LAN. That caps every network-dependent shutdown at the network
+    UPS's runtime, and only `serial` survives past it.
+
 !!! warning "This gate applies regardless of `shutdown_method` — and both default off"
     `shutdown.enabled` plus the relevant group flag (`external` for a
     `serial`/`ssh` machine or a legacy `remote`/`serial` target, `internal` for

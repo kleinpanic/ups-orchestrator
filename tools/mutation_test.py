@@ -588,6 +588,65 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "nutproto: LOGOUT dropped, leaving a stale entry in the very census list_clients "
         "reads (killed by test_logout_is_sent_verbatim_and_never_raises)",
     ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    for begin, end_marker in _NFT_MARKER_PAIRS:\n"
+        "        while True:\n"
+        "            shorter = _strip_one_nft_block(text, begin, end_marker)\n"
+        "            if shorter == text:\n"
+        "                break\n"
+        "            text = shorter\n"
+        "    return text",
+        "    return _strip_one_nft_block(text, _NFT_BEGIN, _NFT_END)",
+        "nutclient: _strip_nft_block back to a single find (second block accumulates)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        'f\'counter name "{_NFT_COUNTER_ALLOWED}" accept comment "upsd NUT secondaries"\\n\'',
+        'f\'accept counter name "{_NFT_COUNTER_ALLOWED}" comment "upsd NUT secondaries"\\n\'',
+        "nutclient: counter reference after the accept verdict (never increments)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        'f"{indent}counter {_NFT_COUNTER_ALLOWED} {{\\n"',
+        "f'{indent}counter \"{_NFT_COUNTER_ALLOWED}\" {{\\n'",
+        "nutclient: quoted named-counter declaration (nft -f syntax error)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "f'counter name \"{_NFT_COUNTER_DENIED}\" '",
+        "f'counter name \"{_NFT_COUNTER_DENIED}\" accept '",
+        "nutclient: verdict added to the denied counter rule (opens 3493 to all)",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    new_text = new_text[:table_at] + objects + new_text[table_at:]",
+        "    new_text = new_text[:insert_at] + objects + new_text[insert_at:]",
+        "nutclient: counter objects inserted at chain scope, not table scope",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        'if counter.get("table") != table or counter.get("family") != family:\n'
+        "            continue",
+        "if False:\n            continue",
+        "nutclient: parse_nft_counters ignores the table/family scope",
+    ),
+    (
+        "src/ups_orchestrator/nutclient.py",
+        "    if rc != 0:\n        return False, {}\n"
+        "    return True, parse_nft_counters(out, table, family)",
+        "    return True, parse_nft_counters(out, table, family)",
+        "nutclient: read_nft_counters cannot distinguish unreadable from absent",
+    ),
+    (
+        "src/ups_orchestrator/cli.py",
+        "    rc = _monitor_verify_machine(cfg, argv, stat_fn)\n"
+        "    _say_firewall_counters()\n    return rc",
+        "    rc = _monitor_verify_machine(cfg, argv, stat_fn)\n"
+        "    readable, _c = nutclient.read_nft_counters(_NFT_TABLE, _monitor_run_nft_read)\n"
+        "    _say_firewall_counters()\n    return rc if readable else 2",
+        "cli: a firewall diagnostic failure changes monitor verify's exit code",
+    ),
 ]
 
 
