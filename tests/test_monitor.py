@@ -3188,3 +3188,137 @@ def test_resolve_remote_ip_rejects_a_v6_route_src(monkeypatch) -> None:
         ),
     )
     assert cli._resolve_remote_ip("mt", None, "192.168.1.125") is None
+
+
+# --- monitor add is an upsert, not a replace ---------------------------------
+
+
+def test_re_adding_with_a_new_method_keeps_the_ssh_alias(cfg_path, monkeypatch, caplog) -> None:
+    # Changing a machine's method used to rebuild its record from argv alone, so any
+    # field not re-typed was silently blanked. `monitor add mt --method serial ...`
+    # (no --ssh) destroyed the alias, and a later `--method native` then refused to
+    # enrol a machine that had been reachable the whole time.
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "add",
+                "box",
+                "--method",
+                "ssh",
+                "--ssh",
+                "box-alias",
+                "--ups",
+                "cyberpower",
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "add",
+                "box",
+                "--method",
+                "serial",
+                "--ups",
+                "cyberpower",
+                "--serial-device",
+                "/dev/ttyUSB0",
+                "--serial-baud",
+                "115200",
+            ]
+        )
+        == 0
+    )
+
+    record = json.loads(cfg_path.read_text())["monitored_machines"][0]
+    assert record["shutdown_method"] == "serial"
+    assert record["ssh"] == "box-alias"  # inherited, not blanked
+
+
+def test_re_adding_keeps_serial_settings_when_switching_back_to_ssh(cfg_path, monkeypatch) -> None:
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "add",
+                "box",
+                "--method",
+                "serial",
+                "--ups",
+                "cyberpower",
+                "--serial-device",
+                "/dev/ttyUSB0",
+                "--serial-baud",
+                "115200",
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "add",
+                "box",
+                "--method",
+                "ssh",
+                "--ssh",
+                "box-alias",
+                "--ups",
+                "cyberpower",
+            ]
+        )
+        == 0
+    )
+
+    record = json.loads(cfg_path.read_text())["monitored_machines"][0]
+    assert record["serial_device"] == "/dev/ttyUSB0"
+    assert record["serial_baud"] == 115200
+
+
+def test_an_explicit_value_still_overrides_the_inherited_one(cfg_path, monkeypatch) -> None:
+    # Inheritance must not become stickiness: a value the operator DID type wins.
+    monkeypatch.setenv(cli._SECRET_ENV, _PW)
+    _no_privileged_seams(monkeypatch)
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "add",
+                "box",
+                "--method",
+                "ssh",
+                "--ssh",
+                "old-alias",
+                "--ups",
+                "cyberpower",
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "add",
+                "box",
+                "--method",
+                "ssh",
+                "--ssh",
+                "new-alias",
+                "--ups",
+                "cyberpower",
+            ]
+        )
+        == 0
+    )
+
+    record = json.loads(cfg_path.read_text())["monitored_machines"][0]
+    assert record["ssh"] == "new-alias"

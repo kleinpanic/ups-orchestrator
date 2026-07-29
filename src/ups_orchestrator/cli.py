@@ -1831,6 +1831,27 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     others = tuple(m for m in cfg.monitored_machines if m.name.strip().lower() != target)
     existing = _monitor_find(cfg, args.name)
 
+    # Re-adding an existing machine is an UPSERT, not a REPLACE. The record used to be
+    # rebuilt from argv alone, so any field the operator did not re-type was silently
+    # blanked — changing a machine's method with
+    #     monitor add mt --method serial --ups cyberpower --serial-device ... --serial-baud ...
+    # destroyed its `ssh` alias, because --ssh was not repeated. Nothing reported it; the
+    # record simply came back with `ssh=`, and the next `--method native` (which requires
+    # an alias) then refused to enrol a machine that had been perfectly reachable all
+    # along. Inherit every field whose ABSENCE is distinguishable from a real value, so a
+    # method change stops costing unrelated configuration.
+    #
+    # `os` and `powervalue` are deliberately NOT inherited: argparse gives them concrete
+    # defaults ("auto", 1), so "not passed" and "passed the default" are the same value
+    # here and inheriting would be a guess. They are also both harmless to restate.
+    if existing is not None:
+        ssh_alias = ssh_alias or existing.ssh
+        ups_name = ups_name or existing.ups
+        if not args.serial_device:
+            args.serial_device = existing.serial_device
+        if baud is None and args.serial_baud is None:
+            baud = existing.serial_baud
+
     # BL-C2: the same ambiguity `monitor remove` refuses (T-02-48), for the same two
     # reasons — `_monitor_find` is first-wins, so the transition guard below would
     # inspect an ARBITRARY one of the duplicates, while `others` filters out EVERY
