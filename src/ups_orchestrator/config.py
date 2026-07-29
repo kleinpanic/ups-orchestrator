@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -231,6 +231,24 @@ class ConfigNotice:
 def is_disarming(notice: ConfigNotice) -> bool:
     """Does ``notice`` take a shutdown authority away? See ``is_disarming_severity``."""
     return is_disarming_severity(notice.severity)
+
+
+def any_disarming(notices: Sequence[ConfigNotice]) -> bool:
+    """Did ANY notice take a shutdown authority away?
+
+    This is the heading's severity, and it is deliberately a separate question from
+    each row's. Both renderers used to hardcode the heading at the maximum, so a
+    config whose only notice was an advisory still announced "a shutdown authority
+    was disarmed" in red on EVERY invocation. On this deployment that was the steady
+    state, not an exception: 'method: none' beside a named UPS is a permanent,
+    verified-benign advisory, so the operator was trained to scroll past the one
+    banner that reports machines being powered off wrongly.
+
+    Kept beside ``is_disarming`` rather than inlined at the two call sites so the
+    safe orientation of the fold (unrecognised severity counts as disarming) cannot
+    drift between them.
+    """
+    return any(is_disarming(n) for n in notices)
 
 
 def _opt_int(value: object) -> int | None:

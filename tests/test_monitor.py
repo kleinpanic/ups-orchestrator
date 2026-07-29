@@ -2202,6 +2202,39 @@ def test_list_renders_degraded_notices_with_zero_machines(cfg_path, capsys) -> N
     assert "DEGRADED CONFIG" in out and "blank host" in out
 
 
+def test_advisory_only_config_does_not_claim_an_authority_was_disarmed(cfg_path, capsys) -> None:
+    """The heading takes the severity of its worst row, not a fixed maximum.
+
+    This is the live eulerpi4 shape: `method: none` beside a named UPS earns a
+    permanent advisory (declaring 'none' does not disarm an already-enrolled
+    secondary), and nothing is disarmed by it. Rendering that in the same red
+    "a shutdown authority was disarmed" banner as a real disarm made the banner
+    the steady state on this deployment, which trains the operator to scroll past
+    the one block that reports machines being powered off wrongly.
+    """
+    _write_config(cfg_path, machines=[_machine_entry("eulerpi4", method="none", ups="cyberpower")])
+    assert cli.main(["monitor", "list"]) == 0
+    out = capsys.readouterr().out
+
+    assert "CONFIG ADVISORIES" in out
+    assert "DEGRADED CONFIG" not in out
+    assert "disarmed at load" not in out
+    assert "ADVISORY" in out and "ERROR" not in out
+
+
+def test_a_disarming_notice_still_gets_the_degraded_heading(cfg_path, capsys) -> None:
+    """Reachability for the other side of the fold — the alarm must survive the fix."""
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("mt", method="serial", ups="", device="/dev/ttyUSB0", baud=9600)],
+    )
+    assert cli.main(["monitor", "list"]) == 0
+    out = capsys.readouterr().out
+
+    assert "DEGRADED CONFIG" in out
+    assert "CONFIG ADVISORIES" not in out
+
+
 def test_list_prints_no_degrade_block_when_clean(cfg_path, capsys) -> None:
     _write_config(cfg_path, machines=[_machine_entry("spark", method="native", ssh="spark")])
     assert cli.main(["monitor", "list"]) == 0

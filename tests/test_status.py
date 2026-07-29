@@ -110,6 +110,38 @@ def test_status_shows_error_and_advisory_notices(monkeypatch) -> None:
     assert "ADVISORY" in rendered and "spark" in rendered and "shutdown_cmd needs sudo" in rendered
 
 
+def test_status_advisory_only_block_is_not_titled_degraded(monkeypatch) -> None:
+    # Same fold as the CLI banner: an all-advisory config disarmed nothing, so the
+    # heading must not say it did. See test_config's any_disarming tests.
+    degraded = (ConfigNotice(severity="advisory", subject="eulerpi4", message="declares none"),)
+    cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+    rendered = status.render(cfg, color=False, now=0)
+    assert "CONFIG ADVISORIES" in rendered
+    assert "DEGRADED" not in rendered
+
+
+def test_status_advisory_only_heading_is_yellow_not_red(monkeypatch) -> None:
+    # Colour carries the severity for a glancing operator, so it has to follow the
+    # fold too — a yellow body under a red title reads as a disarm.
+    advisory = (ConfigNotice(severity="advisory", subject="eulerpi4", message="declares none"),)
+    disarming = (ConfigNotice(severity="error", subject="mt", message="disarmed"),)
+    monkeypatch.setattr(
+        status, "read_snapshot", lambda _name: UpsSnapshot("OL", 100, 600, 20, 120.0)
+    )
+
+    def title_line(notices):
+        cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=notices)
+        rendered = status.render(cfg, color=True, now=0)
+        return next(ln for ln in rendered.splitlines() if "CONFIG" in ln)
+
+    assert status._YELLOW in title_line(advisory)
+    assert status._RED not in title_line(advisory)
+    assert status._RED in title_line(disarming)
+
+
 def test_status_degraded_block_appears_before_first_ups_card(monkeypatch) -> None:
     degraded = (ConfigNotice(severity="error", subject="mt", message="disarmed"),)
     cfg = Config(webhook_url="", upses={"ups1": make_ups("ups1")}, degraded=degraded)

@@ -68,6 +68,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/config.py",
+        "return any(is_disarming(n) for n in notices)",
+        "return all(is_disarming(n) for n in notices)",
+        "config: heading severity folds with all() — a real disarm mixed with "
+        "advisories renders as advisory, hiding it",
+    ),
+    (
         "src/ups_orchestrator/nut.py",
         "self.realpower_nominal * self.load / 100",
         "self.realpower_nominal * self.load / 10",

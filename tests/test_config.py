@@ -13,6 +13,7 @@ from ups_orchestrator.config import (
     MonitoredMachine,
     ShutdownTarget,
     UpsConfig,
+    any_disarming,
     canonical_ups_index,
     canonical_ups_key,
     derive_shutdown_method,
@@ -1164,6 +1165,28 @@ def test_advisory_and_error_together_disarm_and_retain_both() -> None:
     assert m.effective_method == "none"
     assert len(m.load_notices) == 2
     assert {n.severity for n in m.load_notices} == {"advisory", "error"}
+
+
+def test_any_disarming_folds_the_heading_severity() -> None:
+    # The heading is a SEPARATE question from each row's severity. Both renderers
+    # used to hardcode it at the maximum, so an advisory-only config announced "a
+    # shutdown authority was disarmed" in red on every invocation.
+    assert any_disarming(()) is False
+    assert any_disarming((_adv(), _adv())) is False
+    assert any_disarming((_adv(), _err())) is True
+    assert any_disarming((_err(),)) is True
+
+
+def test_any_disarming_keeps_the_safe_orientation_of_its_fold() -> None:
+    # is_disarming_severity treats anything it does not recognise as disarming; the
+    # heading must inherit that, not re-derive a laxer rule. ConfigNotice validates
+    # at construction, so a free-string severity is built by bypassing __init__ the
+    # same way _transport_notices' strings reach the fold.
+    weird = ConfigNotice.__new__(ConfigNotice)
+    object.__setattr__(weird, "severity", "critical")
+    object.__setattr__(weird, "subject", "mt")
+    object.__setattr__(weird, "message", "a severity nobody added a branch for")
+    assert any_disarming((weird,)) is True
 
 
 def test_load_notices_are_not_compared() -> None:

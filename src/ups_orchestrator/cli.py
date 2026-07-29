@@ -65,6 +65,7 @@ from ups_orchestrator.config import (
     MonitoredMachine,
     ShutdownTarget,
     UpsConfig,
+    any_disarming,
     canonical_ups_key,
     dual_regime_conflicts,
     is_disarming,
@@ -282,7 +283,11 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
         body += f" ({overflow} further notice(s) not shown.)"
     deps.notifier.send(
         Notification(
-            title=f"⚠️ Config degraded at startup — {len(cfg.degraded)} notice(s)",
+            title=(
+                f"⚠️ Config degraded at startup — {len(cfg.degraded)} notice(s)"
+                if errors
+                else f"⚠️ Config advisories at startup — {len(cfg.degraded)} notice(s)"
+            ),
             body=body,
             level=Level.CRITICAL if errors else Level.WARNING,
             # F5: Discord renders these in a code-free embed field, and the
@@ -1200,7 +1205,10 @@ def _print_degraded(cfg: Config) -> None:
     if not cfg.degraded:
         return
     _say("")
-    _say("⚠ DEGRADED CONFIG — a shutdown authority was disarmed or flagged at load:")
+    if any_disarming(cfg.degraded):
+        _say("⚠ DEGRADED CONFIG — a shutdown authority was disarmed at load:")
+    else:
+        _say("⚠ CONFIG ADVISORIES — nothing was disarmed; review at leisure:")
     for n in cfg.degraded:
         label = "ERROR" if is_disarming(n) else "ADVISORY"
         _say(f"  {label} {n.subject}: {n.message}")  # _say sanitises (F5/LO-C5)

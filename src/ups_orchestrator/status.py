@@ -10,7 +10,13 @@ import textwrap
 import time
 from pathlib import Path
 
-from ups_orchestrator.config import Config, ConfigNotice, is_disarming, safe_text
+from ups_orchestrator.config import (
+    Config,
+    ConfigNotice,
+    any_disarming,
+    is_disarming,
+    safe_text,
+)
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
@@ -235,7 +241,12 @@ def _degraded_block(degraded: tuple[ConfigNotice, ...], *, use_color: bool) -> l
     def c(text: str, code: str) -> str:
         return f"{code}{text}{_RESET}" if use_color else text
 
-    title = c("⚠ DEGRADED CONFIG", _RED)
+    # The heading takes the severity of the worst row, not a fixed maximum: an
+    # all-advisory config that renders in red teaches the operator to ignore red.
+    if any_disarming(degraded):
+        title = c("⚠ DEGRADED CONFIG", _RED)
+    else:
+        title = c("⚠ CONFIG ADVISORIES", _YELLOW)
     # MED-05: wrap rather than widen. MED-06: sanitise the two config-authored fields
     # before they reach the terminal.
     width = _term_width() - 4
