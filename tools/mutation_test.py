@@ -68,6 +68,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/cli.py",
+        "return _verify_serial(machine, stat_fn, deep=args.deep, probe=serial_probe) or rc",
+        "return _verify_serial(machine, stat_fn, deep=False, probe=serial_probe) or rc",
+        "cli: --deep silently downgraded to the shallow serial check — the operator "
+        "asks the far end to answer and gets 'a device node exists'",
+    ),
+    (
         "src/ups_orchestrator/config.py",
         "return any(is_disarming(n) for n in notices)",
         "return all(is_disarming(n) for n in notices)",

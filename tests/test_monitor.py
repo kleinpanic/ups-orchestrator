@@ -20,6 +20,8 @@ import pytest
 
 import ups_orchestrator
 from ups_orchestrator import cli
+from ups_orchestrator.config import MonitoredMachine
+from ups_orchestrator.events import ProbeOutcome, ProbeResult
 
 # The operator's real policy-drop input base chain (mirrors the live box). The
 # upsd accept is spliced INTO this chain, so tests must seed the nft file with it
@@ -2418,6 +2420,118 @@ def test_verify_serial_checks_device_presence_through_the_injected_stat(
     assert seen == ["/dev/ttyUSB0"]  # no real /dev node was ever reached
     assert "9600" in out
     assert ssh.calls == []  # no ssh alias, no NUT probe
+
+
+def _chardev_stat(_path: str):  # noqa: ANN202
+    return os.stat_result((stat.S_IFCHR | 0o660, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+
+def test_verify_serial_without_deep_does_not_touch_the_line(capsys) -> None:
+    """The shallow check must stay shallow — and SAY that it is shallow.
+
+    A USB serial adapter presents a character device with nothing plugged into its
+    far end, so "the node exists" is not evidence the Dell can be reached.
+    """
+    m = MonitoredMachine(
+        name="mt", shutdown_method="serial", serial_device="/dev/ttyUSB0", serial_baud=115200
+    )
+
+    def _explode(*_a, **_k):  # noqa: ANN202
+        raise AssertionError("the shallow path must never open the line")
+
+    rc = cli._verify_serial(m, _chardev_stat, deep=False, probe=_explode)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "node only" in out and "--deep" in out
+
+
+def test_verify_serial_deep_reports_the_far_end_executing(capsys) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def _probe(device: str, baud: int):  # noqa: ANN202
+        calls.append((device, baud))
+        return ProbeResult(outcome=ProbeOutcome.SEEN, elapsed_seconds=0.4, detail="token returned")
+
+    m = MonitoredMachine(
+        name="mt", shutdown_method="serial", serial_device="/dev/ttyUSB0", serial_baud=115200
+    )
+    rc = cli._verify_serial(m, _chardev_stat, deep=True, probe=_probe)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls == [("/dev/ttyUSB0", 115200)]  # the DECLARED baud, never a substituted one
+    assert "executed our probe" in out
+
+
+def test_verify_serial_deep_silence_fails_without_claiming_the_line_is_dead(capsys) -> None:
+    """Silence fails the verb but must not assert a cause.
+
+    A busy console, a getty that does not echo, and a genuinely wrong baud are
+    indistinguishable from this end (see ProbeOutcome's own docstring), so the
+    wording has to stay an observation while the exit code stays honest: `verify`
+    returning 0 means "I confirmed it", and nothing was confirmed here.
+    """
+    m = MonitoredMachine(
+        name="mt", shutdown_method="serial", serial_device="/dev/ttyUSB0", serial_baud=115200
+    )
+    rc = cli._verify_serial(
+        m,
+        _chardev_stat,
+        deep=True,
+        probe=lambda *_a, **_k: ProbeResult(
+            outcome=ProbeOutcome.NOT_SEEN, elapsed_seconds=3.0, detail="no token in 3.0s"
+        ),
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "does NOT prove" in out
+    assert "dead" not in out.replace("the line is dead", "")  # only inside the disclaimer
+
+
+def test_verify_serial_deep_no_transport_is_rc1(capsys) -> None:
+    m = MonitoredMachine(
+        name="mt", shutdown_method="serial", serial_device="/dev/ttyUSB0", serial_baud=115200
+    )
+    rc = cli._verify_serial(
+        m,
+        _chardev_stat,
+        deep=True,
+        probe=lambda *_a, **_k: ProbeResult(
+            outcome=ProbeOutcome.NO_TRANSPORT, elapsed_seconds=0.0, detail="EACCES"
+        ),
+    )
+    assert rc == 1
+    assert "no usable serial line" in capsys.readouterr().out
+
+
+def test_monitor_verify_threads_deep_through_to_the_serial_probe(cfg_path, capsys) -> None:
+    """The actual bug: --deep was parsed and then never passed to _verify_serial.
+
+    Serial is the only method that survives the network UPS dying, so an operator
+    asking for the strong check on that path silently got the weak one.
+    """
+    _write_config(
+        cfg_path,
+        machines=[
+            _machine_entry(
+                "mt", method="serial", ups="cyberpower", device="/dev/ttyUSB0", baud=115200
+            )
+        ],
+    )
+    probed: list[tuple[str, int]] = []
+
+    def _probe(device: str, baud: int):  # noqa: ANN202
+        probed.append((device, baud))
+        return ProbeResult(outcome=ProbeOutcome.SEEN, elapsed_seconds=0.2, detail="ok")
+
+    # Passed as a seam rather than monkeypatched: the parameter default binds at def
+    # time, so patching cli.serial_liveness_probe would leave the real one in place
+    # and this test would open a real /dev node.
+    rc = cli._monitor_verify(
+        _load(cfg_path), ["mt", "--deep"], stat_fn=_chardev_stat, serial_probe=_probe
+    )
+    assert rc == 0
+    assert probed == [("/dev/ttyUSB0", 115200)]
+    assert "executed our probe" in capsys.readouterr().out
 
 
 def test_verify_serial_missing_device_is_rc1(cfg_path, capsys) -> None:

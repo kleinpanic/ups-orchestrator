@@ -77,10 +77,13 @@ from ups_orchestrator.config import (
 # re-deriving either. A second copy of "would this fire?" is a second answer.
 from ups_orchestrator.events import (
     Deps,
+    ProbeOutcome,
+    ProbeResult,
     _machine_targets,
     _target_location,
     _target_should_fire,
     dispatch,
+    serial_liveness_probe,
     ssh_dest,
 )
 from ups_orchestrator.jsonlog import append_event
@@ -1269,10 +1272,26 @@ def _probe_secondary_reason(m: MonitoredMachine) -> str | None:
     return None
 
 
-def _verify_serial(m: MonitoredMachine, stat_fn: Callable[[str], os.stat_result]) -> int:
+def _verify_serial(
+    m: MonitoredMachine,
+    stat_fn: Callable[[str], os.stat_result],
+    *,
+    deep: bool = False,
+    probe: Callable[..., ProbeResult] = serial_liveness_probe,
+) -> int:
     """Device presence and a declared baud, through an INJECTED stat.
 
-    The stat is injected so a unit test never reaches for a real ``/dev`` node.
+    The stat is injected so a unit test never reaches for a real ``/dev`` node, and
+    ``probe`` likewise so no test writes to a real console.
+
+    ``deep`` is what makes this verb worth trusting for the serial path. Without it
+    the strongest claim available is "a character device exists at that path", which
+    a USB adapter satisfies with nothing plugged into its other end. Serial is the
+    ONLY method that survives the network UPS dying, so "the node is there" is the
+    weakest possible evidence for the most important path. --deep already means
+    "actually talk to the far end" for the native path; before this it was a silent
+    no-op here, so an operator asking for the strong check got the weak one with no
+    indication.
     """
     device = m.serial_device.strip()
     if not device:
@@ -1291,8 +1310,35 @@ def _verify_serial(m: MonitoredMachine, stat_fn: Callable[[str], os.stat_result]
             f"{m.name}: FAIL — no usable declared serial_baud (must match the far end's getty rate)"
         )
         return 1
-    _say(f"{m.name}: OK — serial {device} present at a declared {m.serial_baud} baud")
-    return 0
+    if not deep:
+        _say(
+            f"{m.name}: OK — serial {device} present at a declared {m.serial_baud} baud "
+            f"(node only; --deep asks the far end to answer)"
+        )
+        return 0
+
+    result = probe(device, m.serial_baud)
+    if result.outcome is ProbeOutcome.SEEN:
+        _say(
+            f"{m.name}: OK — the far end executed our probe on {device} at "
+            f"{m.serial_baud} baud in {result.elapsed_seconds:.1f}s"
+        )
+        return 0
+    # NOT_SEEN is deliberately NOT reported as "the line is dead". ProbeOutcome is
+    # named for what was observed because the inference is contested: a busy console,
+    # a getty that does not echo, and a genuinely wrong baud all produce silence.
+    # It still fails the verb -- `verify` returning 0 has to mean "I confirmed it",
+    # and silence is exactly the case where the operator must go and look.
+    if result.outcome is ProbeOutcome.NOT_SEEN:
+        _say(
+            f"{m.name}: FAIL — nothing answered on {device} at {m.serial_baud} baud "
+            f"after {result.elapsed_seconds:.1f}s ({result.detail}). This does NOT prove "
+            f"the line is dead: a busy console, a getty that does not echo, and a wrong "
+            f"baud all look identical from here. Check the cable and the far end's getty."
+        )
+        return 1
+    _say(f"{m.name}: FAIL — no usable serial line to probe on {device} ({result.detail})")
+    return 1
 
 
 def _verify_ssh_alias(m: MonitoredMachine) -> int:
@@ -1375,6 +1421,7 @@ def _monitor_verify(
     cfg: Config,
     argv: list[str],
     stat_fn: Callable[[str], os.stat_result] = os.stat,
+    serial_probe: Callable[..., ProbeResult] = serial_liveness_probe,
 ) -> int:
     """``_monitor_verify_machine`` plus a best-effort firewall line, rc untouched.
 
@@ -1384,7 +1431,7 @@ def _monitor_verify(
     verdict. Here the rc is computed before the diagnostic runs and returned after,
     so no behaviour of the diagnostic can reach it (T-03-33).
     """
-    rc = _monitor_verify_machine(cfg, argv, stat_fn)
+    rc = _monitor_verify_machine(cfg, argv, stat_fn, serial_probe)
     _say_firewall_counters()
     return rc
 
@@ -1393,6 +1440,7 @@ def _monitor_verify_machine(
     cfg: Config,
     argv: list[str],
     stat_fn: Callable[[str], os.stat_result] = os.stat,
+    serial_probe: Callable[..., ProbeResult] = serial_liveness_probe,
 ) -> int:
     """Answer the question an operator actually asks: *will this machine shut down?*
 
@@ -1404,7 +1452,12 @@ def _monitor_verify_machine(
     parser = argparse.ArgumentParser(prog="ups-orchestrator monitor verify")
     parser.add_argument("name")
     parser.add_argument("--timeout", type=int, default=10, help="seconds to await a result")
-    parser.add_argument("--deep", action="store_true", help="also grep the remote auth journal")
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="talk to the far end: grep the remote auth journal (native), "
+        "or make the console answer a probe (serial)",
+    )
     parser.add_argument("--primary-ip", help="override the LAN address the secondary connects to")
     args = parser.parse_args(argv)
 
@@ -1546,7 +1599,7 @@ def _monitor_verify_machine(
     if machine.disarmed:
         return rc  # it will not fire; there is no transport left to check
     if declared == "serial":
-        return _verify_serial(machine, stat_fn) or rc
+        return _verify_serial(machine, stat_fn, deep=args.deep, probe=serial_probe) or rc
     if declared == "ssh":
         return _verify_ssh_alias(machine) or rc
     _say(f"{machine.name}: no active shutdown authority")
