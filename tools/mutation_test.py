@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import os
 import pathlib
+import signal
 import subprocess
 import sys
+import types
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -23,6 +25,45 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # restored .py whose mtime lands in the same second as the mutated write keeps
 # the mutated .pyc cached, poisoning the next clean run with a phantom failure.
 _CHILD_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+
+# This harness edits src/ IN PLACE, so its one hard promise is that a mutant
+# never outlives the run. Two separate incidents broke that promise in one
+# evening and both left broken logic on disk looking exactly like an ordinary
+# working-tree edit:
+#
+#   1. Two runs raced. Each restored "its" original, so one wrote back a copy it
+#      had read while the OTHER's mutant was applied — leaving `if False:` where
+#      a MONITOR guard belongs, and `load / 10` where a watts calculation goes.
+#   2. An external `timeout 900` sent SIGTERM mid-mutant. The `finally` never
+#      ran, leaving the nftables rollback replaced by `pass`.
+#
+# Both are now structurally prevented rather than remembered: a lock stops the
+# race, and a signal handler restores before dying. A reviewer reading src/
+# mid-run still sees a mutant — that is unavoidable and is why the automated
+# security scanner flagged one — but nothing is left behind afterwards.
+_LOCK = ROOT / ".mutation-test.lock"
+_IN_FLIGHT: tuple[pathlib.Path, str] | None = None
+
+
+def _restore_in_flight() -> None:
+    """Put back the mutant currently applied, if any. Safe to call twice."""
+    global _IN_FLIGHT
+    if _IN_FLIGHT is not None:
+        path, original = _IN_FLIGHT
+        _IN_FLIGHT = None
+        try:
+            path.write_text(original)
+        except OSError as exc:  # pragma: no cover — best effort while dying
+            print(f"FAILED to restore {path}: {exc}", file=sys.stderr)
+
+
+def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
+    """Restore before dying. Without this a SIGTERM leaves a mutant on disk."""
+    _restore_in_flight()
+    _LOCK.unlink(missing_ok=True)
+    print(f"\ninterrupted by signal {signum}; source restored", file=sys.stderr)
+    raise SystemExit(128 + signum)
+
 
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
@@ -651,6 +692,31 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
 
 
 def main() -> int:
+    # Refuse to start while another run holds the tree. Concurrent runs corrupt
+    # each other's restores; see the note beside _LOCK.
+    try:
+        fd = os.open(_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        print(
+            f"another mutation run holds {_LOCK}. This harness patches src/ in place,\n"
+            "so two runs corrupt each other. Wait for it, or remove the lock if stale.",
+            file=sys.stderr,
+        )
+        return 2
+    os.write(fd, f"{os.getpid()}\n".encode())
+    os.close(fd)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
+    try:
+        return _run()
+    finally:
+        _restore_in_flight()
+        _LOCK.unlink(missing_ok=True)
+
+
+def _run() -> int:
+    global _IN_FLIGHT
     killed = survived = skipped = 0
     for rel, old, new, desc in MUTATIONS:
         path = ROOT / rel
@@ -659,6 +725,7 @@ def main() -> int:
             print(f"  SKIP     {desc} (pattern not found — update the harness)")
             skipped += 1
             continue
+        _IN_FLIGHT = (path, original)
         path.write_text(original.replace(old, new, 1))
         try:
             # Hard timeout: a mutant can turn a bounded loop into an infinite one
@@ -679,6 +746,7 @@ def main() -> int:
             print(f"  KILLED   {desc} (suite hung — mutant caused a non-terminating loop)")
         finally:
             path.write_text(original)
+            _IN_FLIGHT = None
         if returncode != 0:
             if returncode != -1:
                 print(f"  KILLED   {desc}")

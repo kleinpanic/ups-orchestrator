@@ -42,6 +42,11 @@ coverage.xml
 mutants/
 .mutmut-cache
 
+# tools/mutation_test.py mutual-exclusion lock. Normally removed on exit; a
+# SIGKILL or power loss can strand one, and a stranded lock is a thing to
+# delete, never to commit.
+.mutation-test.lock
+
 # opencode CLI runtime state (from cross-AI reviews)
 .opencode/
 
