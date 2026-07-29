@@ -241,7 +241,10 @@ def test_valid_shutdown_cmd_is_the_one_predicate_for_both_sinks():
 
 def test_accept_rule_is_a_marked_chain_line_not_a_table():
     rule = nutclient.render_nft_accept_rule(["192.168.1.40", "192.168.1.50"])
-    assert "tcp dport 3493 ip saddr { 192.168.1.40, 192.168.1.50 } accept" in rule
+    assert (
+        'tcp dport 3493 ip saddr { 192.168.1.40, 192.168.1.50 } counter name "upsd_allowed" accept'
+        in rule
+    )
     assert "# BEGIN UPS-ORCHESTRATOR MANAGED" in rule
     # No dedicated table / hooked chain of our own — the old broken form.
     assert "table inet ups_orchestrator" not in rule
@@ -261,7 +264,7 @@ def test_upsert_lands_inside_policy_drop_chain_after_ct_accept():
     """
     text, changed = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.114"])
     assert changed is True
-    rule_line = "tcp dport 3493 ip saddr { 192.168.1.114 } accept"
+    rule_line = 'tcp dport 3493 ip saddr { 192.168.1.114 } counter name "upsd_allowed" accept'
     assert rule_line in text
 
     # It falls between this chain's ct-accept and the chain's closing brace, i.e.
@@ -326,6 +329,249 @@ def test_upsert_falls_back_to_after_brace_without_ct_accept():
     rule_pos = text.index("tcp dport 3493")
     lo_pos = text.index('iif "lo" accept')
     assert hook_pos < rule_pos < lo_pos
+
+
+# --- 03-07: named counters, two managed blocks, the marker trap ---------------
+#
+# Every test below names the mutation it kills. The project has shipped
+# "tests that cannot fail" five times, and the shape is always an assertion on a
+# value BOTH branches produce — so these assert on ORDERING, on ABSENCE, on a
+# recorded call list, or on a comparison between two runs.
+
+
+def test_counter_objects_render_at_table_scope_not_inside_the_chain():
+    """KILLS: inserting the objects block at the ct-accept site (chain scope).
+
+    A named counter is a TABLE-scope object. Emitted inside the chain it parses as
+    a chain statement and then fails at load, taking the operator's policy-drop
+    chain with it at the next boot. Asserting only "the declaration is present"
+    would pass under BOTH placements, so this asserts its POSITION: after the
+    table's opening line and before the chain's.
+    """
+    text, _ = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.114"])
+    table_pos = text.index("table inet filter {")
+    counter_pos = text.index("counter upsd_allowed")
+    chain_pos = text.index("chain input {")
+    assert table_pos < counter_pos < chain_pos
+    # And the reference is inside the chain, i.e. the two scopes really are distinct.
+    assert chain_pos < text.index('counter name "upsd_allowed"')
+
+
+def test_counter_declaration_name_is_bare_and_the_reference_is_quoted():
+    """KILLS: quoting the counter DECLARATION.
+
+    Verified against nft 1.1.3: `counter "upsd_allowed" {` is
+    `syntax error, unexpected quoted string, expecting string` — a hard `nft -f`
+    failure. The quoted spelling is legal ONLY in the `counter name "x"` reference,
+    which is the asymmetry that makes this easy to get backwards. Both halves are
+    asserted so a mutant that "fixes" the quoting consistently in either direction
+    is caught.
+    """
+    objects = nutclient.render_nft_counter_objects()
+    assert "counter upsd_allowed {" in objects
+    assert 'counter "upsd_allowed"' not in objects
+    assert 'counter "upsd_denied"' not in objects
+
+    rule = nutclient.render_nft_accept_rule(["192.168.1.114"])
+    assert 'counter name "upsd_allowed"' in rule
+    assert "counter name upsd_allowed" not in rule
+
+
+def test_counter_reference_precedes_the_accept_verdict():
+    """KILLS: moving the counter reference AFTER the verdict.
+
+    `accept counter name "upsd_allowed"` still PARSES (confirmed with nft -c), so a
+    syntax gate cannot catch it — but a verdict terminates rule evaluation, so the
+    counter never increments and the diagnostic reads zero forever. Asserts the two
+    tokens' order WITHIN the one rendered line; asserting both are present would
+    pass under both branches.
+    """
+    rule = nutclient.render_nft_accept_rule(["192.168.1.114"])
+    line = next(ln for ln in rule.splitlines() if "ip saddr" in ln)
+    assert line.index('counter name "upsd_allowed"') < line.index(" accept")
+
+
+def test_denied_rule_carries_no_verdict():
+    """KILLS: adding a verdict to the verdict-less denied rule.
+
+    An `accept` there opens tcp/3493 to EVERY source on the network, ABOVE the
+    operator's policy drop — the single most dangerous mutation in this plan. The
+    packet must fall through to the chain's own policy, so the line carries a
+    counter and nothing else.
+    """
+    rule = nutclient.render_nft_accept_rule(["192.168.1.114"])
+    denied = next(ln for ln in rule.splitlines() if "upsd_denied" in ln)
+    for verdict in ("accept", "drop", "reject", "queue", "jump", "goto", "return", "continue"):
+        assert verdict not in denied, f"denied rule must carry no verdict, found {verdict!r}"
+
+
+def test_three_consecutive_upserts_leave_one_copy_of_each_block():
+    """KILLS: the single-`find` stripper (one block stripped, the other accumulating).
+
+    Discriminating by construction: ONE upsert passes under both branches, and so
+    does the assertion "the block is present". Only the third exposes the
+    accumulation — and duplicate `counter` declarations are a hard `nft -f`
+    failure, so the accumulated file breaks every reload from then on.
+    """
+    text = POLICY_DROP_RULESET
+    for _ in range(3):
+        text, _ = nutclient.upsert_nft_input_chain(text, ["192.168.1.114"])
+    assert text.count(nutclient._NFT_BEGIN) == 1
+    assert text.count(nutclient._NFT_COUNTERS_BEGIN) == 1
+    assert text.count("counter upsd_allowed {") == 1
+    assert text.count("counter upsd_denied {") == 1
+
+
+def test_object_marker_and_rule_marker_are_not_prefixes_of_each_other():
+    """KILLS: renaming the objects block to the prefix-colliding form.
+
+    THE TRAP LOCK. Research suggested `# BEGIN UPS-ORCHESTRATOR MANAGED OBJECTS`,
+    a strict prefix superset of `# BEGIN UPS-ORCHESTRATOR MANAGED`. The stripper
+    locates a block with a single `text.find`, and the objects block sits EARLIER
+    in the file, so `find(_NFT_BEGIN)` would land on the objects block and strip
+    through the RULE block's `# END`, deleting the chain's opening lines. Without
+    this assertion a rename looks harmless. Checked in BOTH directions and for
+    containment, not just `startswith`, because either ordering breaks a `find`.
+    """
+    pairs = (
+        (nutclient._NFT_BEGIN, nutclient._NFT_COUNTERS_BEGIN),
+        (nutclient._NFT_END, nutclient._NFT_COUNTERS_END),
+    )
+    for rule_marker, object_marker in pairs:
+        assert rule_marker != object_marker
+        assert not object_marker.startswith(rule_marker)
+        assert not rule_marker.startswith(object_marker)
+        assert rule_marker not in object_marker
+        assert object_marker not in rule_marker
+
+
+def test_empty_saddrs_restores_a_two_block_ruleset_byte_for_byte():
+    """KILLS: stripping only ONE of the two blocks on revocation.
+
+    Starts from a ruleset that ALREADY carries both blocks (not from the bare
+    fixture), so a stripper that handles the rule block alone leaves the counter
+    declarations behind and the equality fails. Byte equality, not a substring
+    check: a leftover blank indented line would also be a defect.
+    """
+    both, _ = nutclient.upsert_nft_input_chain(POLICY_DROP_RULESET, ["192.168.1.114"])
+    assert nutclient._NFT_BEGIN in both and nutclient._NFT_COUNTERS_BEGIN in both
+    dropped, changed = nutclient.upsert_nft_input_chain(both, [])
+    assert changed is True
+    assert dropped == POLICY_DROP_RULESET
+
+
+def test_upsert_refuses_when_the_hook_chain_has_no_enclosing_table():
+    """KILLS: inserting the objects block at offset 0 when no table line is found.
+
+    A counter declared outside a table is not a declaration at all, and a rule
+    referencing an undeclared counter makes nft reject the whole ruleset. Refusing
+    to write beats writing a file that will not load at the next boot.
+    """
+    bare_chain = (
+        "chain input {\n"
+        "    type filter hook input priority filter; policy drop;\n"
+        "    ct state established,related accept\n"
+        "}\n"
+    )
+    with pytest.raises(ValueError, match="table"):
+        nutclient.upsert_nft_input_chain(bare_chain, ["192.168.1.114"])
+
+
+# --- 03-07: the counter READ path (pure parser + injected seam) ---------------
+
+_COUNTERS_JSON = """
+{"nftables": [
+  {"metainfo": {"version": "1.1.3", "json_schema_version": 1}},
+  {"counter": {"family": "inet", "table": "main", "name": "upsd_allowed",
+               "handle": 4, "packets": 12, "bytes": 720}},
+  {"counter": {"family": "inet", "table": "main", "name": "upsd_denied",
+               "handle": 5, "packets": 3, "bytes": 180}}
+]}
+"""
+
+
+def test_counter_parser_reads_packets_and_bytes():
+    got = nutclient.parse_nft_counters(_COUNTERS_JSON, "main")
+    assert got == {"upsd_allowed": (12, 720), "upsd_denied": (3, 180)}
+
+
+def test_counter_parser_scopes_to_the_requested_table():
+    """KILLS: returning the first NAME match regardless of table/family.
+
+    A same-named counter in another table belongs to another subsystem; reporting
+    it as ours is a confident wrong answer about whether our block is loaded at
+    all. The canned document carries `upsd_allowed` in BOTH tables with different
+    values, so a parser that ignores the table returns the wrong numbers rather
+    than merely too many.
+    """
+    payload = """
+    {"nftables": [
+      {"counter": {"family": "inet", "table": "somebody_else", "name": "upsd_allowed",
+                   "packets": 999, "bytes": 999}},
+      {"counter": {"family": "inet", "table": "main", "name": "upsd_allowed",
+                   "packets": 1, "bytes": 40}}
+    ]}
+    """
+    assert nutclient.parse_nft_counters(payload, "main") == {"upsd_allowed": (1, 40)}
+    assert nutclient.parse_nft_counters(payload, "somebody_else") == {"upsd_allowed": (999, 999)}
+    # The family is scoped too: the same table name in ip/ip6 is a different table.
+    assert nutclient.parse_nft_counters(payload, "main", family="ip") == {}
+
+
+def test_counter_parser_returns_empty_on_malformed_json():
+    """KILLS: removing the defensive parse (a bare json.loads raises here)."""
+    for payload in ("", "not json at all", '{"nftables": ', "\x00\x01"):
+        assert nutclient.parse_nft_counters(payload, "main") == {}
+
+
+def test_counter_parser_returns_empty_on_unexpected_shape():
+    """KILLS: removing the per-level isinstance guards.
+
+    Valid JSON of every wrong shape: a list at the top, a non-list `nftables`, a
+    string where an object entry belongs, and a counter whose fields are the wrong
+    types. Each would be a different `TypeError`/`AttributeError` in the command
+    whose exit code is a machine's shutdown verdict.
+    """
+    for payload in (
+        "[]",
+        '{"nftables": {}}',
+        '{"nftables": ["counter", 7, null]}',
+        '{"nftables": [{"counter": "upsd_allowed"}]}',
+        '{"other_key": [{"counter": {"table": "main", "name": "x"}}]}',
+    ):
+        assert nutclient.parse_nft_counters(payload, "main") == {}
+    # A well-shaped entry with non-integer counts degrades to zeros rather than
+    # raising, and `true` is NOT read as a count of one despite bool being an int.
+    weird = (
+        '{"nftables": [{"counter": {"family": "inet", "table": "main", '
+        '"name": "upsd_allowed", "packets": "lots", "bytes": true}}]}'
+    )
+    assert nutclient.parse_nft_counters(weird, "main") == {"upsd_allowed": (0, 0)}
+
+
+def test_read_counters_distinguishes_unreadable_from_absent():
+    """KILLS: collapsing a non-zero nft rc into an empty mapping.
+
+    Those are different facts: rc != 0 is "no privilege to look" (the non-root
+    case), an empty mapping on rc 0 is "looked, and our block is NOT in the running
+    ruleset" — the drift detector. Reporting the first as the second would tell an
+    operator their firewall rule is missing every time they forget sudo.
+    """
+    argvs: list[list[str]] = []
+
+    def denied(argv):  # noqa: ANN001
+        argvs.append(list(argv))
+        return 1, "", "Operation not permitted"
+
+    readable, counters = nutclient.read_nft_counters("main", denied)
+    assert readable is False and counters == {}
+    assert argvs == [["nft", "-j", "list", "counters"]]
+
+    readable, counters = nutclient.read_nft_counters("main", lambda _argv: (0, "{}", ""))
+    assert readable is True and counters == {}
+
+    readable, counters = nutclient.read_nft_counters("main", lambda _argv: (0, _COUNTERS_JSON, ""))
+    assert readable is True and counters["upsd_denied"] == (3, 180)
 
 
 # --- remote_config_guard (pure) ----------------------------------------------
@@ -604,7 +850,7 @@ def test_apply_nft_restarts_bouncer_after_reload(tmp_path):
     assert order == [f"nft:{conf}", "restart"]
     # The accept landed inside the policy-drop chain, not a table of our own.
     written = conf.read_text()
-    assert "tcp dport 3493 ip saddr { 192.168.1.40 } accept" in written
+    assert 'tcp dport 3493 ip saddr { 192.168.1.40 } counter name "upsd_allowed" accept' in written
     assert "table inet ups_orchestrator" not in written
 
 

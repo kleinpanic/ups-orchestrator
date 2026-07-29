@@ -484,6 +484,110 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "        pass  # mutated — a refused upsc goes back to being silent",
         "nut: upsc failure silent again (the two-day outage's invisibility)",
     ),
+    # --- nutproto: the per-UPS FSD trigger (03-06) ----------------------------
+    #
+    # Every entry below is paired with the test in tests/test_nutproto.py that
+    # kills it. The one mutant deliberately NOT registered is "make the block read
+    # unbounded" — it kills by hanging, which costs this harness its full 120 s
+    # timeout on every run; test_read_block_is_bounded_against_an_endless_server
+    # pins that behaviour directly instead.
+    (
+        "src/ups_orchestrator/nutproto.py",
+        'FSD_ACK = "OK FSD-SET"',
+        'FSD_ACK = "OK"  # mutated — the bare OK the auth lines also return',
+        "nutproto: FSD ack weakened to the auth OK — a server that never set the flag "
+        "reports success (killed by test_bare_ok_to_the_fsd_line_is_a_failure)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        "    if not valid_nut_name(upsname):\n        return FsdResult(",
+        "    if False:  # mutated — UPS name no longer validated\n        return FsdResult(",
+        "nutproto: set_fsd UPS-name guard dropped — a name carrying a newline appends a "
+        "second command (killed by test_refuses_a_bad_ups_name_and_sends_nothing)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        "    if not _valid_credential(password):",
+        "    if False:  # mutated — password no longer checked for control chars",
+        "nutproto: credential control-char guard dropped — a newline in the password "
+        "closes its line (killed by "
+        "test_refuses_a_password_containing_a_newline_and_sends_nothing)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        "    if not _valid_credential(user):",
+        "    if False:  # mutated — username no longer checked for control chars",
+        "nutproto: USERNAME line left injectable (killed by "
+        "test_refuses_a_username_containing_a_control_character_and_sends_nothing)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        '            detail = f"{name} refused: {_scrub(response.strip(), password)!r}"\n'
+        "            return FsdResult(ok=False, upsname=upsname, failed_line=name, detail=detail)",
+        '            detail = f"{name} refused: {_scrub(response.strip(), password)!r}"\n'
+        "            continue  # mutated — a refused line no longer stops the exchange",
+        "nutproto: exchange no longer stops at the first refusal — the plaintext password "
+        "goes on the wire to a server that already refused the user "
+        "(killed by test_stops_when_username_is_refused)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        '            detail = f"{name} refused: {_scrub(response.strip(), password)!r}"',
+        '            detail = f"{line} refused: {_scrub(response.strip(), password)!r}"',
+        "nutproto: failure detail built from the line that was SENT — the PASSWORD line's "
+        "bytes ARE the secret (killed by test_failure_detail_never_contains_the_password)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        'f"{name} refused: {_scrub(response.strip(), password)!r}"',
+        'f"{name} refused: {response.strip()!r}"  # mutated — reply no longer scrubbed',
+        "nutproto: server reply no longer scrubbed — a server echoing the password back "
+        "leaks it (killed by test_a_server_that_echoes_the_password_back_is_scrubbed)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        "        except Exception as exc:",
+        "        except ValueError as exc:  # mutated — OSError now escapes set_fsd",
+        "nutproto: transport exception escapes onto the shutdown path, stranding every "
+        "target behind it (killed by "
+        "test_a_transport_that_raises_returns_a_failure_not_an_exception)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        '    if lines and lines[0].startswith("ERR "):',
+        "    if False:  # mutated — ERR now reads as an empty census",
+        "nutproto: LIST CLIENT ERR read as 'zero clients' — 'upsd does not know that UPS' "
+        "becomes 'every secondary drained' (killed by "
+        "test_list_client_err_is_a_failure_not_an_empty_census)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        '        if len(parts) == 3 and parts[0] == "CLIENT" and parts[1] == upsname',
+        '        if len(parts) == 3 and parts[0] == "CLIENT"  # mutated — any UPS counts',
+        "nutproto: client census harvests other UPSes' clients (killed by "
+        "test_list_client_ignores_client_lines_for_another_ups)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        "    if not line:",
+        "    if False:  # mutated — EOF now reads as a blank line",
+        "nutproto: a closed socket spins the read loop instead of failing; no timeout "
+        "fires because nothing blocks (killed by test_read_line_raises_on_a_closed_connection)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        '        if line.startswith("END LIST"):',
+        "        if False:  # mutated — END LIST no longer terminates the block",
+        "nutproto: block read runs past END LIST into the next reply, desynchronising the "
+        "connection (killed by test_read_block_stops_at_end_list)",
+    ),
+    (
+        "src/ups_orchestrator/nutproto.py",
+        '        return send("LOGOUT")',
+        '        return "OK Goodbye"  # mutated — LOGOUT never sent',
+        "nutproto: LOGOUT dropped, leaving a stale entry in the very census list_clients "
+        "reads (killed by test_logout_is_sent_verbatim_and_never_raises)",
+    ),
 ]
 
 

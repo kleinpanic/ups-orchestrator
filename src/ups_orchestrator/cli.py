@@ -1005,10 +1005,20 @@ _REMOTE_NUT_CONF_PATH = "/etc/nut/nut.conf"
 # to `nft -f` so the whole ruleset (with the include) is reloaded atomically.
 _NFT_PATH = "/etc/nftables.d/main.nft"
 _NFT_RELOAD_PATH = "/etc/nftables.conf"
+# The family/table the managed blocks live in, i.e. the table that owns the input
+# base chain in _NFT_PATH. Only the counter READ needs to name it — the write finds
+# the table structurally, by scanning back from the `hook input` line.
+_NFT_FAMILY = "inet"
+_NFT_TABLE = "main"
 
 
 def _monitor_run_nft(path: str) -> tuple[int, str, str]:  # pragma: no cover — live only
     return nutclient._default_run_local(["nft", "-f", path])
+
+
+# The READ half of the nft seam. Separate from `_monitor_run_nft` because that one
+# writes the kernel's ruleset and this one only looks at it.
+_monitor_run_nft_read = nutclient._default_run_nft_read
 
 
 def _monitor_restart_bouncer() -> None:  # pragma: no cover — live only
@@ -1070,23 +1080,33 @@ def _survivor_saddrs(machines: tuple[MonitoredMachine, ...]) -> list[str]:
     for m in machines:
         if m.shutdown_method.strip().lower() != "native":
             continue
-        ip = m.ip.strip()
-        if not ip:
-            continue
-        if not _valid_saddr_ip(ip):
-            LOG.warning(
-                "monitor: ignoring machine %r's ip %r for the nft saddr set — it is not a "
-                "valid IPv4 literal, and this value is loaded into the ruleset by nft -f. "
-                "That set is rendered as 'ip saddr', nftables' IPv4 matcher, so a v6 "
-                "address there makes nft reject the ENTIRE ruleset (F2). Fix 'ip' in the "
-                "config, or re-run 'monitor add %s' to re-resolve it.",
-                safe_text(m.name),
-                safe_text(m.ip),
-                safe_text(m.name),
-            )
-            continue
-        if ip not in out:
-            out.append(ip)
+        # EVERY address, not just the first. A dual-homed machine sources from
+        # whichever address its own routing table picks, and that table lives on a
+        # box this repo does not administer. Reading only `ip` left the second
+        # address out of the allow set, so a link flap or a DHCP renewal on the
+        # secondary firewalled it out silently — and the symptom is not "blocked",
+        # it is "shuts down 30-45 s late via DEADTIME", which a casual test passes.
+        #
+        # Both filters below run PER MEMBER. Validating only the first would let a
+        # v6 literal in position two reach `nft -f` and reject the whole ruleset.
+        for raw in m.addresses:
+            ip = raw.strip()
+            if not ip:
+                continue
+            if not _valid_saddr_ip(ip):
+                LOG.warning(
+                    "monitor: ignoring machine %r's ip %r for the nft saddr set — it is not a "
+                    "valid IPv4 literal, and this value is loaded into the ruleset by nft -f. "
+                    "That set is rendered as 'ip saddr', nftables' IPv4 matcher, so a v6 "
+                    "address there makes nft reject the ENTIRE ruleset (F2). Fix 'ip'/'ips' in "
+                    "the config, or re-run 'monitor add %s' to re-resolve it.",
+                    safe_text(m.name),
+                    safe_text(raw),
+                    safe_text(m.name),
+                )
+                continue
+            if ip not in out:
+                out.append(ip)
     return out
 
 
@@ -1298,7 +1318,70 @@ def _verify_ssh_alias(m: MonitoredMachine) -> int:
     return 0
 
 
+def _say_firewall_counters() -> None:
+    """Print the managed nft counters, best-effort. Returns nothing, RAISES nothing.
+
+    Nothing in this tool could see the RUNNING ruleset before, and that gap is why
+    file-versus-running drift is invisible: `apply_nft` decides "no change" by
+    comparing the FILE to what the FILE would become and never asks the kernel, so
+    a boot where `nft -f` failed leaves the file correct, the port closed, and this
+    tool reporting success forever after. An ABSENT `upsd_allowed` object on a
+    SUCCESSFUL read is the cheap partial detector for exactly that.
+
+    `upsd_denied` is the line that matters. `upsd_allowed` answers "are the enrolled
+    secondaries connecting?"; only `upsd_denied` answers "is something being
+    blocked?", which is the failure that has already bitten twice on this box.
+
+    Returns None by construction: the caller's exit code is a machine's shutdown
+    verdict, and a firewall diagnostic must not be able to move it (T-03-33).
+    """
+    readable, counters = nutclient.read_nft_counters(
+        _NFT_TABLE, _monitor_run_nft_read, family=_NFT_FAMILY
+    )
+    if not readable:
+        _say(
+            "  firewall counters unavailable (needs root) — 'sudo nft -j list counters' reads them"
+        )
+        return
+    allowed = counters.get(nutclient._NFT_COUNTER_ALLOWED)
+    denied = counters.get(nutclient._NFT_COUNTER_DENIED)
+    if allowed is None:
+        _say(
+            f"  firewall: the managed counter block is NOT in the running ruleset "
+            f"({_NFT_FAMILY} {_NFT_TABLE}). The file on disk may still be correct — that is "
+            f"the drift this detects. Reload with 'sudo nft -f {_NFT_RELOAD_PATH}'."
+        )
+        return
+    denied_pkts, denied_bytes = denied if denied is not None else (0, 0)
+    line = (
+        f"  firewall: upsd_allowed {allowed[0]} pkts / {allowed[1]} bytes, "
+        f"upsd_denied {denied_pkts} pkts / {denied_bytes} bytes"
+    )
+    if denied_pkts:
+        line += " — something is connecting to tcp/3493 from an address the allow set does not"
+        line += " contain; if that is a secondary, its source address is wrong in the config"
+    _say(line)
+
+
 def _monitor_verify(
+    cfg: Config,
+    argv: list[str],
+    stat_fn: Callable[[str], os.stat_result] = os.stat,
+) -> int:
+    """``_monitor_verify_machine`` plus a best-effort firewall line, rc untouched.
+
+    The split is the mechanism, not a style choice: `_monitor_verify_machine` has
+    nine returns, so appending the diagnostic inside it would mean nine call sites
+    and nine chances for one of them to let a firewall failure become the machine's
+    verdict. Here the rc is computed before the diagnostic runs and returned after,
+    so no behaviour of the diagnostic can reach it (T-03-33).
+    """
+    rc = _monitor_verify_machine(cfg, argv, stat_fn)
+    _say_firewall_counters()
+    return rc
+
+
+def _monitor_verify_machine(
     cfg: Config,
     argv: list[str],
     stat_fn: Callable[[str], os.stat_result] = os.stat,
@@ -1629,36 +1712,122 @@ def _parse_route_src(route_out: str) -> str | None:
     return None
 
 
-def _resolve_remote_ip(alias: str, explicit: str | None, primary_ip: str) -> str | None:
-    """Resolve the source IP the secondary uses to reach the primary.
+def _usable_saddr(value: str) -> bool:
+    """A LAN address that can legitimately be a upsd source: v4, routable, not local.
 
-    Order: explicit ``--ip`` overrides everything → ``ip -o route get
-    <primary_ip>`` run ON THE REMOTE (its ``src`` is the address upsd actually
-    sees) → ``$SSH_CONNECTION`` field 1 as a last-resort fallback. Returns a
-    validated IP literal or ``None`` when nothing usable resolves.
-
-    The route probe replaces trusting ``$SSH_CONNECTION`` field 1 outright:
-    over a WAN/NAT SSH path that field is the gateway, so a route lookup toward
-    the primary is the only reliable way to learn the machine's real LAN IP.
+    Loopback and link-local are excluded because neither can ever be the source of
+    a connection that reaches this primary, so an entry for one only widens the
+    allow set for nothing. The remote reports its own addresses, so this filter runs
+    over parsed input from a machine this repo does not administer — it is ours to
+    apply, not the remote's to be trusted with.
     """
-    # F2: every rung yields the value that lands in `entry.ip`, whose only consumer
-    # is the `ip saddr` (IPv4) set — so IPv4 is what "usable" means here. A
-    # v6-reachable secondary's $SSH_CONNECTION field 1 is a v6 literal, which used
-    # to be accepted and then rendered a ruleset `nft -f` refuses.
+    try:
+        addr = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+    return not (addr.is_loopback or addr.is_link_local)
+
+
+_REMOTE_ADDR_PROBE = "ip -o -4 addr show scope global"
+
+
+def _parse_ipv4_addrs(addr_out: str) -> list[str]:
+    """Extract usable IPv4 literals from ``ip -o -4 addr show`` output. PURE.
+
+    Lines look like ``2: eth0    inet 192.168.1.138/24 brd … scope global eth0``.
+    The prefix length is dropped; loopback and link-local are filtered here rather
+    than relying on the command's own ``scope global`` (both filters are cheap and
+    only one of them is under this repo's control). Order is preserved and
+    duplicates are collapsed.
+    """
+    out: list[str] = []
+    for line in addr_out.splitlines():
+        tokens = line.split()
+        for i, tok in enumerate(tokens):
+            if tok != "inet" or i + 1 >= len(tokens):
+                continue
+            candidate = tokens[i + 1].split("/")[0]
+            if _usable_saddr(candidate) and candidate not in out:
+                out.append(candidate)
+    return out
+
+
+def _resolve_remote_addrs(alias: str, explicit: str | None, primary_ip: str) -> list[str] | None:
+    """Every address the secondary can source from, ROUTE SOURCE FIRST. ``None`` = refuse.
+
+    Order: explicit ``--ip`` overrides everything and probes nothing → otherwise
+    ``ip -o route get <primary_ip>`` run ON THE REMOTE, whose ``src`` is the exact
+    address upsd will see, followed by every other global IPv4 the remote reports
+    for itself.
+
+    **There is no ``$SSH_CONNECTION`` fallback, deliberately.** That field is merely
+    the address we happened to arrive from. Its original purpose was real — over a
+    WAN/NAT path it is the gateway, which is why the route probe was introduced
+    (the live bug: mt resolved to 192.168.1.1) — but as a FALLBACK it reintroduces a
+    subtler version of the same error. On eulerpi4 the two differ on the SAME
+    machine: the ssh alias reaches 192.168.1.137 (wlan0) while upsmon sources from
+    192.168.1.138 (eth0), and both answer ARP with the same MAC, so nothing about
+    the pair looks wrong. Enrolling through the alias would write .137 into the
+    firewall, upsmon would connect from .138, the packet would be dropped, and the
+    failure presents as "it works, just slowly" — the secondary still self-shuts
+    30-45 s late through the DEADTIME promotion path. There is no case where
+    guessing beats refusing: the cost of a wrong entry is a secondary that does not
+    receive FSD, which is the whole thing this phase exists to make reliable.
+    ``ip route get`` ships with iproute2 on every machine in this fleet; if it
+    genuinely cannot run, ``--ip`` is the documented escape.
+
+    The route source is FIRST, not appended: it is the authoritative member, and an
+    off-by-one truncation anywhere downstream must drop the insurance, never the
+    answer.
+    """
+    # F2: every value here lands in the `ip saddr` (IPv4) set, so IPv4 is what
+    # "usable" means. `_usable_saddr` also refuses loopback/link-local.
     if explicit:
-        return explicit.strip() if _valid_saddr_ip(explicit) else None
-    if _valid_ip(primary_ip):
-        rc, out, _err = _monitor_run_ssh(alias, f"ip -o route get {primary_ip}", None)
-        if rc == 0:
-            src = _parse_route_src(out)
-            if src is not None and _valid_saddr_ip(src):
-                return src
-    rc, out, _err = _monitor_run_ssh(alias, "echo $SSH_CONNECTION", None)
-    if rc == 0:
-        fields = out.split()
-        if fields and _valid_saddr_ip(fields[0]):
-            return fields[0]
-    return None
+        return [explicit.strip()] if _valid_saddr_ip(explicit) else None
+    if not _valid_ip(primary_ip):
+        LOG.error(
+            "monitor add: no primary address to route toward, so the secondary's real "
+            "source address cannot be resolved on the remote. Pass --primary-ip <addr>, "
+            "or --ip <addr> to state the source address outright."
+        )
+        return None
+    rc, out, err = _monitor_run_ssh(alias, f"ip -o route get {primary_ip}", None)
+    src = _parse_route_src(out) if rc == 0 else None
+    if src is None or not _usable_saddr(src):
+        LOG.error(
+            "monitor add: 'ip -o route get %s' on %s did not yield a usable source address "
+            "(rc %d%s). That src field is the EXACT address upsd will see, and there is no "
+            "fallback: $SSH_CONNECTION is only the address we happened to arrive from, and "
+            "on a multi-addressed box it is a plausible, wrong, same-machine value that "
+            "would silently firewall the secondary out. Pass --ip <addr> to state the "
+            "source address explicitly.",
+            primary_ip,
+            safe_text(alias),
+            rc,
+            f": {safe_text(err.strip())}" if err.strip() else "",
+        )
+        return None
+
+    rc, out, _err = _monitor_run_ssh(alias, _REMOTE_ADDR_PROBE, None)
+    others = _parse_ipv4_addrs(out) if rc == 0 else []
+    if others and src not in others:
+        # Policy routing, a source-NAT, or a route through an address the box does
+        # not own. Surfaced rather than silently unioned: the enrollment is still
+        # correct (src is what upsd sees) but the operator's picture of that machine
+        # is not, and this is the only moment anyone looks.
+        LOG.warning(
+            "monitor add: %s routes toward %s from %s, which is not among the addresses it "
+            "reports for itself (%s). The route source is authoritative and is being "
+            "enrolled, but that mismatch means policy routing or source NAT is in play — "
+            "worth knowing before the next link flap.",
+            safe_text(alias),
+            primary_ip,
+            src,
+            ", ".join(others),
+        )
+    return list(dict.fromkeys([src, *others]))
 
 
 _NATIVE_SHUTDOWN_CMD = "/sbin/shutdown -h now"
@@ -1699,7 +1868,10 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     )
     parser.add_argument("--ssh", help="ssh_config alias (required for --method native/ssh)")
     parser.add_argument("--ups", help="NUT UPS name the machine draws from")
-    parser.add_argument("--ip", help="explicit source IP (skips SSH_CONNECTION probe)")
+    parser.add_argument(
+        "--ip",
+        help="explicit source IP; overrides and skips the remote route probe entirely",
+    )
     parser.add_argument("--os", default="auto", choices=("auto", "arch", "ubuntu", "debian"))
     parser.add_argument("--powervalue", type=int, default=1, choices=(0, 1))
     # Default resolved from --method, not fixed here: a push needs the escalated
@@ -1999,7 +2171,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
     # LO-C1: a dry run prints the plan and TOUCHES NOTHING — the remote included.
     # This print used to sit BELOW steps 7 and 8, i.e. below two SSH round-trips into
-    # the machine (`_resolve_remote_ip`) and a local `ip -o route get`
+    # the machine (`_resolve_remote_addrs`) and a local `ip -o route get`
     # (`_resolve_primary_ip`). Nothing was mutated, so the flag's own help was true,
     # but "mutate nothing" is not "touch nothing" — and this is the mechanism behind
     # 02-03's own reported live-contact exception. Only what the operator supplied on
@@ -2009,7 +2181,10 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         preview_ip = args.ip.strip() if args.ip else ""
         preview_primary = args.primary_ip.strip() if args.primary_ip else ""
         unresolved = "<unresolved — the real run probes for it>"
-        saddrs = _survivor_saddrs((*others, dataclasses.replace(candidate, ip=preview_ip)))
+        preview_ips = (preview_ip,) if preview_ip else ()
+        saddrs = _survivor_saddrs(
+            (*others, dataclasses.replace(candidate, ip=preview_ip, ips=preview_ips))
+        )
         _say(f"[dry-run] resolve ip: {preview_ip or unresolved}")
         _say(
             f"[dry-run] bootstrap primary: LISTEN {preview_primary or unresolved}, "
@@ -2021,20 +2196,39 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         _say("[dry-run] contacted: nothing — no ssh, no route probe, no local command")
         return 0
 
-    # 7. resolve the remote source IP (validated literal). When --primary-ip is
-    # given, the remote `ip route get <primary>` learns the machine's real LAN
-    # source; otherwise the resolver falls back to $SSH_CONNECTION field 1.
-    ip = _resolve_remote_ip(ssh_alias, args.ip, args.primary_ip or "")
-    if not ip:
-        LOG.error("monitor add: could not resolve a valid source IP for %s", ssh_alias)
+    # 7. resolve the primary's LAN IP FIRST, because step 8's route probe needs a
+    # destination to route toward. `toward_ip=""` skips the local route-get rung, so
+    # this uses only --primary-ip or a LAN `nut_server.listen` entry — neither of
+    # which needs the secondary's address. The rung that DOES need it is retried in
+    # step 9 once an explicit --ip has supplied one.
+    #
+    # The order used to be the other way round, and could only be, because the
+    # remote resolution's last rung was $SSH_CONNECTION — which needs nothing. With
+    # that rung removed (03-08) the dependency is real and points this way.
+    primary = _resolve_primary_ip(cfg, args.primary_ip, "")
+    if primary is None and not args.ip:
+        LOG.error(
+            "monitor add: could not resolve the primary's LAN address for %s. It is needed "
+            "BEFORE the secondary's own address, because the only trustworthy way to learn "
+            "which address that box sources from is to route toward this one ON it. Pass "
+            "--primary-ip <addr>, add a LAN LISTEN to nut_server.listen, or pass --ip <addr> "
+            "to state the secondary's source address outright.",
+            ssh_alias,
+        )
         return 2
 
-    # 8. resolve the primary's LAN IP the secondary's MONITOR line points at.
-    # Without --primary-ip, auto-detect it locally by routing toward the machine
-    # (the primary's src on that path) rather than silently defaulting to
-    # localhost, which would leave upsd bound to 127.0.0.1 and enrollment failing
-    # at verify with no clear cause (the live bug).
-    primary = _resolve_primary_ip(cfg, args.primary_ip, ip)
+    # 8. resolve the remote's source addresses (route source first, then every other
+    # global LAN address). Refuses rather than guessing — see `_resolve_remote_addrs`.
+    addrs = _resolve_remote_addrs(ssh_alias, args.ip, primary or "")
+    if not addrs:
+        LOG.error("monitor add: could not resolve a valid source IP for %s", ssh_alias)
+        return 2
+    ip = addrs[0]
+
+    # 9. with --ip given, the primary may still be unresolved; the local route probe
+    # toward the now-known secondary address is the remaining rung.
+    if primary is None:
+        primary = _resolve_primary_ip(cfg, args.primary_ip, ip)
     if not primary:
         LOG.error(
             "monitor add: could not auto-detect the primary's LAN IP toward %s — "
@@ -2057,12 +2251,13 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         os=args.os,
         shutdown_cmd=shutdown_cmd,
         ip=ip,
+        ips=tuple(addrs),
         shutdown_method="native",
         raw=dict(existing.raw) if existing is not None else {},
     )
     saddrs = _survivor_saddrs((*others, entry))
 
-    # 9. bootstrap primary WITH the real password (upsd.users + LISTEN + restart + nft)
+    # 10. bootstrap primary WITH the real password (upsd.users + LISTEN + restart + nft)
     is_root = os.geteuid() == 0
     restart = (lambda: None) if args.no_restart_bouncer else _monitor_restart_bouncer
     try:
@@ -2095,7 +2290,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
             LOG.error("monitor add: %s", line)
         return 4
 
-    # 10. remote bootstrap: detect → install → write config (password on stdin) → enable
+    # 11. remote bootstrap: detect → install → write config (password on stdin) → enable
     os_kind = args.os if args.os != "auto" else nutclient.detect_os(ssh_alias, _monitor_run_ssh)
     rc, _o, _e = nutclient.install_nut_client(ssh_alias, os_kind, _monitor_run_ssh)
     if rc != 0:
@@ -2128,7 +2323,7 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         LOG.error("monitor add: remote nut-monitor enable failed")
         return 3
 
-    # 11. deep verify (catches a wrong/placeholder password — plain upsc is unauth)
+    # 12. deep verify (catches a wrong/placeholder password — plain upsc is unauth)
     ok, detail = nutclient.verify_secondary(
         ssh_alias, ups_name, primary, _monitor_run_ssh, timeout=10, deep=True
     )
@@ -2136,11 +2331,15 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         LOG.error("monitor add: verification failed: %s", detail)
         return 5
 
-    # 12. persist by name (idempotent), no password, unknown keys preserved
+    # 13. persist by name (idempotent), no password, unknown keys preserved
     kept = [m.to_dict() for m in others]
     kept.append(entry.to_dict())
     _monitor_persist(cfg_path, kept)
-    _say(f"enrolled {args.name} ({ip}) on {ups_name}")
+    # Every enrolled address, not just the route source: the operator needs to see
+    # exactly what reached the allow set, because the extras are insurance against a
+    # routing change on a box this repo does not administer and their presence is
+    # otherwise invisible until something breaks.
+    _say(f"enrolled {args.name} ({', '.join(addrs)}) on {ups_name}")
     return 0
 
 

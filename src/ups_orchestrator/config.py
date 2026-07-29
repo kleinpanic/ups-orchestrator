@@ -487,7 +487,20 @@ class MonitoredMachine:
     powervalue: int = 1  # 1 = powered by this UPS (counts to MINSUPPLIES)
     os: str = "auto"  # "auto" | "arch" | "ubuntu" | "debian"
     shutdown_cmd: str = "/sbin/shutdown -h now"
+    # The BACK-COMPAT single address: the first entry of ``ips``, kept as its own
+    # field so a rollback to a release that only knows this key still reads a usable
+    # value. Every reader that wants "the addresses of this machine" should use the
+    # ``addresses`` property instead.
     ip: str = ""  # resolved source IP for the nft saddr set
+    # Every address this machine can source a upsd connection from. NUT offers no
+    # way to pin the source — `upscli_tryconnect()` does getaddrinfo + connect with
+    # no bind and no SO_BINDTODEVICE, and upsmon.conf(5) has no source-address or
+    # interface directive — so the kernel's routing table on a machine this repo
+    # does NOT administer decides, and that table moves on a link flap, a DHCP
+    # renewal or a NetworkManager profile reorder. Allowing every LAN address is
+    # insurance against such a change, not a fix for a routing failure: an address
+    # that cannot ARP to the primary stays unreachable however the firewall reads.
+    ips: tuple[str, ...] = ()
     backup: BackupShutdown = field(default_factory=BackupShutdown)
     # The single effective shutdown method (Option A). Default "none"; a legacy
     # record with no explicit value derives one via ``derive_shutdown_method``.
@@ -504,6 +517,21 @@ class MonitoredMachine:
     # INV-DEGRADE: the ONLY state a load-time degrade may write. Non-persisted and
     # compare=False — a diagnostic overlay, never part of the declaration.
     load_notices: tuple[ConfigNotice, ...] = field(default=(), compare=False)
+
+    @property
+    def addresses(self) -> tuple[str, ...]:
+        """Every source address this record claims, ordered, route-source first.
+
+        The list form is authoritative when present; the legacy scalar is read only
+        when it is absent or empty. Two sources of truth would otherwise disagree
+        silently on a hand-edited file, and the list is the one the resolver writes.
+        Values are NOT validated here — that stays at the render sink, where the
+        string is actually spliced into a file ``nft -f`` loads as root.
+        """
+        if self.ips:
+            return self.ips
+        one = self.ip.strip()
+        return (one,) if one else ()
 
     @property
     def disarmed(self) -> bool:
@@ -545,6 +573,22 @@ class MonitoredMachine:
         serial_device = str(data.get("serial_device", serial_blk.get("device", "")))
         serial_baud = _strict_baud(data.get("serial_baud", serial_blk.get("baud")))
 
+        # Addresses. Both keys are accepted and BOTH are emitted by `to_dict`,
+        # because these two functions round-trip the LIVE config file on every
+        # `monitor add` and `monitor remove` — a field only one direction knows
+        # about silently deletes operator data on the next unrelated command.
+        # Precedence when both are present: the LIST wins, and the scalar is
+        # rewritten to its first entry. A blank list falls back to the scalar, which
+        # is how every pre-03-08 config file loads unchanged.
+        ip = str(data.get("ip", "")).strip()
+        raw_ips = data.get("ips")
+        listed = raw_ips if isinstance(raw_ips, list) else []
+        ips = tuple(dict.fromkeys(str(v).strip() for v in listed if str(v).strip()))
+        if not ips and ip:
+            ips = (ip,)
+        if ips:
+            ip = ips[0]
+
         # Effective method: an explicit valid shutdown_method always wins; else a
         # legacy record derives one. Unknown/blank explicit values coerce to "none"
         # (V5, logged once). Derivation is logged once so an operator sees any
@@ -584,7 +628,8 @@ class MonitoredMachine:
             powervalue=_as_int(data.get("powervalue"), 1),
             os=str(data.get("os", "auto")),
             shutdown_cmd=str(data.get("shutdown_cmd", "/sbin/shutdown -h now")),
-            ip=str(data.get("ip", "")),
+            ip=ip,
+            ips=ips,
             backup=backup,
             shutdown_method=method,
             serial_device=serial_device,
@@ -600,6 +645,7 @@ class MonitoredMachine:
         # Two contradictory sources of truth means an operator editing the nested form
         # is silently ignored. The nested form stays ACCEPTED on input.
         nested_serial = merged.pop("serial", None)
+        addrs = self.addresses
         merged.update(
             {
                 "name": self.name,
@@ -608,7 +654,11 @@ class MonitoredMachine:
                 "powervalue": self.powervalue,
                 "os": self.os,
                 "shutdown_cmd": self.shutdown_cmd,
-                "ip": self.ip,
+                # BOTH forms, always in step: the scalar is the first entry, so a
+                # rollback to a release that only reads `ip` still finds the
+                # authoritative route-source address rather than an empty string.
+                "ip": addrs[0] if addrs else "",
+                "ips": list(addrs),
                 "backup": self.backup.to_dict(),
                 "shutdown_method": self.shutdown_method,
                 "serial_device": self.serial_device,
@@ -1521,11 +1571,15 @@ def _apply_degrades(
     # a push record carrying one is a probable former native secondary whose upsmon was
     # never torn down: two live authorities. Fail closed against the suspected one.
     for i, m in enumerate(list(working)):
-        if m.shutdown_method.strip().lower() in _PUSH_METHODS and m.ip.strip():
+        # Reads `addresses`, not `ip`: 03-08 added the list form, and a hand edit
+        # that moved the address into `ips` while blanking `ip` would otherwise walk
+        # straight through the check that exists to catch exactly that hand edit.
+        if m.shutdown_method.strip().lower() in _PUSH_METHODS and m.addresses:
             disarm_at(
                 i,
                 f"declares shutdown_method={m.shutdown_method!r} but carries a non-empty ip "
-                f"{m.ip!r}. That address is written only by the native enrollment path, so "
+                f"{m.addresses[0]!r}. That address is written only by the native enrollment "
+                f"path, so "
                 f"this is probably a former native secondary whose shutdown_method was "
                 f"hand-edited — leaving the remote upsmon armed AND enabling a push, two live "
                 f"authorities. Disarmed (fail closed). Run 'monitor verify {m.name}' to check "

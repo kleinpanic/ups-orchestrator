@@ -22,6 +22,7 @@ Two research corrections are load-bearing and enforced here:
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 import subprocess
 from collections.abc import Callable, Sequence
@@ -79,8 +80,9 @@ def valid_ipv4(value: str) -> bool:
     F2: ``ip saddr`` is nftables' IPv4 matcher — the IPv6 spelling is ``ip6
     saddr``, and a v6 literal inside ``ip saddr { … }`` makes ``nft -f`` reject
     the WHOLE ruleset. `valid_ip` accepts both families, so a v6 address (reachable
-    via ``monitor add --ip 2001:db8::1``, or from the ``$SSH_CONNECTION`` fallback
-    on a v6-reachable secondary) rendered a file the kernel will not load.
+    via ``monitor add --ip 2001:db8::1``, or — before 03-08 removed that rung —
+    from the ``$SSH_CONNECTION`` fallback on a v6-reachable secondary) rendered a
+    file the kernel will not load.
     """
     try:
         return isinstance(ipaddress.ip_address(value.strip()), ipaddress.IPv4Address)
@@ -99,6 +101,13 @@ RunLocalStdin = Callable[[Sequence[str], "str | None"], tuple[int, str, str]]
 # password-bearing config for a secret-safe remote write (creds never on argv).
 RunSSH = Callable[[str, str, "str | None"], tuple[int, str, str]]
 RunNft = Callable[[str], tuple[int, str, str]]
+# argv -> rc, out, err. The READ half of the nft seam, deliberately a separate
+# type from ``RunNft``: that one takes a PATH and writes the kernel's ruleset,
+# this one takes an argv and only reads it. Nothing in this module could see the
+# running ruleset before, which is why file-versus-running drift was invisible —
+# ``apply_nft`` decides "no change" by comparing the FILE to what the FILE would
+# become and never asks the kernel.
+RunNftRead = Callable[[Sequence[str]], tuple[int, str, str]]
 
 
 # --- default side effects (live-only, excluded from the coverage floor) -------
@@ -344,6 +353,51 @@ def upsert_upsd_users(text: str, user: str, password: str) -> tuple[str, bool]:
 _NFT_BEGIN = "# BEGIN UPS-ORCHESTRATOR MANAGED"
 _NFT_END = "# END UPS-ORCHESTRATOR MANAGED"
 
+# The SECOND managed block: the table-scope named-counter objects the rules above
+# reference. It needs its own marker pair because a named counter is a sibling of
+# the chain, not a statement inside it.
+#
+# THE MARKER TRAP. This marker must NOT be a prefix of — nor contain, nor be
+# contained by — ``_NFT_BEGIN``. Research suggested
+# ``# BEGIN UPS-ORCHESTRATOR MANAGED OBJECTS``, which is a strict prefix SUPERSET
+# of ``# BEGIN UPS-ORCHESTRATOR MANAGED``. ``_strip_nft_block`` locates a block
+# with a single ``text.find``, and the objects block sits EARLIER in the file
+# (table scope precedes chain scope), so ``find(_NFT_BEGIN)`` would land on the
+# objects block, strip from there through the RULE block's ``# END``, and silently
+# delete the chain's opening lines with it. ``COUNTERS`` shares no prefix with
+# ``MANAGED``, and a test pins that property in both directions so a rename cannot
+# quietly reintroduce the collision.
+_NFT_COUNTERS_BEGIN = "# BEGIN UPS-ORCHESTRATOR COUNTERS"
+_NFT_COUNTERS_END = "# END UPS-ORCHESTRATOR COUNTERS"
+
+# Every managed marker pair, stripped as a set so a second block can never
+# accumulate. Order is irrelevant — the pairs are mutually non-overlapping by the
+# rule above, which is what makes a per-pair ``find`` safe.
+_NFT_MARKER_PAIRS = (
+    (_NFT_BEGIN, _NFT_END),
+    (_NFT_COUNTERS_BEGIN, _NFT_COUNTERS_END),
+)
+
+# Named counters. MODULE CONSTANTS, never caller input (T-03-29): these tokens are
+# emitted into a file `nft -f` loads as root, and the whole reason the address set
+# is re-validated at the render sink is that such a token can close a brace and
+# append a rule above the operator's policy drop. Keep them constants.
+#
+# Names are checked against the three this box's main.nft already declares
+# (cnt_services_kindle_dashboard, cnt_geoip_drop_cn, cnt_geoip_drop_ru) — no
+# collision. Collision would not be an EEXIST anyway: main.nft opens with
+# `table inet main {}` + `delete table inet main`, so the table and every object
+# in it is rebuilt from scratch on each load (03-PREREQ-RESOLVED-nft-reload.md).
+_NFT_COUNTER_ALLOWED = "upsd_allowed"
+_NFT_COUNTER_DENIED = "upsd_denied"
+
+# Matches the enclosing table's opening line, so the objects block can be inserted
+# at TABLE scope. Kept deliberately loose on the table's family/name (the live box
+# is `table inet main`, the tests use `table inet filter`) and strict on the brace
+# being the last thing on the line — a table whose body opens on the next line is
+# not a shape this repo writes or the operator's file uses.
+_NFT_TABLE_OPEN_RE = re.compile(r"^([ \t]*)table\s+[A-Za-z0-9_]+\s+\S+\s*\{[ \t]*$", re.MULTILINE)
+
 # Pins the real input base chain by its ``hook input`` declaration (the chain
 # name is free-form: input/INPUT/inbound). We only splice into a chain that
 # actually owns the input hook, so the accept lands where a policy-drop chain
@@ -358,21 +412,64 @@ _NFT_CT_ACCEPT_RE = re.compile(
 )
 
 
+def render_nft_counter_objects(indent: str = "    ") -> str:
+    """Render the marked TABLE-scope named-counter declarations. PURE.
+
+    A named counter is a table-scope OBJECT — a sibling of the chain, not a
+    statement inside it — so it cannot live in the block
+    :func:`render_nft_accept_rule` produces. Hence a second marked block, and
+    hence the marker-prefix rule documented at ``_NFT_COUNTERS_BEGIN``.
+
+    The names are emitted UNQUOTED. The asymmetry is easy to get backwards and is
+    a hard failure in one direction only: ``counter "upsd_allowed" { … }`` is a
+    syntax error (verified against nft 1.1.3: *unexpected quoted string, expecting
+    string*), while the quoted form IS legal — and is what ``nft`` itself prints —
+    in the ``counter name "upsd_allowed"`` REFERENCE the rules use. A rejected
+    declaration means the whole file fails to load, taking the operator's
+    policy-drop chain with it at the next boot.
+    """
+    return (
+        f"{indent}{_NFT_COUNTERS_BEGIN}\n"
+        f"{indent}counter {_NFT_COUNTER_ALLOWED} {{\n"
+        f'{indent}    comment "tcp/3493 accepted from an enrolled NUT secondary"\n'
+        f"{indent}}}\n"
+        f"{indent}counter {_NFT_COUNTER_DENIED} {{\n"
+        f'{indent}    comment "tcp/3493 from a source the enrolled set does not contain"\n'
+        f"{indent}}}\n"
+        f"{indent}{_NFT_COUNTERS_END}\n"
+    )
+
+
 def render_nft_accept_rule(
     saddrs: Sequence[str], port: int = 3493, indent: str = "        "
 ) -> str:
-    """Render the marked accept rule to splice into the input base chain. PURE.
+    """Render the marked accept + denied-counter rules for the input base chain. PURE.
 
-    Returns a ``# BEGIN/END`` marker block wrapping a single
-    ``tcp dport <port> ip saddr { … } accept`` line at ``indent``. Empty
-    ``saddrs`` → empty string (the rule is removed rather than left matching an
-    empty set, which ``nft -f`` rejects).
+    Returns a ``# BEGIN/END`` marker block wrapping TWO lines at ``indent``:
+
+    1. ``tcp dport <port> ip saddr { … } counter name "upsd_allowed" accept`` —
+       the counter reference sits BEFORE the verdict. A verdict terminates rule
+       evaluation, so a counter placed after it never increments and still parses
+       (verified: ``accept counter name "x"`` is accepted by nft). That mutant
+       reads zero forever and is indistinguishable from "nothing connected".
+    2. ``tcp dport <port> counter name "upsd_denied"`` — deliberately VERDICT-LESS,
+       so the packet keeps traversing the chain and meets the chain's own policy.
+       Anything reaching it did not match the set above (the accept is terminal for
+       what it matches), so it counts exactly the tcp/3493 packets from sources the
+       enrolled set does not contain. That is the failure that matters — a
+       secondary blocked because its address is not in the set — and the allowed
+       counter is structurally blind to it. Adding a verdict here would open
+       tcp/3493 to EVERY source above the operator's policy drop (T-03-31).
+
+    Empty ``saddrs`` → empty string (the rule is removed rather than left matching
+    an empty set, which ``nft -f`` rejects).
 
     HI-C2: every member is re-validated HERE, at the shared sink, because this
     string is loaded by ``nft -f`` as root and a member that closes the brace can
     append an arbitrary rule — including ``ip saddr 0.0.0.0/0 accept`` — above the
     operator's policy drop. Refuse rather than escape: nothing but an IP literal is
-    a legitimate member.
+    a legitimate member. The counter names get the same treatment for free by never
+    being caller input at all.
     """
     if not saddrs:
         return ""
@@ -389,30 +486,57 @@ def render_nft_accept_rule(
     members = ", ".join(s.strip() for s in saddrs)
     return (
         f"{indent}{_NFT_BEGIN}\n"
-        f"{indent}tcp dport {port} ip saddr {{ {members} }} accept "
-        f'comment "upsd NUT secondaries"\n'
+        f"{indent}tcp dport {port} ip saddr {{ {members} }} "
+        f'counter name "{_NFT_COUNTER_ALLOWED}" accept comment "upsd NUT secondaries"\n'
+        f"{indent}tcp dport {port} "
+        f'counter name "{_NFT_COUNTER_DENIED}" '
+        f'comment "upsd NUT secondaries: source not in the enrolled set"\n'
         f"{indent}{_NFT_END}\n"
     )
 
 
-def _strip_nft_block(text: str) -> str:
-    """Remove any existing MANAGED block (and its leading indent) from ``text``.
+def _strip_one_nft_block(text: str, begin: str, end_marker: str) -> str:
+    """Remove ONE ``begin``/``end_marker`` block (and its leading indent) from ``text``.
 
     Strips from the start of the ``# BEGIN`` line — including its own indentation
     — through the newline after ``# END``, so re-inserting is a byte-clean replace
     that leaves no dangling blank-indented line behind.
     """
-    start = text.find(_NFT_BEGIN)
+    start = text.find(begin)
     if start == -1:
         return text
     line_start = text.rfind("\n", 0, start)
     line_start = 0 if line_start == -1 else line_start + 1
-    end = text.find(_NFT_END, start)
+    end = text.find(end_marker, start)
     if end == -1:
         return text
     end = text.find("\n", end)
     end = len(text) if end == -1 else end + 1
     return text[:line_start] + text[end:]
+
+
+def _strip_nft_block(text: str) -> str:
+    """Remove EVERY managed block — rule and counter-object — from ``text``.
+
+    The single ``find`` this used to be was correct only while there was one
+    managed block. With two, the second was never stripped and ACCUMULATED a
+    duplicate on every ``monitor add``; duplicate ``counter`` declarations are a
+    hard ``nft -f`` failure, so the third enrollment would have started failing the
+    reload — and, with the F2 rollback in place, failing every enrollment from then
+    on (T-03-30).
+
+    Loops per pair rather than stripping once, so a file that already carries
+    duplicates from a hand edit (or from a build that shipped the single-``find``
+    bug) is cleaned up rather than half-cleaned. Each iteration removes a whole
+    block, so the loop is bounded by the number of blocks in the text.
+    """
+    for begin, end_marker in _NFT_MARKER_PAIRS:
+        while True:
+            shorter = _strip_one_nft_block(text, begin, end_marker)
+            if shorter == text:
+                break
+            text = shorter
+    return text
 
 
 def upsert_nft_input_chain(text: str, saddrs: Sequence[str], port: int = 3493) -> tuple[str, bool]:
@@ -425,10 +549,16 @@ def upsert_nft_input_chain(text: str, saddrs: Sequence[str], port: int = 3493) -
     immediately after the chain's opening brace, so it sits near the top and
     precedes any later drop/reject in the same chain.
 
+    TWO blocks are written, at two scopes: the counter OBJECTS just inside the
+    enclosing table's brace (before the chain, so the objects are declared before
+    the rules that reference them — a rule naming an undeclared counter is a hard
+    ``nft -f`` failure), and the accept + denied rules inside the chain.
+
     Returns ``(new_text, changed)``; ``changed`` is ``False`` only when the result
-    is byte-identical (idempotent). Empty ``saddrs`` removes the rule. Raises
-    :class:`ValueError` when no ``hook input`` base chain exists — refusing to
-    write a rule that would silently land nowhere useful.
+    is byte-identical (idempotent). Empty ``saddrs`` removes BOTH blocks. Raises
+    :class:`ValueError` when no ``hook input`` base chain exists, or when that
+    chain has no enclosing ``table … {`` line — refusing to write a rule that
+    would silently land nowhere useful, or a counter reference with no declaration.
     """
     stripped = _strip_nft_block(text)
     if not saddrs:
@@ -439,6 +569,21 @@ def upsert_nft_input_chain(text: str, saddrs: Sequence[str], port: int = 3493) -
         raise ValueError(
             "no `type filter hook input` base chain found — cannot insert the "
             "upsd accept where a policy-drop chain will honour it"
+        )
+
+    # The enclosing table: the LAST `table … {` line before the hook match. Found by
+    # scanning backwards rather than by name, for the same reason the chain is found
+    # by its hook rather than its name — the live box is `table inet main` and the
+    # tests are `table inet filter`.
+    table = None
+    for match in _NFT_TABLE_OPEN_RE.finditer(stripped, 0, hook.start()):
+        table = match
+    if table is None:
+        raise ValueError(
+            "no enclosing `table … {` line found above the input base chain — the "
+            "named counters are TABLE-scope objects and have nowhere to be declared, "
+            "and a rule referencing an undeclared counter makes nft -f reject the "
+            "whole ruleset"
         )
 
     # Prefer to sit right after the ct established/related accept in the same
@@ -456,8 +601,89 @@ def upsert_nft_input_chain(text: str, saddrs: Sequence[str], port: int = 3493) -
         nl = stripped.find("\n", hook.end())
         insert_at = nl + 1 if nl != -1 else len(stripped)
     rule = render_nft_accept_rule(saddrs, port, indent=indent)
+
+    table_nl = stripped.find("\n", table.end())
+    table_at = table_nl + 1 if table_nl != -1 else len(stripped)
+    objects = render_nft_counter_objects(indent=(table.group(1) or "") + "    ")
+
+    # LATER site first. Both offsets are into `stripped`; inserting at the earlier
+    # one would shift the later by len(objects) and land the rule mid-line.
     new_text = stripped[:insert_at] + rule + stripped[insert_at:]
+    new_text = new_text[:table_at] + objects + new_text[table_at:]
     return new_text, new_text != text
+
+
+# --- reading the RUNNING ruleset's counters (seam + pure parser) --------------
+
+_NFT_LIST_COUNTERS: tuple[str, ...] = ("nft", "-j", "list", "counters")
+
+
+def _default_run_nft_read(argv: Sequence[str]) -> tuple[int, str, str]:  # pragma: no cover
+    proc = subprocess.run(list(argv), capture_output=True, text=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def parse_nft_counters(
+    payload: str, table: str, family: str = "inet"
+) -> dict[str, tuple[int, int]]:
+    """``nft -j list counters`` output → ``{name: (packets, bytes)}``. PURE.
+
+    Scoped to ``family``/``table``: a counter of the same name in a DIFFERENT
+    table belongs to another subsystem, and reporting it as ours would be a
+    confident wrong answer about whether our own block is even loaded.
+
+    NEVER raises. Malformed JSON, an unexpected shape, a truncated document and an
+    empty string all yield an empty mapping. This decorates a command whose exit
+    code is a machine's shutdown verdict; a diagnostic that crashes the command it
+    decorates is worse than no diagnostic at all.
+    """
+    try:
+        doc = json.loads(payload)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    entries = doc.get("nftables")
+    if not isinstance(entries, list):
+        return {}
+    out: dict[str, tuple[int, int]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        counter = entry.get("counter")
+        if not isinstance(counter, dict):
+            continue
+        if counter.get("table") != table or counter.get("family") != family:
+            continue
+        name = counter.get("name")
+        packets = counter.get("packets")
+        chunk = counter.get("bytes")
+        if not isinstance(name, str):
+            continue
+        # `bool` is an `int` subclass; a JSON `true` here is a shape error, not a
+        # count of one.
+        pkt = packets if isinstance(packets, int) and not isinstance(packets, bool) else 0
+        byt = chunk if isinstance(chunk, int) and not isinstance(chunk, bool) else 0
+        out[name] = (pkt, byt)
+    return out
+
+
+def read_nft_counters(
+    table: str, run_nft_read: RunNftRead, family: str = "inet"
+) -> tuple[bool, dict[str, tuple[int, int]]]:
+    """``(readable, counters)`` from the RUNNING ruleset. IMPURE only in the runner.
+
+    ``readable`` is False when ``nft`` itself failed — notably the non-root case,
+    where listing counters needs ``CAP_NET_ADMIN``. That is a DIFFERENT fact from
+    an empty mapping: an empty mapping on a SUCCESSFUL read means the managed block
+    is not in the running ruleset, which is the cheap partial detector for
+    file-versus-running drift. Collapsing the two would report a privilege problem
+    as a missing firewall rule.
+    """
+    rc, out, _err = run_nft_read(_NFT_LIST_COUNTERS)
+    if rc != 0:
+        return False, {}
+    return True, parse_nft_counters(out, table, family)
 
 
 # --- remote config guard (pure) ----------------------------------------------

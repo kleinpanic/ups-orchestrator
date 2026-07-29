@@ -81,6 +81,61 @@ class FakeNft:
         return self.rc, "", "" if self.rc == 0 else "nft failed"
 
 
+class FakeNftRead:
+    """Records the argv handed to the counter READ seam; returns canned output."""
+
+    def __init__(self, rc: int = 0, out: str = "") -> None:
+        self.calls: list[list[str]] = []
+        self.rc = rc
+        self.out = out
+
+    def __call__(self, argv) -> tuple[int, str, str]:  # noqa: ANN001
+        self.calls.append(list(argv))
+        return self.rc, self.out, "" if self.rc == 0 else "Operation not permitted"
+
+
+# `nft -j list counters` output carrying both managed counters, table inet main.
+_COUNTERS_JSON = json.dumps(
+    {
+        "nftables": [
+            {"metainfo": {"version": "1.1.3"}},
+            {
+                "counter": {
+                    "family": "inet",
+                    "table": "main",
+                    "name": "upsd_allowed",
+                    "packets": 12,
+                    "bytes": 720,
+                }
+            },
+            {
+                "counter": {
+                    "family": "inet",
+                    "table": "main",
+                    "name": "upsd_denied",
+                    "packets": 0,
+                    "bytes": 0,
+                }
+            },
+        ]
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_nft_read(monkeypatch):
+    """Arm the counter READ seam for EVERY test in this file, defaulting to non-root.
+
+    `monitor verify` grew a best-effort firewall diagnostic whose live runner spawns
+    `nft`. The suite-wide process tripwire (conftest, LO-C3) catches that, which is
+    the tripwire doing its job — but it would mean 30-odd unrelated verify tests
+    growing a monkeypatch each. Defaulting to rc 1 ("needs root") is also the honest
+    default: that is what an unprivileged run really gets. Tests that assert on the
+    counter line override this with their own `FakeNftRead`.
+    """
+    monkeypatch.setattr(cli, "_monitor_run_nft_read", FakeNftRead(rc=1))
+
+
 class FakeLocal:
     """Records (argv, stdin) for local installs/restarts; returns canned rc."""
 
@@ -168,6 +223,134 @@ def test_verify_fail(cfg_path, monkeypatch) -> None:
 
 def test_verify_unknown(cfg_path) -> None:
     assert cli.main(["monitor", "verify", "ghost"]) == 2
+
+
+# --- 03-07: `monitor verify` surfaces the firewall counters, best-effort -------
+
+
+def test_verify_exit_code_is_unchanged_when_the_counter_read_fails(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    """KILLS: letting a firewall diagnostic failure change the machine's verdict.
+
+    Discriminating by CONSTRUCTION: it compares two exit codes from otherwise
+    identical runs rather than asserting one value, so it cannot pass by accident
+    on a run where both happen to be 0. `monitor verify`'s rc IS the answer to
+    "will this machine shut down?"; a counter read that needs CAP_NET_ADMIN must
+    never be able to move it. Both the succeeding and the failing reader are
+    exercised, and the SAME machine verdict is asserted for both.
+    """
+    _write_config(cfg_path, machines=[_machine("mt")])
+
+    def run(reader) -> int:  # noqa: ANN001
+        monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "OL\n", "")]))
+        monkeypatch.setattr(cli, "_monitor_run_nft_read", reader)
+        return cli.main(["monitor", "verify", "mt"])
+
+    rc_ok = run(FakeNftRead(rc=0, out=_COUNTERS_JSON))
+    rc_denied = run(FakeNftRead(rc=1))
+    rc_garbage = run(FakeNftRead(rc=0, out="}{ not json"))
+    assert rc_ok == rc_denied == rc_garbage == 0
+
+    # And the same holds on the FAILING verdict, so it is not an artefact of the
+    # happy path: a machine whose probe fails is rc 1 with either reader.
+    def run_failing(reader) -> int:  # noqa: ANN001
+        monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(1, "", "refused")]))
+        monkeypatch.setattr(cli, "_monitor_run_nft_read", reader)
+        return cli.main(["monitor", "verify", "mt"])
+
+    assert run_failing(FakeNftRead(rc=0, out=_COUNTERS_JSON)) == run_failing(FakeNftRead(rc=1)) == 1
+    capsys.readouterr()
+
+
+def test_verify_reports_both_counters_when_the_read_succeeds(cfg_path, monkeypatch, capsys) -> None:
+    """KILLS: dropping `upsd_denied` from the reported line.
+
+    `upsd_allowed` answers "are the enrolled secondaries connecting?" and is
+    STRUCTURALLY blind to the failure that matters — a secondary blocked because
+    its address is not in the set is, by definition, not an element of the set and
+    has no per-source counter. Only `upsd_denied` sees it. A line reporting the
+    allowed counter alone reads as a working diagnostic and answers the wrong
+    question, so both names AND both values are asserted.
+    """
+    _write_config(cfg_path, machines=[_machine("mt")])
+    reader = FakeNftRead(rc=0, out=_COUNTERS_JSON)
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "OL\n", "")]))
+    monkeypatch.setattr(cli, "_monitor_run_nft_read", reader)
+    assert cli.main(["monitor", "verify", "mt"]) == 0
+    out = capsys.readouterr().out
+    assert "upsd_allowed 12 pkts / 720 bytes" in out
+    assert "upsd_denied 0 pkts / 0 bytes" in out
+    assert reader.calls == [["nft", "-j", "list", "counters"]]
+
+
+def test_verify_reports_a_nonzero_denied_counter_as_the_thing_to_look_at(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    """KILLS: printing the denied count without flagging that it is non-zero.
+
+    A silent block is the failure that has already bitten twice on this box. A bare
+    number in a wall of verify output is not a signal; a number that a mutant can
+    drop from is the whole point of the counter existing.
+    """
+    payload = json.dumps(
+        {
+            "nftables": [
+                {
+                    "counter": {
+                        "family": "inet",
+                        "table": "main",
+                        "name": "upsd_allowed",
+                        "packets": 0,
+                        "bytes": 0,
+                    }
+                },
+                {
+                    "counter": {
+                        "family": "inet",
+                        "table": "main",
+                        "name": "upsd_denied",
+                        "packets": 47,
+                        "bytes": 2820,
+                    }
+                },
+            ]
+        }
+    )
+    _write_config(cfg_path, machines=[_machine("mt")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "OL\n", "")]))
+    monkeypatch.setattr(cli, "_monitor_run_nft_read", FakeNftRead(rc=0, out=payload))
+    assert cli.main(["monitor", "verify", "mt"]) == 0
+    out = capsys.readouterr().out
+    assert "upsd_denied 47 pkts" in out
+    assert "source address is wrong" in out
+
+
+def test_verify_says_the_block_is_absent_when_the_read_succeeds_but_finds_nothing(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    """KILLS: collapsing "read fine, block absent" into "counters unavailable".
+
+    Those are different facts with different remedies. An empty mapping on a
+    SUCCESSFUL read means the managed block is not in the RUNNING ruleset — the
+    partial detector for file-versus-running drift, where a boot's failed `nft -f`
+    leaves the file correct, the port closed, and this tool reporting success
+    forever after. Asserting the two runs produce DIFFERENT text is what
+    discriminates; both produce "a firewall line".
+    """
+    _write_config(cfg_path, machines=[_machine("mt")])
+
+    def say(reader) -> str:  # noqa: ANN001
+        monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH([(0, "OL\n", "")]))
+        monkeypatch.setattr(cli, "_monitor_run_nft_read", reader)
+        cli.main(["monitor", "verify", "mt"])
+        return capsys.readouterr().out
+
+    absent = say(FakeNftRead(rc=0, out='{"nftables": []}'))
+    unavailable = say(FakeNftRead(rc=1))
+    assert "NOT in the running ruleset" in absent
+    assert "needs root" in unavailable
+    assert absent != unavailable
 
 
 def test_verify_config_ups_metachar_rejected_rc2(cfg_path, monkeypatch) -> None:
@@ -331,10 +514,16 @@ def test_remove_dry_run_mutates_nothing(cfg_path, monkeypatch, capsys) -> None:
 # --- add ----------------------------------------------------------------------
 
 _PW = "s3cr3t-secondary-pw"
-# The literal SSH_CONNECTION line a real secondary shell echoes back:
-# "<client_ip> <client_port> <server_ip> <server_port>". Field 1 is the client
-# source address upsd actually sees.
-_SSH_CONN = "192.168.1.114 22 192.168.1.125 3493\n"
+# What `ip -o route get <primary>` prints ON the remote. Its `src` field is the
+# EXACT address upsd will see — the only trustworthy source since 03-08 removed the
+# $SSH_CONNECTION fallback (which is merely the address we arrived from, and on a
+# multi-addressed box is a plausible, wrong, same-machine value).
+_ROUTE_GET = "192.168.1.125 dev eth0 src 192.168.1.114 uid 0\n"
+# What `ip -o -4 addr show scope global` prints ON the remote.
+_ADDR_SHOW = (
+    "2: eno4    inet 192.168.1.114/24 brd 192.168.1.255 scope global eno4"
+    "\\       valid_lft forever preferred_lft forever\n"
+)
 
 
 @pytest.fixture
@@ -355,8 +544,8 @@ def add_env(monkeypatch, tmp_path: Path):
 def _add_ssh_all_ok(*, with_ip: bool = False) -> FakeSSH:
     """A FakeSSH whose queued responses drive a clean add end-to-end.
 
-    ``with_ip=True`` omits the leading SSH_CONNECTION probe response, matching a
-    run where ``--ip`` is passed and the probe is skipped.
+    ``with_ip=True`` omits the two leading address-resolution responses, matching a
+    run where ``--ip`` is passed and the remote is not probed for its address at all.
     """
     responses = [
         (0, "Linux\n/usr/bin/pacman\n", ""),  # detect_os
@@ -370,7 +559,8 @@ def _add_ssh_all_ok(*, with_ip: bool = False) -> FakeSSH:
         (0, "", ""),  # verify deep journal (no failures)
     ]
     if not with_ip:
-        responses.insert(0, (0, _SSH_CONN, ""))  # echo $SSH_CONNECTION
+        responses.insert(0, (0, _ADDR_SHOW, ""))  # ip -o -4 addr show scope global
+        responses.insert(0, (0, _ROUTE_GET, ""))  # ip -o route get <primary>
     return FakeSSH(responses)
 
 
@@ -594,7 +784,7 @@ def test_add_full_sequence_order(cfg_path, add_env, monkeypatch) -> None:
     assert rc == 0
     cmds = ssh.commands
     # resolve-ip precedes detect precedes install precedes remote write precedes enable.
-    i_resolve = next(i for i, c in enumerate(cmds) if "SSH_CONNECTION" in c)
+    i_resolve = next(i for i, c in enumerate(cmds) if "route get" in c)
     i_detect = next(i for i, c in enumerate(cmds) if "uname -s" in c)
     i_install = next(i for i, c in enumerate(cmds) if "pacman -Qq" in c or "dpkg-query" in c)
     i_write = next(i for i, c in enumerate(cmds) if "/dev/stdin" in c)
@@ -652,7 +842,7 @@ def test_parse_route_src_none_when_absent_or_invalid() -> None:
     assert cli._parse_route_src("... src not-an-ip ...") is None
 
 
-def test_resolve_remote_ip_prefers_route_src_over_ssh_connection_gateway(monkeypatch) -> None:
+def test_resolve_remote_addrs_prefers_route_src_over_ssh_connection_gateway(monkeypatch) -> None:
     # The live bug: over a WAN/NAT SSH path, $SSH_CONNECTION field 1 is the
     # GATEWAY (192.168.1.1), not the machine's real LAN IP. `ip route get
     # <primary>` on the remote returns the true src (192.168.1.114) upsd sees.
@@ -667,29 +857,229 @@ def test_resolve_remote_ip_prefers_route_src_over_ssh_connection_gateway(monkeyp
         return 0, "", ""
 
     monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
-    ip = cli._resolve_remote_ip("mt", None, "192.168.1.125")
-    assert ip == "192.168.1.114"  # route src, NOT the gateway
+    addrs = cli._resolve_remote_addrs("mt", None, "192.168.1.125")
+    assert addrs == ["192.168.1.114"]  # route src, NOT the gateway
     assert any("ip -o route get 192.168.1.125" in c for c in calls)
+    # And the fallback is not merely outranked — it is never asked.
+    assert not any("SSH_CONNECTION" in c for c in calls)
 
 
-def test_resolve_remote_ip_falls_back_to_ssh_connection_when_route_fails(monkeypatch) -> None:
+def test_resolve_remote_addrs_explicit_overrides_and_probes_nothing(monkeypatch) -> None:
+    """KILLS: probing the remote anyway when --ip was supplied.
+
+    Asserts on the recorded CALL LIST, not on the returned value: the value is
+    "10.0.0.5" under both branches, so only the empty call list discriminates.
+    """
+    calls: list[str] = []
+
     def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
-        if "route get" in command:
-            return 1, "", "network unreachable"
-        if "SSH_CONNECTION" in command:
-            return 0, "192.168.1.114 22 192.168.1.125 3493\n", ""
+        calls.append(command)
         return 0, "", ""
 
     monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
-    assert cli._resolve_remote_ip("mt", None, "192.168.1.125") == "192.168.1.114"
+    assert cli._resolve_remote_addrs("mt", "10.0.0.5", "192.168.1.125") == ["10.0.0.5"]
+    assert calls == []
 
 
-def test_resolve_remote_ip_explicit_overrides_everything(monkeypatch) -> None:
+# --- 03-08: the eulerpi4 address trap ----------------------------------------
+#
+# Measured on the live hosts with `ip route get 192.168.1.125` ON each machine:
+#   mt       -> 192.168.1.114 (eno4);  ssh alias also reaches .114
+#   eulerpi4 -> 192.168.1.138 (eth0);  ssh alias reaches .137 (wlan0)  <-- MISMATCH
+#   spark    -> 192.168.1.121
+# Both eulerpi4 addresses answer ARP with the same MAC, so nothing about the pair
+# looks wrong. Enrolling through the alias with the old $SSH_CONNECTION fallback
+# writes .137 into the firewall while upsmon connects from .138 — and the failure
+# presents as "it works, just slowly", because the secondary still self-shuts
+# 30-45 s late through DEADTIME promotion. A casual test passes.
+
+
+def _eulerpi4_ssh(route_rc: int = 0):
+    """A fake whose ssh address and route source DIFFER, like the real eulerpi4."""
+    calls: list[str] = []
+
     def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
-        raise AssertionError("no probe should run when --ip is explicit")
+        calls.append(command)
+        if "route get" in command:
+            if route_rc != 0:
+                return route_rc, "", "RTNETLINK answers: Network is unreachable"
+            return 0, "192.168.1.125 dev eth0 src 192.168.1.138 uid 0\n", ""
+        if "addr show" in command:
+            return (
+                0,
+                (
+                    "2: eth0    inet 192.168.1.138/24 scope global eth0\n"
+                    "3: wlan0    inet 192.168.1.137/24 scope global wlan0\n"
+                ),
+                "",
+            )
+        if "SSH_CONNECTION" in command:
+            # The address we happened to arrive from: valid, same machine, WRONG.
+            return 0, "192.168.1.137 22 192.168.1.125 3493\n", ""
+        return 0, "", ""
+
+    return fake_ssh, calls
+
+
+def test_the_route_source_wins_over_the_address_we_sshed_in_from(monkeypatch) -> None:
+    """KILLS: taking the address from $SSH_CONNECTION instead of the route lookup.
+
+    THE eulerpi4 TEST. The fake offers BOTH a valid route source (.138) and a
+    valid, different, same-machine $SSH_CONNECTION address (.137). A mutant reading
+    the ssh address produces .137 FIRST; the correct code produces .138 first.
+    Asserting "the result is non-empty" or "contains .138" would pass under both,
+    so this pins the ORDER — and .138 being first is what lands in the record's
+    back-compat `ip` field and in any truncated read of the set.
+    """
+    fake_ssh, calls = _eulerpi4_ssh()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    addrs = cli._resolve_remote_addrs("eulerpi4", None, "192.168.1.125")
+    assert addrs is not None
+    assert addrs[0] == "192.168.1.138", "the route source must be the FIRST member"
+    assert not any("SSH_CONNECTION" in c for c in calls)
+
+
+def test_native_enrollment_refuses_when_the_route_probe_fails(monkeypatch, caplog) -> None:
+    """KILLS: restoring the $SSH_CONNECTION fallback on the native path.
+
+    Discriminating by construction, in three independent ways: the fake returns a
+    NON-ZERO rc for the route command AND a perfectly valid, different address for
+    the connection-info command. A mutant with the fallback restored yields a
+    populated address list from the same fake; the correct code yields None. The
+    two branches therefore differ in the return value, in whether the fallback
+    command was ever issued, and in whether an error was logged.
+    """
+    fake_ssh, calls = _eulerpi4_ssh(route_rc=1)
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    with caplog.at_level("ERROR"):
+        addrs = cli._resolve_remote_addrs("eulerpi4", None, "192.168.1.125")
+    assert addrs is None
+    assert not any("SSH_CONNECTION" in c for c in calls)
+    # The refusal names the escape hatch, or the operator is simply stuck.
+    assert "--ip" in caplog.text
+
+
+def test_add_refuses_and_persists_nothing_when_the_route_probe_fails(
+    cfg_path, add_env, monkeypatch
+) -> None:
+    """KILLS: the fallback restored, observed END TO END rather than in the resolver.
+
+    Same fake as above driven through `monitor add`: a restored fallback gives a
+    zero exit code and a persisted record carrying the WRONG address. Asserts the
+    exit code, that nothing was persisted, and that the wrong address (.137) appears
+    nowhere — three observable differences from one fake.
+    """
+    fake_ssh, _calls = _eulerpi4_ssh(route_rc=1)
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    monkeypatch.setattr(cli, "_monitor_run_local", FakeLocal())
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_NFT_PATH", str(add_env["tmp"] / "u.nft"))
+    monkeypatch.setattr(cli, "_NFT_RELOAD_PATH", str(add_env["tmp"] / "u.nft"))
+    _seed_nft(add_env["tmp"] / "u.nft")
+    rc = cli.main(["monitor", "add", "eulerpi4", "--ssh", "eulerpi4", "--ups", "cyberpower"])
+    assert rc == 2
+    raw = cfg_path.read_text()
+    assert json.loads(raw)["monitored_machines"] == []
+    assert "192.168.1.137" not in raw
+
+
+def test_every_lan_address_reaches_the_allow_set(monkeypatch) -> None:
+    """KILLS: returning ONLY the route source.
+
+    That is the pre-change behaviour and it passes every single-homed test. A
+    dual-homed machine is then one routing change — a link flap, a DHCP renewal, a
+    NetworkManager profile reorder on a box this repo does not administer — away
+    from being firewalled out.
+    """
+    fake_ssh, _calls = _eulerpi4_ssh()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    assert cli._resolve_remote_addrs("eulerpi4", None, "192.168.1.125") == [
+        "192.168.1.138",
+        "192.168.1.137",
+    ]
+
+
+def test_route_source_is_first_even_when_the_address_list_does_not_lead_with_it(
+    monkeypatch,
+) -> None:
+    """KILLS: building the set from the address list and APPENDING the route source.
+
+    The fake deliberately reports the list in an order that does not begin with the
+    route source. Appending would put the authoritative address LAST, where an
+    off-by-one truncation anywhere downstream drops the answer and keeps only the
+    insurance.
+    """
+
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        if "route get" in command:
+            return 0, "192.168.1.125 dev eno4 src 192.168.1.114 uid 0\n", ""
+        if "addr show" in command:
+            return (
+                0,
+                (
+                    "2: eno3    inet 192.168.1.133/24 scope global eno3\n"
+                    "3: eno4    inet 192.168.1.114/24 scope global eno4\n"
+                ),
+                "",
+            )
+        return 0, "", ""
 
     monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
-    assert cli._resolve_remote_ip("mt", "10.0.0.5", "192.168.1.125") == "10.0.0.5"
+    addrs = cli._resolve_remote_addrs("mt", None, "192.168.1.125")
+    assert addrs == ["192.168.1.114", "192.168.1.133"]
+
+
+def test_loopback_and_link_local_are_excluded(monkeypatch) -> None:
+    """KILLS: an unfiltered union of whatever the remote reports.
+
+    The remote is trusted enough to enroll, but its output is still parsed input,
+    and neither 127.0.0.1 nor a 169.254/16 address can ever be the source of a
+    packet that reaches this primary. Also pins that a v6 literal in the list does
+    not reach the IPv4-only saddr set.
+    """
+
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        if "route get" in command:
+            return 0, "192.168.1.125 dev eth0 src 192.168.1.121 uid 0\n", ""
+        if "addr show" in command:
+            return (
+                0,
+                (
+                    "1: lo    inet 127.0.0.1/8 scope host lo\n"
+                    "2: eth0    inet 192.168.1.121/24 scope global eth0\n"
+                    "3: eth0    inet 169.254.7.7/16 scope link eth0\n"
+                    "4: eth0    inet6 2001:db8::1/64 scope global eth0\n"
+                ),
+                "",
+            )
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    assert cli._resolve_remote_addrs("spark", None, "192.168.1.125") == ["192.168.1.121"]
+
+
+def test_route_source_absent_from_the_address_list_is_surfaced(monkeypatch, caplog) -> None:
+    """KILLS: silently unioning the route source into the list.
+
+    A route source the box does not report for itself means policy routing or
+    source NAT is in play. The enrollment is still correct — the route source is
+    what upsd sees — but the operator's picture of that machine is not, and this is
+    the only moment anyone looks. Asserts BOTH the warning and that the enrollment
+    proceeded, so a mutant that turns the warning into a refusal is also caught.
+    """
+
+    def fake_ssh(alias, command, stdin=None):  # noqa: ANN001
+        if "route get" in command:
+            return 0, "192.168.1.125 dev vpn0 src 10.8.0.2 uid 0\n", ""
+        if "addr show" in command:
+            return 0, "2: eth0    inet 192.168.1.114/24 scope global eth0\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_monitor_run_ssh", fake_ssh)
+    with caplog.at_level("WARNING"):
+        addrs = cli._resolve_remote_addrs("mt", None, "192.168.1.125")
+    assert addrs == ["10.8.0.2", "192.168.1.114"]
+    assert "10.8.0.2" in caplog.text and "192.168.1.114" in caplog.text
 
 
 def test_add_persists_route_src_not_gateway(cfg_path, add_env, monkeypatch) -> None:
@@ -899,7 +1289,8 @@ def test_add_non_root_rc4(cfg_path, monkeypatch, tmp_path) -> None:
 def test_add_remote_install_fail_rc3(cfg_path, add_env, monkeypatch) -> None:
     ssh = FakeSSH(
         [
-            (0, _SSH_CONN, ""),  # resolve ip
+            (0, _ROUTE_GET, ""),  # resolve: route src ON the remote
+            (0, _ADDR_SHOW, ""),  # resolve: the remote's own global addresses
             (0, "Linux\n/usr/bin/pacman\n", ""),  # detect
             (1, "", "no network"),  # install fails
         ]
@@ -917,7 +1308,8 @@ def test_add_remote_install_fail_rc3(cfg_path, add_env, monkeypatch) -> None:
 def test_add_verify_fail_rc5(cfg_path, add_env, monkeypatch) -> None:
     ssh = FakeSSH(
         [
-            (0, _SSH_CONN, ""),  # resolve
+            (0, _ROUTE_GET, ""),  # resolve: route src ON the remote
+            (0, _ADDR_SHOW, ""),  # resolve: the remote's own global addresses
             (0, "Linux\n/usr/bin/pacman\n", ""),  # detect
             (0, "", ""),  # install
             (0, "", ""),  # cat upsmon
@@ -1007,7 +1399,8 @@ def test_add_refuse_on_existing_monitor_line_without_force(cfg_path, add_env, mo
     # The remote already has an operator MONITOR line outside our marker block.
     ssh = FakeSSH(
         [
-            (0, _SSH_CONN, ""),  # resolve
+            (0, _ROUTE_GET, ""),  # resolve: route src ON the remote
+            (0, _ADDR_SHOW, ""),  # resolve: the remote's own global addresses
             (0, "Linux\n/usr/bin/pacman\n", ""),  # detect
             (0, "", ""),  # install
             (0, "MONITOR myups@host 1 admin pw primary\n", ""),  # cat upsmon (operator config)
@@ -2389,6 +2782,112 @@ def test_survivor_saddrs_drops_a_non_literal_ip_and_a_non_native_record(caplog) 
     assert "evil" in caplog.text  # the drop is explained, not silent
 
 
+def test_survivor_saddrs_covers_every_address_of_every_native_record() -> None:
+    """KILLS: `_survivor_saddrs` reading only the first address.
+
+    That is the pre-03-08 behaviour and it passes every single-homed test in this
+    file. mt is dual-homed (.114 on eno4, .133 on eno3) and eulerpi4 is
+    dual-addressed; reading one address per record leaves the other out of the
+    allow set, so the machine is one routing change from being firewalled out.
+    Order is asserted, not just membership: the route source is first per record.
+    """
+    from ups_orchestrator.config import MonitoredMachine
+
+    machines = (
+        MonitoredMachine(
+            name="mt",
+            shutdown_method="native",
+            ip="192.168.1.114",
+            ips=("192.168.1.114", "192.168.1.133"),
+        ),
+        MonitoredMachine(
+            name="eulerpi4",
+            shutdown_method="native",
+            ip="192.168.1.138",
+            ips=("192.168.1.138", "192.168.1.137"),
+        ),
+    )
+    assert cli._survivor_saddrs(machines) == [
+        "192.168.1.114",
+        "192.168.1.133",
+        "192.168.1.138",
+        "192.168.1.137",
+    ]
+
+
+def test_survivor_saddrs_refuses_a_v6_member_in_the_SECOND_position(caplog) -> None:
+    """KILLS: validating only the FIRST member of the address tuple.
+
+    Discriminating by position: a v6 literal in position ONE passes under both
+    branches, because the loop's first iteration is the only one a first-member
+    check performs. Placed second, it reaches `nft -f` under the mutant and rejects
+    the ENTIRE ruleset — nftables' `ip saddr` is the IPv4 matcher — taking the
+    operator's policy-drop chain with it at the next boot.
+    """
+    from ups_orchestrator.config import MonitoredMachine
+
+    machines = (
+        MonitoredMachine(
+            name="dualstack",
+            shutdown_method="native",
+            ip="192.168.1.114",
+            ips=("192.168.1.114", "2001:db8::1", "192.168.1.133"),
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        assert cli._survivor_saddrs(machines) == ["192.168.1.114", "192.168.1.133"]
+    assert "2001:db8::1" in caplog.text and "IPv4" in caplog.text
+
+
+def test_a_record_that_stops_being_native_sheds_ALL_of_its_addresses(cfg_path, monkeypatch) -> None:
+    """KILLS: shedding only the FIRST address when a record stops being native.
+
+    ME-C4 extended to the tuple. `monitor add --method serial` is a record-only
+    re-enrollment: the machine keeps its name and loses its native authority, so
+    every address it held must leave the allow set. Shedding one would leave the
+    firewall granting upsd access to a host with no native record — the exact
+    stale-accept ME-C4 exists to revoke, one address over.
+    """
+    _write_config(
+        cfg_path,
+        machines=[
+            {
+                **_machine("mt", ip="192.168.1.114"),
+                "shutdown_method": "native",
+                "ips": ["192.168.1.114", "192.168.1.133"],
+            },
+            {**_machine("spark", ip="192.168.1.121"), "shutdown_method": "native"},
+        ],
+    )
+    before = cli._survivor_saddrs(cli._load_config().monitored_machines)
+    assert before == ["192.168.1.114", "192.168.1.133", "192.168.1.121"]
+
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+    monkeypatch.setattr(cli, "_monitor_restart_bouncer", lambda: None)
+    rc = cli.main(
+        [
+            "monitor",
+            "add",
+            "mt",
+            "--method",
+            "serial",
+            "--ups",
+            "cyberpower",
+            "--serial-device",
+            "/dev/ttyUSB0",
+            "--serial-baud",
+            "115200",
+        ]
+    )
+    assert rc == 2  # the native->push transition guard refuses; nothing was shed yet
+    # `monitor remove` is the command that actually disarms, and it must shed BOTH.
+    monkeypatch.setattr(cli, "_monitor_run_ssh", FakeSSH())
+    assert cli.main(["monitor", "remove", "mt"]) == 0
+    after = cli._survivor_saddrs(cli._load_config().monitored_machines)
+    assert after == ["192.168.1.121"]
+    assert "192.168.1.133" not in after
+
+
 def test_render_nft_accept_rule_refuses_a_non_literal_member() -> None:
     # Belt-and-braces at the shared sink: nothing but an IP literal is a legitimate
     # member of a set that root loads.
@@ -3165,19 +3664,28 @@ def test_survivor_saddrs_drops_an_ipv6_record_ip(caplog) -> None:
     assert "v6" in caplog.text and "IPv4" in caplog.text
 
 
-def test_resolve_remote_ip_rejects_a_v6_ssh_connection_fallback(monkeypatch) -> None:
-    """A v6-reachable secondary's $SSH_CONNECTION field 1 is a v6 literal.
+def test_resolve_remote_addrs_refuses_without_a_primary_to_route_toward(monkeypatch) -> None:
+    """The rung that needed no destination is gone, so a blank primary must refuse.
 
-    Accepted, it was written to the record's `ip` and then rendered into the
-    IPv4-only saddr set.
+    Before 03-08 this call fell through to $SSH_CONNECTION, which needs no
+    destination — and on a v6-reachable secondary that field is a v6 literal, which
+    was accepted and then rendered a ruleset `nft -f` refuses. There is nothing to
+    fall through to now, so the answer is a refusal that names both escapes.
     """
+    calls: list[str] = []
     monkeypatch.setattr(
-        cli, "_monitor_run_ssh", lambda _a, _c, _s: (0, "2001:db8::1 4242 2001:db8::2 22\n", "")
+        cli,
+        "_monitor_run_ssh",
+        lambda _a, c, _s: (calls.append(c), (0, "2001:db8::1 4242 2001:db8::2 22\n", ""))[1],
     )
-    assert cli._resolve_remote_ip("mt", None, "") is None
+    assert cli._resolve_remote_addrs("mt", None, "") is None
+    assert calls == []  # it does not even reach out
 
 
-def test_resolve_remote_ip_rejects_a_v6_route_src(monkeypatch) -> None:
+def test_resolve_remote_addrs_rejects_a_v6_route_src(monkeypatch) -> None:
+    # F2: the src is spliced into `ip saddr`, nftables' IPv4 matcher. A v6 literal
+    # there does not merely fail to match — `nft -f` rejects the WHOLE ruleset,
+    # taking the operator's policy drop with it at the next boot.
     monkeypatch.setattr(
         cli,
         "_monitor_run_ssh",
@@ -3187,7 +3695,7 @@ def test_resolve_remote_ip_rejects_a_v6_route_src(monkeypatch) -> None:
             else (1, "", "")
         ),
     )
-    assert cli._resolve_remote_ip("mt", None, "192.168.1.125") is None
+    assert cli._resolve_remote_addrs("mt", None, "192.168.1.125") is None
 
 
 # --- monitor add is an upsert, not a replace ---------------------------------

@@ -1759,6 +1759,111 @@ def test_push_declaration_without_an_ip_is_not_disarmed(tmp_path: Path) -> None:
     assert m.effective_method == "ssh"
 
 
+def test_push_declaration_carrying_only_the_LIST_form_ip_is_still_disarmed(
+    tmp_path: Path,
+) -> None:
+    """KILLS: leaving the IW-05 check reading `ip` after 03-08 added `ips`.
+
+    The check exists to catch a HAND EDIT, and a hand edit that moves the address
+    into the new key while blanking the old one would walk straight through a check
+    that only reads the old one — turning the fingerprint detector off for exactly
+    the shape it was built to catch. Discriminating: the record carries `ips` and an
+    EMPTY `ip`, so a first-field check sees nothing.
+    """
+    m = _sole(
+        _one_machine(
+            tmp_path,
+            {
+                "name": "spark",
+                "ssh": "spark",
+                "ups": "cyberpower",
+                "shutdown_method": "ssh",
+                "ip": "",
+                "ips": ["192.168.1.121"],
+            },
+        )
+    )
+    assert m.disarmed is True
+
+
+# --- 03-08: a machine record holds every address it can source from -----------
+
+
+def test_legacy_single_address_config_round_trips_without_loss() -> None:
+    """KILLS: dropping the back-compat `ip` emission on persist.
+
+    `from_dict`/`to_dict` round-trip the LIVE config file on every `monitor add`
+    and `monitor remove`, so a field only one direction knows about silently
+    deletes operator data on an unrelated command. A release that drops `ip` makes
+    a ROLLBACK to the previous release read an empty address — a firewall that
+    stops granting a machine access, which is the shutdown-critical direction.
+    Asserts BOTH keys survive TWO round trips, not one: a value that survives once
+    can still be lost on the second persist.
+    """
+    from ups_orchestrator.config import MonitoredMachine
+
+    once = MonitoredMachine.from_dict(
+        {"name": "mt", "ssh": "mt", "ups": "cyberpower", "ip": "192.168.1.114"}
+    ).to_dict()
+    assert once["ip"] == "192.168.1.114"
+    assert once["ips"] == ["192.168.1.114"]
+
+    twice = MonitoredMachine.from_dict(once).to_dict()
+    assert twice == once
+    assert MonitoredMachine.from_dict(twice).addresses == ("192.168.1.114",)
+
+
+def test_a_list_of_addresses_loads_in_order_and_deduplicated() -> None:
+    from ups_orchestrator.config import MonitoredMachine
+
+    m = MonitoredMachine.from_dict(
+        {
+            "name": "mt",
+            "ips": ["192.168.1.114", " 192.168.1.133 ", "192.168.1.114", "", "192.168.1.133"],
+        }
+    )
+    assert m.addresses == ("192.168.1.114", "192.168.1.133")
+    # The scalar mirrors the FIRST entry, which is the route source.
+    assert m.ip == "192.168.1.114"
+
+
+def test_when_both_forms_are_present_the_list_wins_and_the_scalar_is_rewritten() -> None:
+    """The documented precedence, pinned so it cannot drift into a silent union.
+
+    Two sources of truth for the same fact must have one stated winner. The LIST
+    wins because it is what the resolver writes and it is the only form that can
+    express a multi-homed machine; the scalar is rewritten to its first entry so a
+    reader of either key sees the same authoritative address.
+    """
+    from ups_orchestrator.config import MonitoredMachine
+
+    m = MonitoredMachine.from_dict(
+        {"name": "mt", "ip": "192.168.1.99", "ips": ["192.168.1.114", "192.168.1.133"]}
+    )
+    assert m.addresses == ("192.168.1.114", "192.168.1.133")
+    assert m.ip == "192.168.1.114"
+    assert m.to_dict()["ip"] == "192.168.1.114"
+
+
+def test_a_blank_list_falls_back_to_the_scalar_rather_than_blanking_the_record() -> None:
+    # A hand-edited `"ips": []` alongside a real `ip` must not silently revoke that
+    # machine's firewall accept.
+    from ups_orchestrator.config import MonitoredMachine
+
+    m = MonitoredMachine.from_dict({"name": "mt", "ip": "192.168.1.114", "ips": []})
+    assert m.addresses == ("192.168.1.114",)
+
+
+def test_a_non_list_ips_value_is_ignored_rather_than_crashing_the_load() -> None:
+    # The config file is hand-editable and Config.load runs on the OUTAGE path; a
+    # TypeError here is a silent no-op that reports success (IW-06).
+    from ups_orchestrator.config import MonitoredMachine
+
+    for bogus in ("192.168.1.114", 7, {"a": 1}, None):
+        m = MonitoredMachine.from_dict({"name": "mt", "ip": "192.168.1.114", "ips": bogus})
+        assert m.addresses == ("192.168.1.114",)
+
+
 # --- T-02-10: the ssh alias reaches an unattended argv ---
 
 
