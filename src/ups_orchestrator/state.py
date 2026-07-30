@@ -46,6 +46,11 @@ class UpsState:
     # alarm on its own instead of depending on NUT's COMMBAD, which it explicitly does
     # not trust to close one. Reset to 0 on the first readable poll.
     unreadable_polls: int = 0
+    # True once LOW BATTERY has been paged for the current outage. Same reason as
+    # commbad_notified: LOWBATT reaches Discord only via a upsmon TRANSITION, so
+    # restarting nut-monitor while a UPS is already OB LB consumes it and the CRITICAL
+    # page never fires for that outage. The poll loop reads the flag every cycle.
+    lowbatt_notified: bool = False
     # Targets whose transport returned rc 0. SEPARATE from shutdowns_sent, which means
     # ATTEMPTED and must keep meaning that: it is what releases the local-target hold
     # so a dead remote cannot strand this host (T-02-24). Using one list for both meant
@@ -82,6 +87,7 @@ class UpsState:
             onbatt_notified=bool(data.get("onbatt_notified", False)),
             commbad_notified=bool(data.get("commbad_notified", False)),
             unreadable_polls=_opt_int(data.get("unreadable_polls")) or 0,
+            lowbatt_notified=bool(data.get("lowbatt_notified", False)),
             shutdowns_confirmed=[str(x) for x in raw_confirmed]
             if isinstance(raw_confirmed, list)
             else [],
@@ -573,6 +579,7 @@ class StateStore:
             # what makes an alarm unclosable.
             mine.commbad_notified = mine.commbad_notified or on_disk.commbad_notified
             mine.onbatt_notified = mine.onbatt_notified or on_disk.onbatt_notified
+            mine.lowbatt_notified = mine.lowbatt_notified or on_disk.lowbatt_notified
 
     def get(self, ups_name: str) -> UpsState:
         """Return the state for ``ups_name``, creating a blank one on first use."""

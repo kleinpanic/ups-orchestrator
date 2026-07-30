@@ -39,8 +39,16 @@ _CHILD_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 #   2. An external `timeout 900` sent SIGTERM mid-mutant. The `finally` never
 #      ran, leaving the nftables rollback replaced by `pass`.
 #
-# Both are now structurally prevented rather than remembered: a lock stops the
-# race, and a signal handler restores before dying. A reviewer reading src/
+# A THIRD writer is not covered by either and cannot be: editing src/ by hand WHILE a
+# run is in flight. The harness reads a file as its baseline, mutates, and restores that
+# baseline — so a concurrent hand-edit is either lost, or left behind as a mutant when
+# the harness restores around it. Observed: a run was killed mid-flight during an edit
+# session and `if False:  # mutated` survived in report.py. The clean-tree precondition
+# below catches STARTING dirty; nothing can catch BECOMING dirty. Do not edit src/ while
+# `make mutation` is running, and check `git status src/` after any interrupted run.
+#
+# Both prior failures are now structurally prevented rather than remembered: a lock
+# stops the race, and a signal handler restores before dying. A reviewer reading src/
 # mid-run still sees a mutant — that is unavoidable and is why the automated
 # security scanner flagged one — but nothing is left behind afterwards.
 _LOCK = ROOT / ".mutation-test.lock"
@@ -85,6 +93,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
+    (
+        "src/ups_orchestrator/events.py",
+        "    if state.lowbatt_notified or not snap.low_battery:\n        return",
+        "    if True:\n        return",
+        "events: the poll loop stops backstopping LOW BATTERY — a upsmon restart while "
+        "already OB LB consumes the transition and the CRITICAL page never fires",
+    ),
     (
         "src/ups_orchestrator/events.py",
         "    if name in state.shutdowns_confirmed:\n        return False",

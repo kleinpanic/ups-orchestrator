@@ -2542,3 +2542,62 @@ def test_a_suspect_clock_blocks_firing_rather_than_permitting_it() -> None:
 
     assert ok is False
     assert "not recorded yet" in why
+
+
+# --- LOW BATTERY had no poll-loop backstop, unlike ONBATT and (now) COMMBAD ---
+#
+# LOWBATT reached Discord only via `AT LOWBATT * EXECUTE lowbatt`, i.e. a upsmon
+# TRANSITION — the exact mechanism that failed for COMMOK. Restart nut-monitor while a
+# UPS is already OB LB and the transition is consumed: the CRITICAL page never fires for
+# that outage. `snap.low_battery` was read by four modules and by nothing in the event
+# path at all.
+
+
+def test_the_poll_loop_pages_low_battery_when_nut_missed_the_transition() -> None:
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OB LB"), now=100, countdown_every=0)
+
+    dispatch("tick", ups, state, deps)
+
+    assert any("LOW BATTERY" in n.title for n in notifier.sent), [n.title for n in notifier.sent]
+    assert state.lowbatt_notified is True
+
+
+def test_low_battery_is_paged_once_per_outage_not_every_poll() -> None:
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OB LB"), now=100, countdown_every=0)
+
+    for _ in range(5):
+        dispatch("tick", ups, state, deps)
+
+    assert sum("LOW BATTERY" in n.title for n in notifier.sent) == 1
+
+
+def test_nut_delivering_lowbatt_suppresses_the_backstop() -> None:
+    """Both producers must not page for the same outage."""
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OB LB"), now=100, countdown_every=0)
+
+    dispatch("lowbatt", ups, state, deps)  # NUT's own path
+    before = sum("LOW BATTERY" in n.title for n in notifier.sent)
+    dispatch("tick", ups, state, deps)  # the backstop must stay quiet
+
+    assert sum("LOW BATTERY" in n.title for n in notifier.sent) == before
+
+
+def test_returning_to_utility_power_rearms_the_low_battery_page() -> None:
+    """A second outage must be able to page again."""
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(onbatt_since=1, onbatt_notified=True, lowbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL"), now=100, countdown_every=0)
+
+    dispatch("tick", ups, state, deps)  # power returns
+
+    assert state.lowbatt_notified is False

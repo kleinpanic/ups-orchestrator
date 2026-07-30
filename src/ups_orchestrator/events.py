@@ -610,13 +610,19 @@ def _log_event(
 def _notify(deps: Deps, note: Notification) -> None:
     """Send a notification on the SHUTDOWN path without ever raising out of it.
 
-    The mirror of ``_log_event``, and load-bearing for the same reason. The three
-    notify sites below sit on the path that powers machines off, and
-    ``state.shutdowns_sent`` is appended only after the transport returns — so a
+    The mirror of ``_log_event``, and load-bearing for the same reason. EVERY notify
+    site reachable from ``handle_tick`` routes through here — not just the ones on the
+    firing path itself, because they all run upstream of the firing decision in the SAME
+    tick. ``state.shutdowns_sent`` is appended only after the transport returns, so a
     notifier that raises (a dead switch mid-outage is the expected case) leaves the
     target unmarked and the local hosts unreached, which is the T-02-24 starvation the
     ``_fire_target`` backstop exists to prevent. ``_report_unprojectable`` raises out of
     the ``_machine_targets`` generator instead, i.e. before anything has fired at all.
+
+    The comm-alarm, low-battery and load-step pages each used a raw
+    ``deps.notifier.send`` and were caught by the two tests pinning this invariant: on a
+    dead switch they aborted the tick, and with it the shutdown of mt and spark. Anything
+    new on this path uses ``_notify``.
     """
     try:
         deps.notifier.send(note)
@@ -677,6 +683,7 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     state.shutdown_attempts = {}
     state.last_tick_notified = None
     state.onbatt_notified = False
+    state.lowbatt_notified = False
     state.last_status = snap.status
     fields = _snapshot_fields(snap)
     if outage is not None:
@@ -704,6 +711,9 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
 def handle_lowbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     snap = deps.read_snapshot(ups.name)
+    # Latched so the poll-loop backstop does not send a second page for the same outage
+    # when NUT delivered this one normally.
+    state.lowbatt_notified = True
     _log_event(deps, "lowbatt", ups, snap, "NUT reported low battery.")
     deps.notifier.send(
         Notification(
@@ -1300,13 +1310,14 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
     )
     if sparkline:
         body += f"\n\n{sparkline}"
-    deps.notifier.send(
+    _notify(
+        deps,
         Notification(
             title=f"📉 {ups.label} — load dropped {drop} points",
             body=body,
             level=Level.WARNING,
             fields=_snapshot_fields(snap),
-        )
+        ),
     )
 
 
@@ -1340,7 +1351,8 @@ def _open_comm_alarm_if_persistently_unreadable(
         return
     state.commbad_notified = True
     _log_event(deps, "commbad", ups, None, "upsc returned nothing for consecutive polls.")
-    deps.notifier.send(
+    _notify(
+        deps,
         Notification(
             title=f"🔌 {ups.label} — COMMUNICATION LOST",
             body=(
@@ -1349,7 +1361,7 @@ def _open_comm_alarm_if_persistently_unreadable(
                 f"reachable, so check `upsc {ups.name}` and the driver."
             ),
             level=Level.WARNING,
-        )
+        ),
     )
 
 
@@ -1383,7 +1395,8 @@ def _close_comm_alarm_if_recovered(
         return  # still unreachable; leave the alarm standing
     state.commbad_notified = False
     _log_event(deps, "commok", ups, snap, "UPS readable again (closed by the poll loop).")
-    deps.notifier.send(
+    _notify(
+        deps,
         Notification(
             title=f"🔌 {ups.label} — COMMUNICATION RESTORED",
             body=(
@@ -1392,7 +1405,46 @@ def _close_comm_alarm_if_recovered(
             ),
             level=Level.SUCCESS,
             fields=_snapshot_fields(snap),
-        )
+        ),
+    )
+
+
+def _page_low_battery_if_nut_did_not(
+    ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot
+) -> None:
+    """Page LOW BATTERY from the poll loop when NUT's own transition was missed.
+
+    LOWBATT reached Discord only through `AT LOWBATT * EXECUTE lowbatt`, i.e. through a
+    ``upsmon`` TRANSITION — the exact mechanism that failed for COMMOK. Restart
+    ``nut-monitor`` while a UPS is already ``OB LB`` (which a ``nut-server`` restart
+    does) and the transition is consumed: the CRITICAL page never fires for that outage
+    and the operator sees only the routine countdown embeds.
+
+    ONBATT already had a poll-loop detector (`onbatt_detected_by_poll`) and COMMBAD now
+    has one; LOW BATTERY had neither an opener nor a backstop, despite being the most
+    urgent of the three. ``snap.low_battery`` was read by the report, status, webui and
+    selftest modules and by nothing in the event path at all.
+
+    Latched, so NUT delivering it normally and this backstop cannot both page.
+    """
+    if state.lowbatt_notified or not snap.low_battery:
+        return
+    state.lowbatt_notified = True
+    _log_event(deps, "lowbatt", ups, snap, "Low battery seen by the poll loop.")
+    _notify(
+        deps,
+        Notification(
+            title=f"\u26a0\ufe0f {ups.label} — LOW BATTERY",
+            body=(
+                "The UPS reports LB. Detected by the poll loop — NUT's own LOWBATT "
+                "transition was not delivered, which happens when nut-monitor restarts "
+                "while the UPS is already low. Whether any machine is powered off is "
+                "decided by the shutdown policy; run 'ups-orchestrator remote-shutdown "
+                "--dry-run' for the per-target verdict."
+            ),
+            level=Level.CRITICAL,
+            fields=_snapshot_fields(snap),
+        ),
     )
 
 
@@ -1450,6 +1502,7 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
         return
 
     now = deps.now()
+    _page_low_battery_if_nut_did_not(ups, state, deps, snap)
     if state.onbatt_since is None:
         state.onbatt_since = now
         state.shutdowns_sent = []
