@@ -45,6 +45,8 @@ def test_state_save_creates_parent_and_writes_json(tmp_path) -> None:
             "onbatt_notified": False,
             "commbad_notified": False,
             "unreadable_polls": 0,
+            "shutdowns_confirmed": [],
+            "shutdown_attempts": {},
         }
     }
 

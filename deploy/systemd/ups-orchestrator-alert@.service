@@ -1,0 +1,15 @@
+[Unit]
+# OnFailure handler for the orchestrator's own units.
+#
+# `%i` is the failed unit's name, passed by systemd via `OnFailure=...@%n.service`.
+#
+# This exists because the orchestrator cannot report its own death: an unloadable
+# config makes both the watch loop and every NUT event handler exit before a notifier
+# is constructed. Without this, a crash-loop is completely silent and the next real
+# outage produces no alerts and no shutdowns.
+Description=Page Discord because %i failed
+
+[Service]
+Type=oneshot
+# No venv, no package import, no config read — see the script's header for why.
+ExecStart=/usr/local/bin/ups-orchestrator-notify-unit-failure %i

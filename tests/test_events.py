@@ -1286,9 +1286,19 @@ def test_projected_push_does_not_fire_above_threshold() -> None:
     assert calls == []
 
 
-def test_failed_projected_push_is_not_retried() -> None:
-    # Attempt-once: _fire_target records the target whatever the runner returned, so
-    # a box that failed to answer is not hammered on every remaining poll.
+def test_failed_projected_push_is_retried_but_bounded() -> None:
+    """A failed transport is retried a few times, then left alone.
+
+    This previously attempted ONCE per outage, on the reasoning that a box which failed
+    to answer must not be hammered every poll. That concern is right and is preserved by
+    the budget — but one attempt was too blunt: for spark it is a single ~20s ssh window
+    (ConnectTimeout 10) over a LAN fed by the shortest-runtime UPS of the three, i.e.
+    exactly the window most likely to fail transiently. Failing it meant spark stayed up
+    for the whole outage while drawing from the battery the primary shares.
+
+    `shutdowns_sent` still records every ATTEMPT, because that is what releases the
+    local-target hold (T-02-24); the retry key is `shutdowns_confirmed`.
+    """
     notifier = FakeNotifier()
     deps, calls = make_deps(
         notifier, _low(), countdown_every=0, ssh_rc=1, monitored_machines=(_spark(),)
@@ -1296,17 +1306,41 @@ def test_failed_projected_push_is_not_retried() -> None:
     ups = make_ups("ups1", shutdown_policy=shutdown_policy())
     state = UpsState(onbatt_since=1, onbatt_notified=True)
 
-    dispatch("tick", ups, state, deps)
-    dispatch("tick", ups, state, deps)
+    for _ in range(6):  # well past the budget
+        dispatch("tick", ups, state, deps)
 
-    assert calls == ["spark"]
-    assert state.shutdowns_sent == ["spark"]
+    assert calls == ["spark"] * events_mod.MAX_SHUTDOWN_ATTEMPTS, calls
+    assert state.shutdowns_confirmed == [], "a failed push must never count as confirmed"
     assert "shutdown FAILED" in notifier.sent[-1].title
 
 
-def test_failed_projected_serial_push_is_not_retried() -> None:
+def test_a_push_that_succeeds_on_retry_is_not_attempted_again() -> None:
+    """The point of the budget: recover from a transient, then stop."""
+    notifier = FakeNotifier()
+    deps, calls = make_deps(
+        notifier, _low(), countdown_every=0, ssh_rc=1, monitored_machines=(_spark(),)
+    )
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy())
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+
+    dispatch("tick", ups, state, deps)  # fails
+    assert state.shutdowns_confirmed == []
+
+    def _works(target):  # noqa: ANN001,ANN202 - the far end comes back
+        calls.append(target.name)
+        return 0, "", ""
+
+    deps.ssh_shutdown = _works
+    dispatch("tick", ups, state, deps)  # succeeds
+    assert state.shutdowns_confirmed == ["spark"]
+
+    dispatch("tick", ups, state, deps)  # and is not fired again
+    assert calls == ["spark", "spark"], calls
+
+
+def test_failed_projected_serial_push_is_retried_but_bounded() -> None:
     # Same contract over the serial transport: a short write (adapter unplugged, no
-    # getty on the far end) is reported and recorded, not retried on the next poll.
+    # getty on the far end) is retried within the budget and then left alone.
     notifier = FakeNotifier()
     deps, calls = make_deps(
         notifier, _low(), countdown_every=0, serial_rc=1, monitored_machines=(_mt(),)
@@ -1314,11 +1348,11 @@ def test_failed_projected_serial_push_is_not_retried() -> None:
     ups = make_ups("ups1", shutdown_policy=shutdown_policy())
     state = UpsState(onbatt_since=1, onbatt_notified=True)
 
-    dispatch("tick", ups, state, deps)
-    dispatch("tick", ups, state, deps)
+    for _ in range(6):  # well past the budget
+        dispatch("tick", ups, state, deps)
 
-    assert calls == ["mt"]
-    assert state.shutdowns_sent == ["mt"]
+    assert calls == ["mt"] * events_mod.MAX_SHUTDOWN_ATTEMPTS, calls
+    assert state.shutdowns_confirmed == []
     assert "shutdown FAILED" in notifier.sent[-1].title
 
 

@@ -648,6 +648,8 @@ def handle_onbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     now = deps.now()
     state.onbatt_since = now
     state.shutdowns_sent = []
+    state.shutdowns_confirmed = []
+    state.shutdown_attempts = {}
     state.last_tick_notified = now  # delay first countdown by one cadence
     state.onbatt_notified = True  # this path pages now, so the poll loop won't re-page
     state.last_status = snap.status
@@ -671,6 +673,8 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     paged = state.onbatt_notified  # did this outage ever page ON BATTERY?
     state.onbatt_since = None
     state.shutdowns_sent = []
+    state.shutdowns_confirmed = []
+    state.shutdown_attempts = {}
     state.last_tick_notified = None
     state.onbatt_notified = False
     state.last_status = snap.status
@@ -982,7 +986,17 @@ def _fire_target(
         rc, err = 1, f"shutdown transport for {target.name} ({where}) raised: {exc}"
     # Unchanged and load-bearing: the append happens on EVERY outcome, including an rc!=0
     # and an escaping runner, so a dead remote can never strand the local host (T-02-24).
+    # `shutdowns_sent` means ATTEMPTED, and only that.
     state.shutdowns_sent.append(target.name)
+    state.shutdown_attempts[target.name] = state.shutdown_attempts.get(target.name, 0) + 1
+    # SUCCEEDED is a separate ledger. Conflating the two meant a transport that FAILED
+    # was recorded as done and never tried again: one attempt per target per outage. For
+    # spark that is a single ~20s ssh window (ConnectTimeout 10), over a LAN fed by the
+    # shortest-runtime UPS of the three — exactly the window most likely to fail
+    # transiently, and failing it meant spark stayed up for the whole outage while
+    # drawing from the battery the primary shares.
+    if rc == 0 and target.name not in state.shutdowns_confirmed:
+        state.shutdowns_confirmed.append(target.name)
     _log_event(
         deps,
         "shutdown_result",
@@ -993,6 +1007,26 @@ def _fire_target(
     )
     _notify_shutdown_attempt(ups, deps, target, snap, where, reason)
     _notify_shutdown_result(ups, deps, target, rc, err, where)
+
+
+# A failed transport is retried, but not forever: an unreachable box would otherwise be
+# re-fired every poll for the whole outage, with an attempt+result notification each
+# time. Three is enough to ride out a transient (a switch still coming up, an sshd not
+# yet listening) without becoming a loop.
+MAX_SHUTDOWN_ATTEMPTS = 3
+
+
+def _may_attempt(state: UpsState, name: str) -> bool:
+    """May this target be fired? False once it succeeded or spent its retry budget.
+
+    Keyed on ``shutdowns_confirmed``, NOT on ``shutdowns_sent``. The latter means
+    ATTEMPTED and exists to release the local-target hold (T-02-24) — using it as the
+    fire-once key gave every target exactly one attempt per outage and treated a failure
+    as a completed shutdown.
+    """
+    if name in state.shutdowns_confirmed:
+        return False
+    return state.shutdown_attempts.get(name, 0) < MAX_SHUTDOWN_ATTEMPTS
 
 
 def _report_unprojectable(
@@ -1127,9 +1161,9 @@ def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: Ups
 
     for t in remotes:
         should_fire, reason = _target_should_fire(ups, state, deps, t, snap)
-        if t.name not in state.shutdowns_sent and should_fire:
+        if _may_attempt(state, t.name) and should_fire:
             _fire_target(ups, state, deps, t, snap, reason)
-        elif t.name not in state.shutdowns_sent:
+        elif _may_attempt(state, t.name):
             _log_event(
                 deps,
                 "shutdown_target_blocked",
@@ -1160,9 +1194,9 @@ def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: Ups
         return
     for t in locals_:
         should_fire, reason = _target_should_fire(ups, state, deps, t, snap)
-        if t.name not in state.shutdowns_sent and should_fire:
+        if _may_attempt(state, t.name) and should_fire:
             _fire_target(ups, state, deps, t, snap, reason)
-        elif t.name not in state.shutdowns_sent:
+        elif _may_attempt(state, t.name):
             _log_event(
                 deps,
                 "shutdown_target_blocked",
@@ -1419,6 +1453,8 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     if state.onbatt_since is None:
         state.onbatt_since = now
         state.shutdowns_sent = []
+        state.shutdowns_confirmed = []
+        state.shutdown_attempts = {}
         state.last_tick_notified = now
         _log_event(
             deps,

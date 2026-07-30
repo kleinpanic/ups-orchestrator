@@ -14,6 +14,18 @@
 # boot. Ordering after the sync closes the boot case at the source.
 After=time-sync.target
 Wants=time-sync.target
+# Page Discord if this unit dies. The orchestrator cannot report its own death.
+OnFailure=ups-orchestrator-alert@%n.service
+# These two live in [Unit], NOT [Service] — systemd silently ignores them in [Service]
+# and keeps its 10s default, which `systemctl show -p StartLimitIntervalUSec` reveals.
+#
+# Without a start limit that can actually TRIP, `Restart=always` means this unit never
+# reaches `failed`: it loops in `activating` forever and OnFailure= never fires. The
+# default 10s window is unreachable by construction at RestartSec=5, because five
+# restarts take 25s. A 5-minute window makes a genuine crash-loop terminal, which is
+# what turns it into a page instead of indefinite silence.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 Description=ups-orchestrator poll loop (policy-gated shutdowns + countdown)
 
 [Service]

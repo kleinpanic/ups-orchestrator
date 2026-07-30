@@ -97,6 +97,11 @@ SUDOERS
 chmod 0440 /etc/sudoers.d/ups-orchestrator
 visudo -cf /etc/sudoers.d/ups-orchestrator >/dev/null && echo "   sudoers OK" || { echo "   sudoers INVALID — removing"; rm -f /etc/sudoers.d/ups-orchestrator; }
 
+echo ">> unit-failure alerter (the only thing that can report the orchestrator being down)"
+install -o root -g root -m 0755 "$REPO/deploy/notify-unit-failure.sh" \
+  /usr/local/bin/ups-orchestrator-notify-unit-failure
+echo "   installed /usr/local/bin/ups-orchestrator-notify-unit-failure"
+
 echo ">> NUT control user (beeper + battery test; least privilege)"
 "$REPO/deploy/nut-control-user.sh" || echo "   control-user setup skipped (NUT not ready?)"
 

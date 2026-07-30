@@ -46,10 +46,20 @@ class UpsState:
     # alarm on its own instead of depending on NUT's COMMBAD, which it explicitly does
     # not trust to close one. Reset to 0 on the first readable poll.
     unreadable_polls: int = 0
+    # Targets whose transport returned rc 0. SEPARATE from shutdowns_sent, which means
+    # ATTEMPTED and must keep meaning that: it is what releases the local-target hold
+    # so a dead remote cannot strand this host (T-02-24). Using one list for both meant
+    # a FAILED push was recorded as done and never retried.
+    shutdowns_confirmed: list[str] = field(default_factory=list)
+    # Attempts per target this outage, so a target that keeps failing is retried a few
+    # times and then left alone rather than re-fired every poll for the whole outage.
+    shutdown_attempts: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
         raw_sent = data.get("shutdowns_sent", [])
+        raw_confirmed = data.get("shutdowns_confirmed", [])
+        raw_attempts = data.get("shutdown_attempts", {})
         sent = [str(x) for x in raw_sent] if isinstance(raw_sent, list) else []
         raw_recent = data.get("recent_loads", [])
         recent = (
@@ -72,6 +82,14 @@ class UpsState:
             onbatt_notified=bool(data.get("onbatt_notified", False)),
             commbad_notified=bool(data.get("commbad_notified", False)),
             unreadable_polls=_opt_int(data.get("unreadable_polls")) or 0,
+            shutdowns_confirmed=[str(x) for x in raw_confirmed]
+            if isinstance(raw_confirmed, list)
+            else [],
+            shutdown_attempts={
+                str(k): int(v)
+                for k, v in (raw_attempts.items() if isinstance(raw_attempts, dict) else ())
+                if isinstance(v, int) and not isinstance(v, bool)
+            },
         )
 
 
@@ -544,6 +562,13 @@ class StateStore:
             for sent in on_disk.shutdowns_sent:
                 if sent not in mine.shutdowns_sent:
                     mine.shutdowns_sent.append(sent)
+            for done in on_disk.shutdowns_confirmed:
+                if done not in mine.shutdowns_confirmed:
+                    mine.shutdowns_confirmed.append(done)
+            # Highest attempt count wins, so a retry budget another writer already spent
+            # is not handed back by our stale copy.
+            for name_, count in on_disk.shutdown_attempts.items():
+                mine.shutdown_attempts[name_] = max(mine.shutdown_attempts.get(name_, 0), count)
             # Latches: OR, never overwrite. See the docstring — losing a True here is
             # what makes an alarm unclosable.
             mine.commbad_notified = mine.commbad_notified or on_disk.commbad_notified

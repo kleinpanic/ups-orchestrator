@@ -24,6 +24,11 @@ install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-recorder.service" "$UNIT_
 install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-boot-audit.service" "$UNIT_DIR/"
 install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-report.service" "$UNIT_DIR/"
 install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-report.timer" "$UNIT_DIR/"
+# The OnFailure handler for the units above. Template unit, never enabled and never
+# started directly — systemd instantiates it as ups-orchestrator-alert@<unit>.service
+# when one of them enters `failed`. It is the ONLY thing that can report the
+# orchestrator being down, because the orchestrator is what would otherwise report it.
+install -m 0644 "$REPO/deploy/systemd/ups-orchestrator-alert@.service" "$UNIT_DIR/"
 # IF-09: these two shipped in deploy/systemd/ and were installed by NOTHING —
 # neither this script nor install.sh — so `systemctl --user start
 # ups-orchestrator-selftest` failed with "unit not found" on every deployment.
