@@ -34,6 +34,14 @@ class UpsState:
     # transfer that clears within the notify grace (a blip or our own self-test)
     # from ever paging, and stops the poll loop re-paging a persistent outage.
     onbatt_notified: bool = False
+    # True once a COMMUNICATION LOST page has been sent and not yet closed. Needed
+    # because NUT cannot always close it: upsmon fires COMMOK only on a lost->ok
+    # transition IT observed, so restarting nut-monitor (which a nut-server restart
+    # does) leaves the dying process having sent COMMBAD and the fresh one with no
+    # memory of it. That happened here on 2026-07-28: all three UPSes paged
+    # COMMUNICATION LOST within one second and NONE was ever closed, so the operator
+    # carried three open alarms for two days about hardware that was fine.
+    commbad_notified: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
@@ -58,6 +66,7 @@ class UpsState:
             recent_loads=recent,
             last_load_step_notified=_opt_int(data.get("last_load_step_notified")),
             onbatt_notified=bool(data.get("onbatt_notified", False)),
+            commbad_notified=bool(data.get("commbad_notified", False)),
         )
 
 

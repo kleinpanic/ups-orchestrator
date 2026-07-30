@@ -1573,12 +1573,17 @@ def test_no_bare_temp_rename_survives_anywhere_in_the_tree() -> None:
         for path in sorted(directory.rglob("*")):
             if not path.is_file() or path.suffix not in (".py", ".sh"):
                 continue
-            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            for line in path.read_text().splitlines():
                 if bare_rename.search(line):
-                    offenders.append(f"{path.relative_to(repo)}:{lineno}: {line.strip()}")
+                    # Deliberately WITHOUT the line number. Pinning one made this fail on
+                    # any edit ABOVE the call — adding a field to UpsState broke it — and
+                    # a churn-failure in a guard like this teaches people to re-baseline it
+                    # rather than read it, which is exactly how the guard stops guarding.
+                    # File plus statement identifies the site; the line number only dates it.
+                    offenders.append(f"{path.relative_to(repo)}: {line.strip()}")
     # The single legitimate site: the rename inside the metadata-preserving helper
     # itself, which has already carried mode/owner/ACL onto the temp file.
-    assert offenders == ["src/ups_orchestrator/state.py:276: tmp_path.replace(dest_path)"], (
+    assert offenders == ["src/ups_orchestrator/state.py: tmp_path.replace(dest_path)"], (
         "a bare temp-file rename over a destination reappeared (IF-02, IF-08, "
         "T-02-23) — it strips the destination's mode, owner and ACL. Use "
         "state.write_text_preserving_metadata / write_json_preserving_metadata:\n"

@@ -723,6 +723,8 @@ def handle_lowbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 
 
 def handle_commbad(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
+    # Recorded so the POLL LOOP can close this alarm even if NUT never sends COMMOK.
+    state.commbad_notified = True
     _log_event(deps, "commbad", ups, None, "Lost contact with UPS.")
     deps.notifier.send(
         Notification(
@@ -736,6 +738,7 @@ def handle_commbad(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
 def handle_commok(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     snap = deps.read_snapshot(ups.name)
     state.last_status = snap.status
+    state.commbad_notified = False  # closed by NUT itself; the tick has nothing to do
     _log_event(deps, "commok", ups, snap, "Re-established contact with UPS.")
     deps.notifier.send(
         Notification(
@@ -1231,6 +1234,47 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
     )
 
 
+def _close_comm_alarm_if_recovered(
+    ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot
+) -> None:
+    """Close an open COMMUNICATION LOST page once the UPS is readable again.
+
+    NUT cannot be relied on to close this one. ``upsmon`` fires COMMOK only on a
+    lost->ok transition that IT observed, so restarting ``nut-monitor`` — which a
+    ``nut-server`` restart does — leaves the dying process having sent COMMBAD and the
+    fresh process with no memory that anything was ever lost. On 2026-07-28 all three
+    UPSes here paged COMMUNICATION LOST within one second and not one was ever closed;
+    the operator carried three open alarms for two days about hardware that was fine.
+
+    The poll loop is the right place to fix it because it has the one thing upsmon lost:
+    it reads every UPS every cycle, so it can see recovery directly rather than needing
+    to have witnessed the transition. An alarm that can fire and never clear trains an
+    operator to ignore the channel, which is the same failure the advisory-push change
+    addressed from the other direction.
+
+    ``snap.status`` is the evidence. ``read_snapshot`` returns an empty status when
+    ``upsc`` cannot reach the UPS, so a non-empty one means the data path works end to
+    end — driver, upsd and our client.
+    """
+    if not state.commbad_notified:
+        return
+    if not (snap.status or "").strip():
+        return  # still unreachable; leave the alarm standing
+    state.commbad_notified = False
+    _log_event(deps, "commok", ups, snap, "UPS readable again (closed by the poll loop).")
+    deps.notifier.send(
+        Notification(
+            title=f"🔌 {ups.label} — COMMUNICATION RESTORED",
+            body=(
+                "The UPS is readable again. Closed by the poll loop — NUT does not "
+                "always send COMMOK, because a upsmon restart loses the transition."
+            ),
+            level=Level.SUCCESS,
+            fields=_snapshot_fields(snap),
+        )
+    )
+
+
 def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     """One poll iteration (driven by the ``watch`` loop).
 
@@ -1239,6 +1283,7 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     only every ``countdown_every`` seconds.
     """
     snap = deps.read_snapshot(ups.name)
+    _close_comm_alarm_if_recovered(ups, state, deps, snap)
     _record_status_transition(ups, state, deps, snap)
     _check_load_step(ups, state, deps, snap)
     if not snap.on_battery:

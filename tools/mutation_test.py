@@ -86,6 +86,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/events.py",
+        "    if not state.commbad_notified:\n        return",
+        "    if True:\n        return",
+        "events: the poll loop stops closing an open COMM alarm — NUT cannot close it "
+        "after a upsmon restart, so it stays open forever",
+    ),
+    (
         "src/ups_orchestrator/cli.py",
         "needs_remote_disarm = is_native or suspected_stale_secondary",
         "needs_remote_disarm = is_native",

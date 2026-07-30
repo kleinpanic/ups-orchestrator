@@ -2347,3 +2347,74 @@ def test_no_probe_test_names_the_real_serial_device() -> None:
 
     for needle in _REAL_DEVICE_NEEDLES:
         assert needle not in section, f"a probe test names the real console: {needle}"
+
+
+# --- an alarm that cannot close is a broken alarm ---
+#
+# On 2026-07-28 all three UPSes on this host paged COMMUNICATION LOST within one second
+# and not one was ever closed. The hardware was fine the whole time. Cause: `nut-server`
+# was restarted, which restarts `nut-monitor` too; upsmon fires COMMOK only on a
+# lost->ok transition IT observed, so the dying process sent COMMBAD and the fresh one
+# had no memory that anything was lost. The operator carried three open alarms for two
+# days. The poll loop can see recovery directly, so it closes them.
+
+
+def test_commbad_marks_state_so_the_poll_loop_can_close_it() -> None:
+    ups = make_ups("ups1")
+    state = UpsState()
+    deps, _ = make_deps(FakeNotifier(), snap(""))
+
+    events_mod.handle_commbad(ups, state, deps)
+
+    assert state.commbad_notified is True
+
+
+def test_tick_closes_an_open_comm_alarm_once_the_ups_reads_again() -> None:
+    ups = make_ups("ups1")
+    state = UpsState(commbad_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL"))
+
+    events_mod.handle_tick(ups, state, deps)
+
+    titles = [n.title for n in notifier.sent]
+    assert any("COMMUNICATION RESTORED" in t for t in titles), titles
+    assert state.commbad_notified is False  # and it does not re-send next tick
+
+
+def test_tick_leaves_the_alarm_standing_while_the_ups_is_still_unreadable() -> None:
+    """An empty status is what read_snapshot returns when upsc cannot reach the UPS."""
+    ups = make_ups("ups1")
+    state = UpsState(commbad_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap(""))
+
+    events_mod.handle_tick(ups, state, deps)
+
+    assert not any("COMMUNICATION RESTORED" in n.title for n in notifier.sent)
+    assert state.commbad_notified is True
+
+
+def test_tick_does_not_invent_a_restore_when_no_alarm_was_open() -> None:
+    ups = make_ups("ups1")
+    state = UpsState(commbad_notified=False)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL"))
+
+    events_mod.handle_tick(ups, state, deps)
+
+    assert not any("COMMUNICATION RESTORED" in n.title for n in notifier.sent)
+
+
+def test_commok_clears_the_flag_so_the_tick_does_not_double_send() -> None:
+    ups = make_ups("ups1")
+    state = UpsState(commbad_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL"))
+
+    events_mod.handle_commok(ups, state, deps)
+    assert state.commbad_notified is False
+
+    notifier.sent.clear()
+    events_mod.handle_tick(ups, state, deps)
+    assert not any("COMMUNICATION RESTORED" in n.title for n in notifier.sent)

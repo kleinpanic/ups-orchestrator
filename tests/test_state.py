@@ -43,6 +43,7 @@ def test_state_save_creates_parent_and_writes_json(tmp_path) -> None:
             "onbatt_since": 123,
             "shutdowns_sent": [],
             "onbatt_notified": False,
+            "commbad_notified": False,
         }
     }
 
