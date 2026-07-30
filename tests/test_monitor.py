@@ -3983,3 +3983,56 @@ def test_an_explicit_value_still_overrides_the_inherited_one(cfg_path, monkeypat
 
     record = json.loads(cfg_path.read_text())["monitored_machines"][0]
     assert record["ssh"] == "new-alias"
+
+
+# --- BL-02: `monitor remove` must actually do what the advisory promises ---
+#
+# The standing advisory on a `none`-with-a-named-UPS record says: "'none' does NOT
+# disarm an already-enrolled native secondary ... run 'monitor remove <name>' to
+# actually disarm it." The remote teardown was keyed on `is_native` alone, so for
+# exactly that shape the remedy SKIPPED the teardown it advertises, dropped the
+# record, and exited 0 -- removing the warning while leaving the secondary enabled.
+# Live consequence: eulerpi4's nut-monitor stayed `enabled` after a "successful" remove.
+
+
+def test_remove_contacts_the_remote_for_a_none_record_naming_a_ups(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("eulerpi4", method="none", ups="cyberpower", ssh="eulerpi4")],
+    )
+    ssh = FakeSSH()
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+
+    rc = cli.main(["monitor", "remove", "eulerpi4"])
+
+    assert rc == 0
+    assert ssh.calls, "the remote was never contacted — the advisory's remedy is a no-op"
+    assert "eulerpi4" in ssh.calls[0][0]
+
+
+def test_remove_reports_loudly_when_the_remote_disarm_could_not_run(
+    cfg_path, monkeypatch, capsys
+) -> None:
+    """A quieter system is not a safer one.
+
+    Dropping the record also drops the advisory that was reporting the risk, so a bare
+    "removed" would leave the operator with no surface showing an armed secondary.
+    """
+    _write_config(
+        cfg_path,
+        machines=[_machine_entry("eulerpi4", method="none", ups="cyberpower", ssh="eulerpi4")],
+    )
+    failing = FakeSSH([(255, "", "Permission denied (publickey).")])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", failing)
+    monkeypatch.setattr(cli, "_monitor_run_nft", FakeNft())
+
+    rc = cli.main(["monitor", "remove", "eulerpi4"])
+    out = capsys.readouterr().out
+
+    assert rc == 5, "a partial removal must not share an exit code with a clean one"
+    assert "NOT disarmed" in out
+    assert "STILL armed" in out
+    assert "disable --now nut-monitor" in out  # the exact manual step

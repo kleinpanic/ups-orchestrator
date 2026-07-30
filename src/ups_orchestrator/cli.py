@@ -1751,12 +1751,23 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
     # The rewrite is unconditional now; with `_survivor_saddrs`'s native filter
     # (HI-C2) the managed set becomes exactly "the ip of every surviving native
     # record", which is the invariant it was always supposed to have.
-    is_native = machine.shutdown_method.strip().lower() == "native"
+    declared = machine.shutdown_method.strip().lower()
+    is_native = declared == "native"
+    # A record declaring `none` while naming a UPS is the BL-02 shape, and it is the
+    # exact shape the standing advisory fires on -- "'none' does NOT disarm an
+    # already-enrolled native secondary ... run 'monitor remove <name>' to actually
+    # disarm it". Keying the remote teardown on `is_native` alone meant that remedy
+    # SKIPPED the teardown it advertises, deleted the record, and exited 0. On this
+    # host that removed the warning while leaving eulerpi4's secondary `enabled` for
+    # the next boot -- strictly worse than doing nothing, because the condition became
+    # invisible. If we are going to name this command as the remedy, it has to try.
+    suspected_stale_secondary = declared == "none" and bool(machine.ups.strip())
+    needs_remote_disarm = is_native or suspected_stale_secondary
 
     if args.dry_run:
         disarm = (
-            f"skip (declared {machine.shutdown_method})"
-            if not is_native
+            f"skip (declared {machine.shutdown_method}, no UPS named)"
+            if not needs_remote_disarm
             else "skip (--keep-remote)"
             if args.keep_remote
             else machine.ssh
@@ -1767,8 +1778,9 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         _say(f"[dry-run] persist: drop {machine.name} (config written LAST)")
         return 0
 
-    # 1) disarm remote (unless --keep-remote, or the record is not native)
-    if is_native and not args.keep_remote:
+    # 1) disarm remote (unless --keep-remote, or nothing suggests a secondary there)
+    remote_disarm_failed = ""
+    if needs_remote_disarm and not args.keep_remote:
         # BL-C1. Checked HERE rather than at the top of the command deliberately:
         # removing the record is the remedy for a bad alias, so refusing the whole
         # verb would trap the operator. Only the step that puts the alias in an ssh
@@ -1782,10 +1794,25 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
                 machine.name,
             )
             return 2
-        rc, _out, err = _monitor_run_ssh(machine.ssh, _REMOTE_DISARM, None)
-        if rc != 0:
-            LOG.error("monitor remove: remote disarm failed: %s", err)
-            return 3
+        if not machine.ssh.strip():
+            # No alias to reach it by. The local removal is still the right thing --
+            # but it must not be reported as a full disarm.
+            remote_disarm_failed = (
+                f"{machine.name} names UPS {machine.ups!r} but carries no 'ssh' alias, "
+                f"so no box could be contacted"
+            )
+        else:
+            rc, _out, err = _monitor_run_ssh(machine.ssh, _REMOTE_DISARM, None)
+            if rc != 0:
+                if is_native:
+                    # A declared-native record failing its teardown is a hard stop: the
+                    # machine is armed and we know it.
+                    LOG.error("monitor remove: remote disarm failed: %s", err)
+                    return 3
+                # For the SUSPECTED case we do not know a secondary was ever there, so
+                # a failure is not proof of one. Carry on with the local removal and
+                # report loudly rather than either lying or trapping the operator.
+                remote_disarm_failed = f"remote disarm on {machine.ssh} failed: {err}"
 
     # 2) firewall: rewrite the saddr set from survivors (unless --no-firewall).
     # ME-C4: unconditional. The rewrite is local and idempotent, and a NON-native
@@ -1805,6 +1832,18 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
     # 3) persist config LAST (so a firewall failure leaves config unchanged)
     _monitor_persist(cfg_path, [m.to_dict() for m in survivors])
+    if remote_disarm_failed:
+        # Removing the record also removes the ADVISORY that was reporting the risk, so
+        # a bare "removed" here would hand the operator a quieter system rather than a
+        # safer one. Say exactly what did not happen and how to finish it by hand.
+        _say(f"removed {machine.name} LOCALLY — but the remote was NOT disarmed")
+        _say(f"  {remote_disarm_failed}")
+        _say(
+            f"  If {machine.name} is running a NUT secondary it is STILL armed, and the "
+            f"advisory that was reporting that is gone with the record. Finish by hand:"
+        )
+        _say(f"    ssh {machine.ssh or machine.name} 'sudo systemctl disable --now nut-monitor'")
+        return 5
     _say(f"removed {machine.name}")
     return 0
 

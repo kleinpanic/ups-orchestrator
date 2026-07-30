@@ -86,6 +86,20 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/cli.py",
+        "needs_remote_disarm = is_native or suspected_stale_secondary",
+        "needs_remote_disarm = is_native",
+        "cli: monitor remove skips the remote teardown for the BL-02 shape — the "
+        "advisory names it as the remedy and it silently would not disarm",
+    ),
+    (
+        "src/ups_orchestrator/cli.py",
+        "    if not errors:\n        LOG.info(",
+        "    if False:\n        LOG.info(",
+        "cli: advisory-only degrades page Discord again — a permanent notice pushes on "
+        "every restart and every config edit",
+    ),
+    (
         "src/ups_orchestrator/config.py",
         '    "/dev/tty",\n',
         '    "/dev/",\n',
