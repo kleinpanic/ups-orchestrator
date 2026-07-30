@@ -190,6 +190,19 @@ def _maintenance_path() -> Path:
     return _BASE / "maintenance.json"
 
 
+def _config_mtime(path: Path) -> float | None:
+    """``st_mtime`` of the config, or ``None`` if it cannot be stat'd.
+
+    ``None`` is a distinct value, not an error: a config that is momentarily absent
+    (mid-rename during a persist) must not be mistaken for an unchanged one, and must
+    not be mistaken for a change either once it comes back with its old timestamp.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _load_config() -> Config | None:
     """Load the config, or ``None`` on a fatal problem. Never raises.
 
@@ -388,7 +401,48 @@ def _cmd_watch() -> int:
     signal.signal(signal.SIGINT, _sig)
 
     LOG.info("watch: polling %d UPS(es) every %ds", len(cfg.upses), interval)
+    cfg_path = _config_path()
+    cfg_mtime = _config_mtime(cfg_path)
     while not stop:
+        # The config is re-read when it CHANGES, not once at startup.
+        #
+        # Without this the daemon enforced whatever was on disk the moment it started,
+        # forever. That was live and silent: the watch unit started at 22:14 and the
+        # config was edited at 22:48, so the running loop had spark `disarmed=True`
+        # while the file on disk had it armed -- and `remote-shutdown --dry-run`, which
+        # reads disk fresh, reported the DISK answer. The preview and the daemon
+        # disagreed with nothing to say so.
+        #
+        # The dangerous direction is the other one: `monitor remove <name>` persists,
+        # prints "removed", and exits 0, so an operator's DISARM was a no-op until
+        # somebody happened to restart the service.
+        #
+        # A reload that fails keeps the previous config rather than exiting. An
+        # unparseable config at STARTUP is fatal on purpose (IW-06 above), but a
+        # half-written file appearing under a running shutdown controller must not
+        # disarm the fleet -- carry on with the last good policy and say so loudly.
+        new_mtime = _config_mtime(cfg_path)
+        if new_mtime != cfg_mtime:
+            cfg_mtime = new_mtime
+            reloaded = _load_config()
+            if reloaded is None:
+                LOG.error(
+                    "config at %s changed but will not load; CONTINUING with the "
+                    "previously loaded policy. Fix the file — the running policy is "
+                    "now older than the file on disk.",
+                    cfg_path,
+                )
+            else:
+                cfg = reloaded
+                deps = _build_deps(cfg)
+                interval = max(5, cfg.poll_seconds)
+                LOG.info(
+                    "config at %s changed; reloaded — now polling %d UPS(es) every %ds",
+                    cfg_path,
+                    len(cfg.upses),
+                    interval,
+                )
+                _notify_degraded(cfg, deps)
         # IF-01: `state.json` has two writers — this process and the `nut` user's
         # upssched dispatcher (also an operator's `remote-shutdown`, which takes the
         # same event path). Without this, the tick's `shutdowns_sent` dedupe was made

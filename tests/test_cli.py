@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -1475,3 +1477,99 @@ def test_watch_tick_does_not_re_push_a_target_the_event_path_already_fired(
     assert pushes == ["mt"], f"mt was shut down more than once: {pushes}"
     on_disk = json.loads((tmp_path / "state.json").read_text())["ups1"]["shutdowns_sent"]
     assert on_disk == ["mt"], f"the dedupe ledger did not survive the tick: {on_disk}"
+
+
+# --- the watch loop re-reads the config when it changes (not once at startup) ---
+#
+# This was live and silent: the watch unit started at 22:14 and the config was edited at
+# 22:48, so the running loop had spark disarmed while the file on disk had it armed --
+# and `remote-shutdown --dry-run`, which reads disk fresh, reported the DISK answer. The
+# preview and the daemon disagreed, with nothing on any surface to say so.
+#
+# The dangerous direction is the other one: `monitor remove <name>` persists, prints
+# "removed", exits 0, and was a no-op in the running daemon until someone restarted it.
+#
+# The loop sleeps in 1s slices (`for _ in range(interval)`), so a sleep counter is NOT an
+# iteration counter. These pin poll_seconds so the slice count per iteration is known:
+# interval = max(5, poll_seconds) = 5, hence sleeps 1..5 close iteration 1 and the reload
+# happens at the top of iteration 2.
+_SLICES = 5
+
+
+def _watch_upses_per_build(monkeypatch, rewrite_at_slice, rewrite):
+    """Run _cmd_watch, rewriting the config after a given sleep-slice.
+
+    Returns the UPS count seen by each _build_deps call — one at startup, plus one per
+    successful reload.
+    """
+    seen: list[int] = []
+    slices = {"n": 0}
+    monkeypatch.setattr(cli, "dispatch", lambda *_a, **_k: None)
+
+    real_build = cli._build_deps
+
+    def spy_build(cfg):  # noqa: ANN202
+        seen.append(len(cfg.upses))
+        return real_build(cfg)
+
+    monkeypatch.setattr(cli, "_build_deps", spy_build)
+
+    def fake_sleep(_secs: float) -> None:
+        slices["n"] += 1
+        if slices["n"] == rewrite_at_slice:
+            rewrite()
+        # Two slices into iteration 2 — past the reload at the top of it.
+        if slices["n"] >= _SLICES + 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+    return seen
+
+
+def _bump(path) -> None:
+    """Make the mtime distinctly newer, independent of filesystem granularity."""
+    future = time.time() + 10
+    os.utime(path, (future, future))
+
+
+def test_watch_reloads_the_config_when_the_file_changes(env_config, monkeypatch) -> None:
+    env_config.write_text(json.dumps({"poll_seconds": 5, "upses": {"ups1": {"label": "U1"}}}))
+
+    def rewrite() -> None:
+        env_config.write_text(
+            json.dumps(
+                {"poll_seconds": 5, "upses": {"ups1": {"label": "U1"}, "ups2": {"label": "U2"}}}
+            )
+        )
+        _bump(env_config)
+
+    seen = _watch_upses_per_build(monkeypatch, _SLICES, rewrite)
+
+    # 1 UPS at startup, then 2 after the reload — the running loop saw the new file.
+    assert seen == [1, 2], seen
+
+
+def test_watch_keeps_the_last_good_config_when_a_reload_fails(
+    env_config, monkeypatch, caplog
+) -> None:
+    """A half-written config must not disarm a running shutdown controller.
+
+    An unparseable config at STARTUP is deliberately fatal (IW-06) so systemd's Restart=
+    makes it loud. Mid-run is the opposite case: the fleet is already protected under a
+    known-good policy, and dropping that because someone saved a file half-way is
+    strictly worse than carrying on with it.
+    """
+    env_config.write_text(json.dumps({"poll_seconds": 5, "upses": {"ups1": {"label": "U1"}}}))
+
+    def rewrite() -> None:
+        env_config.write_text("{ this is not json")
+        _bump(env_config)
+
+    with caplog.at_level("ERROR"):
+        seen = _watch_upses_per_build(monkeypatch, _SLICES, rewrite)
+
+    # Built ONCE, at startup. The failed reload did not swap the live policy.
+    assert seen == [1], seen
+    assert any("CONTINUING with the previously loaded policy" in r.message for r in caplog.records)

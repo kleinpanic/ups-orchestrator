@@ -704,7 +704,18 @@ def handle_lowbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     deps.notifier.send(
         Notification(
             title=f"⚠️ {ups.label} — LOW BATTERY",
-            body="Battery critical — NUT will shut this host down (backstop).",
+            # States the fact and NOT a prediction about this host's fate. The old text
+            # promised "NUT will shut this host down (backstop)", which is false on this
+            # deployment and false in the worst direction: the primary runs MINSUPPLIES 0
+            # so upsmon's forceshutdown() is unreachable, and shutdown.internal.enabled is
+            # false so no local target can fire. This host is the one that must SURVIVE to
+            # bring the fleet back, and an alert claiming it is about to die would send an
+            # operator chasing the wrong thing during the outage it matters most.
+            body=(
+                "Battery critical. Whether any machine is powered off is decided by the "
+                "shutdown policy — run 'ups-orchestrator remote-shutdown --dry-run' to "
+                "see the per-target verdict."
+            ),
             level=Level.CRITICAL,
             fields=_snapshot_fields(snap),
         )
