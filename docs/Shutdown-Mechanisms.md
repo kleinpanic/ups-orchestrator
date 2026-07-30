@@ -103,7 +103,9 @@ timeout, but can never prevent it.
 `_default_ssh_shutdown` runs, per target:
 
 ```text
-ssh -o BatchMode=yes -o ConnectTimeout=10 <user@host> "sudo /sbin/shutdown -h now"
+ssh -o BatchMode=yes -o ConnectTimeout=10 -- <user@host> <the record's shutdown_cmd>
+# `--` terminates option parsing (BL-01): without it a host or user beginning
+# with '-' is read by ssh as an option such as -oProxyCommand=... and executed.
 ```
 
 The orchestrator **pushes** a shutdown command *into* each box over SSH when its

@@ -78,8 +78,15 @@ shutting machines down while the UPS still reports healthy runtime.
     issue — completely independent of what a given machine's `shutdown_method`
     is set to. A machine correctly configured with `shutdown_method: "serial"`
     will still never fire while `shutdown.enabled` (or its group) is `false`.
-    **Both default to `false`.** Phase 2 ships with the policy off in
-    production; do not flip `shutdown.enabled` unless you mean it.
+    **Both default to `false`** in code, and this page documents the defaults.
+    Do not flip `shutdown.enabled` unless you mean it — it is the difference
+    between a monitoring tool and something that powers machines off.
+
+    To find out what YOUR deployment is doing, do not read this page — read the
+    gate. `remote-shutdown --dry-run` prints a per-target verdict, and the reason
+    string distinguishes the two states exactly: `shutdown policy disabled` means
+    disarmed, anything else (e.g. `UPS is not on battery`) means **armed and
+    waiting**.
 
     Two commands exist to inspect this without flipping anything:
 
@@ -241,6 +248,18 @@ sudo ups-orchestrator monitor add somebox --method none
 # Method-aware lifecycle
 ups-orchestrator monitor list      # declared method, and the effective method when it differs;
                                     # plus every Config.degraded notice, ERROR/ADVISORY labelled
+!!! warning "`native` is not automatically the right default — check what FSD would hit"
+    The `native` examples on this page are valid syntax, not a recommendation. Native
+    shutdown rides on NUT's FSD, and `forceshutdown()` FSDs **every** `ST_PRIMARY` UPS
+    without reference to which one went critical — so it halts every enrolled secondary
+    at once, including any you need to keep running. On the reference deployment that
+    is why the machine originally enrolled `native` was moved to `ssh`, and why the
+    primary runs `MINSUPPLIES 0`.
+
+    Before choosing `native`, work out which machines an FSD would take down, and
+    whether the UPS carrying your **network** would still be up to deliver it. See
+    [Shutdown-Mechanisms](Shutdown-Mechanisms.md).
+
 ups-orchestrator monitor verify mt # "will this machine actually shut down?" — see below
 ups-orchestrator monitor verify mt --deep  # make the far end prove it: for a serial record this
                                     # asks the console to execute a probe and echo a token back,
@@ -291,6 +310,27 @@ rc read the opposite of the line it had just printed.)
 | Config `ups` value is a **non-empty** NUT-metacharacter string, or a **non-empty** `ssh` alias is option-shaped, on a record that would be probed | Refuses to run the probe (never shells out with an unvalidated value). Both checks are keyed on the value being non-empty: a blank is not an injection, and BL-02's advisory probe is precisely a record with no alias — see the blank-`ups` row above for the blank cases | **rc 2** |
 | The primary's LAN IP cannot be resolved for a record that *would* be probed | Refuses to probe. `verify` resolves the primary through the same `_resolve_primary_ip` `monitor add` uses — `--primary-ip`, then the first non-loopback `nut_server.listen` entry, then a local `ip -o route get <machine ip>`. It does **not** fall back to `127.0.0.1`: the probe runs `upsc <ups>@<primary>` **on the secondary**, so a loopback address interrogates that box's own upsd rather than this one — a false FAIL for an armed secondary, or a false OK if it happens to run its own upsd with a same-named UPS | **rc 2**, naming `--primary-ip` and `nut_server.listen` as the two remedies |
 | Unknown machine name | — | **rc 2** |
+
+### `monitor remove` exit codes
+
+| rc | Meaning |
+|---|---|
+| 0 | The record is gone AND, where one was implied, the remote secondary was disarmed. |
+| 2 | Called wrong — unknown machine, invalid literal. Nothing was changed. |
+| 3 | A **declared-`native`** record's remote disarm failed. Hard stop: a secondary is known to be enrolled and is still armed, so the record is deliberately left in place rather than deleted out from under it. |
+| 4 | The firewall rewrite failed on the `native` path. |
+| 5 | **The record was removed locally but the remote could NOT be disarmed.** |
+
+`rc 5` is the one to script against. It is reachable for a record that declared
+`none` while naming a UPS — the shape whose advisory says "'none' does not disarm an
+already-enrolled native secondary". For that shape the command still attempts the
+remote teardown, but a missing `ssh` alias or an unreachable box means it cannot
+confirm the disarm. It reports what did not happen and prints the manual command.
+
+The distinct code matters because removing the record **also removes the advisory that
+was reporting the risk**. A caller treating a partial removal as success ends up with a
+quieter system rather than a safer one, which is the failure this code exists to make
+un-missable.
 
 `monitor verify`/`monitor add`/`monitor remove` share **rc 2** for a config or
 argument problem the command refuses to act on: an unknown machine, an
@@ -368,6 +408,13 @@ legacy `shutdown_target` on the same UPS. `monitor add` **refuses without
 that reaches disk another way — a hand-edited file, or a config authored
 before this rule existed — does **not** fail to load. `Config.load` disarms
 whichever side of the conflict is disarmable and keeps running, logging an
+**Discord receives disarms, not advisories.** An advisory-only degrade is logged and
+shown on the four surfaces below, but is deliberately NOT pushed: the common advisory
+is a standing, unchanging condition, so pushing it meant an alert on every service
+restart and every config edit about something the operator had already read. That
+mutes the channel which also carries on-battery and shutdown alerts. A **disarm** — an
+authority that was going to fire and now will not — pushes every time.
+
 `ERROR`-severity notice and surfacing it in `monitor list`, `monitor verify`,
 the `status` view, and the web UI. The outcome differs by which authority
 conflicts:

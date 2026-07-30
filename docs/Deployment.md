@@ -46,9 +46,16 @@ who shuts down and when, so get these right:
   `MINSUPPLIES`) and `0` for a notify-only UPS, so an unrelated UPS's battery
   can't trigger this host's shutdown.
 - **`primary`** runs the shutdown sequence (exactly one per UPS); **`secondary`**
-  only observes and powers itself off. On eulerpi5 the lines are `primary`
-  because it owns the shutdown; a USB-cabled debug/observer host (the rpi4) would
-  list the same UPSes as `secondary`.
+  only observes and powers itself off. A USB-cabled debug/observer host would list
+  the same UPSes as `secondary`.
+
+    The role is **per UPS**, and a host that owns the USB cable for all of them does
+    not have to be `primary` for all of them. On the reference deployment eulerpi5
+    is `primary` for exactly one UPS and `secondary` at powervalue `0` for the other
+    two, with `MINSUPPLIES 0` — deliberately, because `primary` plus a reachable
+    `MINSUPPLIES` is what lets upsmon's `forceshutdown()` halt this host, and this
+    host is the one that must survive an outage to bring the others back. Read the
+    live file rather than assuming; `grep -E '^MONITOR|^MINSUPPLIES' /etc/nut/upsmon.conf`.
 
 Every `NOTIFYFLAG … EXEC` must map to an event the orchestrator handles
 (`onbatt`, `online`, `lowbatt`, `commbad`, `commok`) and vice versa — a flag with
@@ -172,9 +179,14 @@ logs a spurious comm-loss on boot until DHCP settles.
 
 **Operator-only actions on the far-end machine** (e.g. `mt`) — the orchestrator
 never touches another host's `/etc`; this is reference guidance for whoever
-administers that box, and Phase 2 ships **code only**: nothing here has been
-carried out against a live host as part of this phase, and `shutdown.enabled`
-stays `false` in production.
+administers that box.
+
+!!! warning "The 'code only' scope no longer applies"
+    An earlier revision of this page said Phase 2 shipped code only and that
+    `shutdown.enabled` stays `false` in production. That scope was lifted by the
+    operator and both statements are now false on the reference deployment. Never
+    infer a deployment's armed state from this page — run
+    `ups-orchestrator remote-shutdown --dry-run` and read the gate verdict.
 
 ### Primary-side prerequisite: device access (`dialout`)
 
@@ -293,7 +305,21 @@ deploy/install-user-service.sh
 This installs:
 
 - `ups-orchestrator-watch.service`: continuous poll loop for the opt-in shutdown
-  policy and on-battery countdowns.
+  policy and on-battery countdowns. It **re-reads the config when the file
+  changes**, so an edit to `/etc/ups-orchestrator/config.json` takes effect within
+  one poll interval — no restart needed. A reload that fails to parse keeps the
+  previously loaded policy and logs an error rather than exiting, because a
+  half-written file must not disarm a running shutdown controller.
+
+    This matters most for `monitor remove`: before the reload existed, a disarm
+    persisted to disk and the running daemon carried on with its startup snapshot
+    until somebody restarted the unit.
+
+    The loop also **closes a `COMMUNICATION LOST` alert itself** once the UPS reads
+    again. NUT cannot always do it: `upsmon` fires `COMMOK` only on a lost→ok
+    transition it observed, so restarting `nut-monitor` (which a `nut-server`
+    restart does) leaves the alarm permanently open. The poll loop reads every UPS
+    every cycle, so it sees the recovery directly.
 - `ups-orchestrator-recorder.service`: one-second UPS telemetry samples for
   power-loss forensics. It retains twenty 50 MB historical segments plus the
   active file (roughly two weeks at the live three-UPS record size) and records
@@ -385,8 +411,16 @@ Deleting the file by hand is equivalent to `maintenance end`.
 
 ## Health checks and repair
 
-Three targets exist for the times something looks wrong. Run the read-only one
+Several targets exist for the times something looks wrong. Run the read-only ones
 first.
+
+`make nut-driver-cpu` is worth knowing about before you need it. It samples each
+`usbhid-ups` process over five seconds of wall clock, because `ps` reports a
+**lifetime average** — which is how a driver spinning at 64% of a core went unnoticed
+here for two days. The UPS answered `upsc` in 15 ms throughout, so nothing was "down"
+and nothing alerted; it simply ate a fifth of the machine. If one driver is pegged
+while its siblings sit at 0%, `sudo make nut-repair-driver-spin UPS=<name>` adds NUT's
+`pollonly` to that one device and restarts only its driver.
 
 ```bash
 make nut-status                                  # read-only, NO sudo
