@@ -605,3 +605,35 @@ def test_write_marker_preserves_an_existing_file_mode(tmp_path: Path) -> None:
     assert after.st_ino == before.st_ino
     assert stat.S_IMODE(after.st_mode) == 0o640
     assert json.loads(marker.read_text())["boot_id"] == "boot-xyz"
+
+
+def test_the_audit_reads_rotated_event_logs(tmp_path: Path) -> None:
+    """An outage burst that rotates must not hide itself from the post-mortem.
+
+    `_tail_jsonl` read only the ACTIVE file, while the sample reader beside it already
+    walked rotations. So an outage that emitted enough shutdown_attempt/shutdown_result
+    records to cross the rotation threshold pushed them into events.jsonl.1 — and
+    `ups-orchestrator audit`, run to find out what happened during exactly that outage,
+    read the near-empty new file and reported nothing.
+    """
+    log = tmp_path / "events.jsonl"
+    (tmp_path / "events.jsonl.2").write_text(json.dumps({"kind": "oldest"}) + "\n")
+    (tmp_path / "events.jsonl.1").write_text(json.dumps({"kind": "the_outage"}) + "\n")
+    log.write_text(json.dumps({"kind": "after_rotation"}) + "\n")
+
+    records = audit._tail_jsonl(log, limit=10)
+    kinds = [r.get("kind") for r in records]
+
+    assert kinds == ["oldest", "the_outage", "after_rotation"], kinds
+
+
+def test_the_audit_still_honours_its_limit_across_rotations(tmp_path: Path) -> None:
+    log = tmp_path / "events.jsonl"
+    (tmp_path / "events.jsonl.1").write_text(
+        "".join(json.dumps({"n": i}) + "\n" for i in range(10))
+    )
+    log.write_text("".join(json.dumps({"n": i}) + "\n" for i in range(10, 20)))
+
+    records = audit._tail_jsonl(log, limit=5)
+
+    assert [r["n"] for r in records] == [15, 16, 17, 18, 19]

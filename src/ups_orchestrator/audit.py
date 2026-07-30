@@ -368,12 +368,24 @@ def _summary_lines(
 
 
 def _tail_jsonl(path: Path | None, limit: int) -> list[dict[str, object]]:
+    """Last ``limit`` records across the retained generations AND the active file.
+
+    This read only the active file, while the sample reader beside it already walked
+    rotations via `_sample_paths`. The asymmetry had a concrete cost: an outage emits a
+    burst of shutdown_attempt/shutdown_result/status_transition records, and if that
+    burst crosses the rotation threshold the records land in `events.jsonl.1` — so the
+    post-mortem `ups-orchestrator audit`, run to find out what happened during exactly
+    that outage, read the near-empty new file and reported nothing.
+    """
     if path is None:
         return []
-    try:
-        lines = path.read_text().splitlines()[-limit:]
-    except (FileNotFoundError, OSError):
-        return []
+    lines: list[str] = []
+    for candidate in _sample_paths(path):  # oldest-first, active file last
+        try:
+            lines.extend(candidate.read_text().splitlines())
+        except (FileNotFoundError, OSError):
+            continue
+    lines = lines[-limit:]
 
     records: list[dict[str, object]] = []
     for line in lines:

@@ -87,6 +87,20 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "src/ups_orchestrator/events.py",
+        "    if name in state.shutdowns_confirmed:\n        return False",
+        "    if name in state.shutdowns_sent:\n        return False",
+        "events: retry keyed on ATTEMPTED again — a failed push counts as a completed "
+        "shutdown and the machine is never retried",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "    for candidate in _sample_paths(path):  # oldest-first, active file last",
+        "    for candidate in [path]:  # oldest-first, active file last",
+        "audit: post-mortem reads only the active log again — an outage burst that "
+        "rotated hides itself from the audit of that outage",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
         '    if not (snap.status or "").strip():\n        # UNREADABLE is not the same',
         "    if False:\n        # UNREADABLE is not the same",
         "events: an unreadable UPS reads as utility power again — sends POWER RESTORED "
@@ -187,9 +201,9 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/jsonlog.py",
-        "path.replace(rotated)",
-        "pass  # mutated",
-        "jsonlog: rotation no-op",
+        "    path.replace(_rotation_path(path, 1))",
+        "    pass  # mutated",
+        "jsonlog: rotation no-op — the generation shift is skipped and the log grows without bound",
     ),
     (
         "src/ups_orchestrator/report.py",
@@ -551,11 +565,10 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/events.py",
-        "    state.shutdowns_sent.append(target.name)\n    _log_event(\n"
-        '        deps,\n        "shutdown_result",',
+        "    state.shutdowns_sent.append(target.name)\n    state.shutdown_attempts[target.name] =",
         "    if rc == 0:  # mutated — a failed remote now strands the local host\n"
-        "        state.shutdowns_sent.append(target.name)\n    _log_event(\n"
-        '        deps,\n        "shutdown_result",',
+        "        state.shutdowns_sent.append(target.name)\n"
+        "    state.shutdown_attempts[target.name] =",
         "events: shutdowns_sent append gated on success (T-02-24 local starvation)",
     ),
     (
