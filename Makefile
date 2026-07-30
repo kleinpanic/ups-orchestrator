@@ -86,6 +86,26 @@ deploy-user-service:
 nut-repair-listen:
 	@deploy/repair-upsd-listen.sh
 
+# Read-only: which NUT driver is burning CPU, sampled over 5s of wall clock.
+# %CPU from ps is a LIFETIME average and hid this for two days -- a driver that
+# spun up recently reads low, and one that has since calmed down reads high.
+nut-driver-cpu:
+	@echo "sampling usbhid-ups CPU over 5s (jiffies/100 = seconds of CPU)..."
+	@for p in $$(pgrep -x usbhid-ups); do \
+	  a=$$(awk '{print $$14+$$15}' /proc/$$p/stat 2>/dev/null); echo "$$p $$a"; \
+	 done > /tmp/.nutcpu.$$$$; sleep 5; \
+	 while read p a; do \
+	   b=$$(awk '{print $$14+$$15}' /proc/$$p/stat 2>/dev/null); \
+	   [ -n "$$b" ] || continue; \
+	   name=$$(tr '\0' ' ' < /proc/$$p/cmdline 2>/dev/null | awk '{print $$NF}'); \
+	   printf '  %-14s pid %-8s %s%% of one core\n' "$$name" "$$p" "$$(( (b-a) * 100 / 500 ))"; \
+	 done < /tmp/.nutcpu.$$$$; rm -f /tmp/.nutcpu.$$$$
+	@echo "a healthy idle driver is ~0%. If one is pegged, see: make nut-repair-driver-spin UPS=<name>"
+
+# Root: add NUT's `pollonly` to one misbehaving driver and restart just it.
+nut-repair-driver-spin:
+	@deploy/repair-driver-spin.sh $(UPS)
+
 # Validate a config.json, then install it into /etc with the canonical
 # 0640 root:nut + u:$(USER):r ACL: sudo make install-config CONFIG=/path/to.json
 install-config:
