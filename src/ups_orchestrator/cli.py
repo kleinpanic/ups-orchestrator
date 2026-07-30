@@ -1211,7 +1211,11 @@ def _print_degraded(cfg: Config) -> None:
     if any_disarming(cfg.degraded):
         _say("⚠ DEGRADED CONFIG — a shutdown authority was disarmed at load:")
     else:
-        _say("⚠ CONFIG ADVISORIES — nothing was disarmed; review at leisure:")
+        # States the fold and nothing more. An earlier draft said "review at leisure",
+        # which is an urgency claim the rows can contradict: the commonest advisory here
+        # reports an UNDECLARED live native secondary that will still power a box off.
+        # Dropping the false "was disarmed" alarm must not add a false "is fine" one.
+        _say("⚠ CONFIG ADVISORIES — no shutdown authority was disarmed at load; read each row:")
     for n in cfg.degraded:
         label = "ERROR" if is_disarming(n) else "ADVISORY"
         _say(f"  {label} {n.subject}: {n.message}")  # _say sanitises (F5/LO-C5)
@@ -1277,6 +1281,7 @@ def _verify_serial(
     stat_fn: Callable[[str], os.stat_result],
     *,
     deep: bool = False,
+    timeout: float | None = None,
     probe: Callable[..., ProbeResult] = serial_liveness_probe,
 ) -> int:
     """Device presence and a declared baud, through an INJECTED stat.
@@ -1317,7 +1322,16 @@ def _verify_serial(
         )
         return 0
 
-    result = probe(device, m.serial_baud)
+    # --timeout is honoured here for the same reason it is on the native path: the
+    # probe's 3.0s default was derived from a poll-loop bound (see
+    # SERIAL_PROBE_DEADLINE_SECONDS), and `verify --deep` is not the poll loop. Dropping
+    # the flag meant `--deep --timeout 30` gave up at 3s and told the operator the only
+    # network-independent transport was dead.
+    result = (
+        probe(device, m.serial_baud)
+        if timeout is None
+        else probe(device, m.serial_baud, deadline_seconds=float(timeout))
+    )
     if result.outcome is ProbeOutcome.SEEN:
         _say(
             f"{m.name}: OK — the far end executed our probe on {device} at "
@@ -1599,7 +1613,12 @@ def _monitor_verify_machine(
     if machine.disarmed:
         return rc  # it will not fire; there is no transport left to check
     if declared == "serial":
-        return _verify_serial(machine, stat_fn, deep=args.deep, probe=serial_probe) or rc
+        return (
+            _verify_serial(
+                machine, stat_fn, deep=args.deep, timeout=args.timeout, probe=serial_probe
+            )
+            or rc
+        )
     if declared == "ssh":
         return _verify_ssh_alias(machine) or rc
     _say(f"{machine.name}: no active shutdown authority")

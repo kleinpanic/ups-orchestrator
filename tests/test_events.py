@@ -1820,6 +1820,9 @@ class _FarEnd:
         self.ignore_first = ignore_first
         self.received = bytearray()
         self.commands = 0
+        # Every line the far end actually RAN, so a test can assert that something a
+        # human left half-typed never became one.
+        self.executed: list[bytes] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -1846,10 +1849,26 @@ class _FarEnd:
                 continue
             pending += chunk
             while True:
-                ends = [i for i in (pending.find(b"\r"), pending.find(b"\n")) if i >= 0]
-                if not ends:
+                # VKILL is handled in STREAM ORDER alongside the terminators, not by a
+                # scan of the whole buffer: "abc\rdef\x15ghi" must submit "abc", discard
+                # "def", and leave "ghi" pending, exactly as a real tty would.
+                marks = [
+                    i
+                    for i in (pending.find(b"\r"), pending.find(b"\n"), pending.find(b"\x15"))
+                    if i >= 0
+                ]
+                if not marks:
                     break
-                cut = min(ends)
+                cut = min(marks)
+                if pending[cut : cut + 1] == b"\x15":
+                    # Canonical-mode VKILL: the line discipline throws away the pending
+                    # input line and the shell never sees it. Modelling this is
+                    # load-bearing rather than cosmetic -- the probe sends VKILL so that
+                    # a half-typed command on the console is DISCARDED instead of
+                    # submitted, and a double that delivered \x15 to the shell as a
+                    # command would report that safety property working when it was not.
+                    pending = pending[cut + 1 :]
+                    continue
                 line, pending = bytes(pending[:cut]), pending[cut + 1 :]
                 if line.strip():
                     self._answer(line)
@@ -1860,6 +1879,7 @@ class _FarEnd:
         self.commands += 1
         if self.commands <= self.ignore_first:
             return  # a getty respawning at exactly the wrong moment: no reader at all
+        self.executed.append(line)
         os.write(self.master_fd, line + b"\r\n")  # readline echoes before it runs
         if self.personality == "echoing":
             return
@@ -2095,6 +2115,30 @@ def test_the_probe_retries_once_when_the_first_attempt_is_unanswered(pty_line) -
     assert result.outcome is events_mod.ProbeOutcome.SEEN
     assert far.commands >= 2
     assert "attempt 2" in result.detail
+
+
+def test_the_probe_discards_a_half_typed_line_instead_of_submitting_it(pty_line) -> None:
+    """The probe must not execute what a human left sitting on the console.
+
+    The far end is a getty in canonical mode. If someone attached with screen, typed
+    `shutdown -h now`, and walked away without pressing Enter, that line sits in the
+    line-discipline buffer. The probe used to open with a bare "\r" to nudge the shell
+    to a fresh prompt -- which SUBMITS that line. Harmless while the probe had no
+    production caller; a machine-killer once `monitor verify --deep` could reach it,
+    since verify reads as a read-only diagnostic an operator runs casually.
+
+    Sending VKILL first discards the pending line at the line discipline. This asserts
+    the dangerous line never becomes a command, while the probe still gets its answer.
+    """
+    far = pty_line.start("executing")
+    # A human's half-typed command, with NO terminator -- exactly the dangerous state.
+    os.write(pty_line.master_fd, b"shutdown -h now")
+
+    result = _probe(pty_line, deadline_seconds=2.0)
+
+    assert result.outcome is events_mod.ProbeOutcome.SEEN  # the probe still worked
+    submitted = b"".join(far.executed)
+    assert b"shutdown" not in submitted, f"the probe SUBMITTED a pending line: {submitted!r}"
 
 
 def test_the_probe_drains_the_input_queue_before_it_writes(monkeypatch, pty_line) -> None:

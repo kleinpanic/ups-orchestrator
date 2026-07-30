@@ -245,7 +245,8 @@ ups-orchestrator monitor verify mt # "will this machine actually shut down?" —
 ups-orchestrator monitor verify mt --deep  # make the far end prove it: for a serial record this
                                     # asks the console to execute a probe and echo a token back,
                                     # which is the only evidence that is not just "the local USB
-                                    # adapter exists". Writes one harmless line to that console.
+                                    # adapter exists". Sends Ctrl-U + Enter (discarding, NOT submitting, anything a human
+                                    # left half-typed there) and then one echo command.
 sudo ups-orchestrator monitor remove mt   # native: real remote NUT teardown + nft/saddr rewrite;
                                     # serial/ssh/none: config entry + the same LOCAL nft rewrite
                                     # (no remote host is contacted for a non-native record)

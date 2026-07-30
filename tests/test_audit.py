@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -519,3 +521,87 @@ def test_write_maintenance_creates_its_parent_directory(tmp_path: Path) -> None:
     marker = tmp_path / "fresh" / "maintenance.json"
     audit.write_maintenance(marker, until=2_000.0, reason="x")
     assert audit.read_maintenance(marker, now=1_000.0).active is True
+
+
+# --- state-dir markers: the directory is group-writable by `nut`, no sticky bit ---
+#
+# /var/lib/ups-orchestrator is drwxrwxr-x nut:nut, and upsd runs as `nut` listening on
+# the LAN. Every unit that writes there is `systemd --user`, i.e. klein, a sudoer. So a
+# marker writer that follows a symlink or blocks on a FIFO is a real primitive, not a
+# theoretical one. These pin both refusals.
+
+
+def test_write_marker_refuses_to_write_through_a_symlink(tmp_path: Path) -> None:
+    """A planted symlink must fail the write, not redirect it onto the target.
+
+    _write_marker used the metadata-preserving writer, which resolves symlinks ON
+    PURPOSE for the root-owned /etc config. In the state dir that meant uid `nut` could
+    aim klein's writer at ~/.ssh/authorized_keys or the user units.
+    """
+    victim = tmp_path / "victim"
+    victim.write_text("original contents\n")
+    marker = tmp_path / "boot-audit.json"
+    marker.symlink_to(victim)
+
+    with pytest.raises(OSError):
+        audit._write_marker(marker, "some-boot-id")
+
+    assert victim.read_text() == "original contents\n"  # untouched
+    assert marker.is_symlink()  # and we did not replace the link either
+
+
+def test_write_maintenance_refuses_a_symlink(tmp_path: Path) -> None:
+    victim = tmp_path / "victim"
+    victim.write_text("original\n")
+    marker = tmp_path / "maintenance.json"
+    marker.symlink_to(victim)
+
+    with pytest.raises(OSError):
+        audit.write_maintenance(marker, until=1_000.0, reason="x")
+    assert victim.read_text() == "original\n"
+
+
+def test_read_maintenance_ignores_a_fifo_instead_of_blocking_forever(tmp_path: Path) -> None:
+    """A FIFO is not a symlink, so the old is_symlink() check let it through.
+
+    read_text() then blocked in open(2) waiting for a writer that never comes, hanging
+    send_boot_audit BEFORE the notifier — suppressing the post-outage alert on every
+    boot, with no expiry. That defeats MAX_MAINTENANCE_SECONDS, which bounds a forged
+    VALUE and cannot bound a forged file TYPE.
+
+    If this test ever regresses it HANGS rather than fails, so it is wrapped in a
+    timeout by the faulthandler settings in CI; locally the O_NONBLOCK open returns
+    immediately and the S_ISREG check rejects.
+    """
+    marker = tmp_path / "maintenance.json"
+    os.mkfifo(marker)
+
+    window = audit.read_maintenance(marker, now=1_000.0)
+
+    assert window.active is False
+
+
+def test_write_marker_refuses_a_fifo_instead_of_blocking_forever(tmp_path: Path) -> None:
+    marker = tmp_path / "boot-audit.json"
+    os.mkfifo(marker)
+    with pytest.raises(OSError):
+        audit._write_marker(marker, "some-boot-id")
+
+
+def test_write_marker_preserves_an_existing_file_mode(tmp_path: Path) -> None:
+    """O_TRUNC keeps the inode, so mode/owner/ACL survive without a rename.
+
+    This is what the metadata-preserving writer was there for; the hardened writer has
+    to keep that property or the fix trades one bug for another.
+    """
+    marker = tmp_path / "boot-audit.json"
+    marker.write_text("{}")
+    marker.chmod(0o640)
+    before = marker.stat()
+
+    audit._write_marker(marker, "boot-xyz")
+
+    after = marker.stat()
+    assert after.st_ino == before.st_ino
+    assert stat.S_IMODE(after.st_mode) == 0o640
+    assert json.loads(marker.read_text())["boot_id"] == "boot-xyz"

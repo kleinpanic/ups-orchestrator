@@ -423,7 +423,21 @@ def serial_liveness_probe(
                 # Two separate expressions, never one derived from the other.
                 typed = f'echo {_PROBE_TOKEN_HEAD}""{_PROBE_TOKEN_TAIL}{nonce}\r'.encode()
                 expect = f"{_PROBE_TOKEN_HEAD}{_PROBE_TOKEN_TAIL}{nonce}".encode()
-                _probe_write(fd, b"\r", deadline_at)  # nudge the shell to a fresh prompt
+                # Ctrl-U (VKILL) BEFORE the newline, never a bare "\r".
+                #
+                # The far end's console is a getty in CANONICAL mode, so its line
+                # discipline may already hold a partially typed, unsubmitted command --
+                # someone attached with screen/minicom, started typing, and walked away.
+                # A bare "\r" SUBMITS that line. This function is reachable from
+                # `monitor verify --deep`, a diagnostic an operator runs casually, so a
+                # forgotten half-typed `shutdown -h now` on mt's console would be
+                # executed BY THE VERIFY. VKILL discards the pending line instead, and
+                # costs nothing when the buffer is already empty.
+                #
+                # Our own side is `raw`, which is what makes this work: the byte goes out
+                # the wire unmodified and is interpreted by the FAR end's line discipline,
+                # not swallowed by ours.
+                _probe_write(fd, b"\x15\r", deadline_at)
                 time.sleep(max(0.0, min(settle_seconds, deadline_at - time.monotonic())))
                 _probe_write(fd, typed, deadline_at)
                 if _probe_scan(fd, expect, deadline_at):

@@ -2220,7 +2220,10 @@ def test_advisory_only_config_does_not_claim_an_authority_was_disarmed(cfg_path,
 
     assert "CONFIG ADVISORIES" in out
     assert "DEGRADED CONFIG" not in out
-    assert "disarmed at load" not in out
+    # The per-row marker, not a loose substring: the heading legitimately contains the
+    # words "disarmed at load" ("no shutdown authority was disarmed at load"), so a
+    # bare `"disarmed at load" not in out` matched the heading rather than any machine.
+    assert "DISARMED (declared" not in out
     assert "ADVISORY" in out and "ERROR" not in out
 
 
@@ -2517,10 +2520,10 @@ def test_monitor_verify_threads_deep_through_to_the_serial_probe(cfg_path, capsy
             )
         ],
     )
-    probed: list[tuple[str, int]] = []
+    probed: list[tuple[str, int, float | None]] = []
 
-    def _probe(device: str, baud: int):  # noqa: ANN202
-        probed.append((device, baud))
+    def _probe(device: str, baud: int, *, deadline_seconds: float | None = None):  # noqa: ANN202
+        probed.append((device, baud, deadline_seconds))
         return ProbeResult(outcome=ProbeOutcome.SEEN, elapsed_seconds=0.2, detail="ok")
 
     # Passed as a seam rather than monkeypatched: the parameter default binds at def
@@ -2530,7 +2533,10 @@ def test_monitor_verify_threads_deep_through_to_the_serial_probe(cfg_path, capsy
         _load(cfg_path), ["mt", "--deep"], stat_fn=_chardev_stat, serial_probe=_probe
     )
     assert rc == 0
-    assert probed == [("/dev/ttyUSB0", 115200)]
+    # The operator's --timeout reaches the probe. It used to be parsed, honoured on the
+    # native path, and silently dropped here -- so `--deep --timeout 30` still gave up
+    # at the probe's 3s default and declared the one network-independent transport dead.
+    assert probed == [("/dev/ttyUSB0", 115200, 10.0)]  # 10 = the --timeout default
     assert "executed our probe" in capsys.readouterr().out
 
 

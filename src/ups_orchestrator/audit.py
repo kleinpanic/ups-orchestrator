@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
 import os
 import re
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -16,7 +18,6 @@ from ups_orchestrator.config import Config
 from ups_orchestrator.events import fmt_duration
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
-from ups_orchestrator.state import write_json_preserving_metadata
 
 _POWER_LOSS_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -53,6 +54,9 @@ LOG = logging.getLogger("ups_orchestrator.audit")
 # The longest suppression any marker can buy, enforced on read. See
 # read_maintenance for why the reader and not just the writer enforces it.
 MAX_MAINTENANCE_SECONDS = 24 * 3600.0
+# A bounded read: the marker is a two-key JSON object, so anything larger is not one.
+# Without a bound a huge planted file is read entirely into memory before being rejected.
+_MAX_MARKER_BYTES = 64 * 1024
 _UPS_EVENT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -639,13 +643,25 @@ def read_maintenance(path: Path | None, *, now: float) -> MaintenanceWindow:
     """
     if path is None:
         return MaintenanceWindow(active=False)
-    if path.is_symlink():
-        LOG.warning("maintenance marker %s is a symlink; ignoring it", path)
+    # One open, then fstat the DESCRIPTOR. The previous is_symlink()-then-read_text()
+    # was two independent path lookups (racable), and checked only for a symlink: a FIFO
+    # is not a symlink, so read_text() blocked in open(2) forever waiting for a writer.
+    # That hung send_boot_audit before it reached the notifier, suppressing the
+    # post-outage alert on every boot with no expiry -- a one-shot plant defeating the
+    # horizon cap that exists to stop exactly that.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
         return MaintenanceWindow(active=False)
     try:
-        raw = json.loads(path.read_text())
-    except (FileNotFoundError, OSError, ValueError):
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            LOG.warning("maintenance marker %s is not a regular file; ignoring it", path)
+            return MaintenanceWindow(active=False)
+        raw = json.loads(os.read(fd, _MAX_MARKER_BYTES).decode())
+    except (OSError, ValueError, UnicodeDecodeError):
         return MaintenanceWindow(active=False)
+    finally:
+        os.close(fd)
     if not isinstance(raw, dict):
         return MaintenanceWindow(active=False)
     until = raw.get("until")
@@ -667,6 +683,29 @@ def read_maintenance(path: Path | None, *, now: float) -> MaintenanceWindow:
     )
 
 
+def _write_state_file(path: Path, payload: str) -> None:
+    """Write a marker in the state dir: never through a symlink, never into a FIFO.
+
+    ``O_NOFOLLOW`` alone is not enough. It refuses a symlink and says nothing about a
+    FIFO, and opening a FIFO for writing BLOCKS in ``open(2)`` until someone opens the
+    read end — so a planted FIFO wedges the caller forever rather than failing it.
+    ``O_NONBLOCK`` makes that open return instead of hanging, and the ``S_ISREG`` check
+    on the resulting descriptor is what actually rejects it. Both are needed: the flag
+    stops the hang, the fstat stops the write.
+
+    The fstat is on the FD, not the path, so it describes the object actually opened
+    and cannot be raced between check and use.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, f"{path} is not a regular file; refusing to write")
+        os.write(fd, (payload + "\n").encode())
+    finally:
+        os.close(fd)
+
+
 def write_maintenance(path: Path, *, until: float, reason: str) -> None:
     """Declare a maintenance window ending at ``until`` (unix seconds).
 
@@ -680,10 +719,11 @@ def write_maintenance(path: Path, *, until: float, reason: str) -> None:
     payload = json.dumps({"until": until, "reason": reason}, sort_keys=True)
     # The metadata-preserving writer this replaced created the parent directory;
     # a $UPS_ORCH_MAINTENANCE_STATE pointing somewhere new must keep working.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(payload + "\n")
+    # Shared with _write_marker: O_NOFOLLOW alone refused a symlink but still HUNG on a
+    # planted FIFO, which silenced outage alerts indefinitely and bypassed the
+    # MAX_MAINTENANCE_SECONDS cap entirely (the cap bounds a forged VALUE, not a forged
+    # file TYPE).
+    _write_state_file(path, payload)
 
 
 def clear_maintenance(path: Path) -> bool:
@@ -702,13 +742,23 @@ def clear_maintenance(path: Path) -> bool:
 
 
 def _write_marker(path: Path, boot_id: str) -> None:
-    # IF-08: this was a bare `tmp.replace(path)` — the same pattern state.py
-    # documents as destroying the destination inode's mode, owner and ACL (T-02-23).
-    # Lower blast radius than IF-02 because `install.sh` puts a DEFAULT ACL on
-    # /var/lib/ups-orchestrator so a new inode inherits it, but the same unmigrated
-    # class, and "lower blast radius" is not a property this file controls — an
-    # operator who moves the marker with $UPS_ORCH_STATE takes the default ACL away.
-    write_json_preserving_metadata(path, {"boot_id": boot_id}, indent=None)
+    """Record the audited boot id, refusing to write through a planted symlink.
+
+    This used ``write_json_preserving_metadata``, whose writer resolves symlinks ON
+    PURPOSE (MED-03) because that is right for the root-owned /etc config. It is wrong
+    here, for exactly the reason ``write_maintenance`` already documents: this marker
+    lives in /var/lib/ups-orchestrator, which is group-writable by ``nut`` with no
+    sticky bit, so uid ``nut`` — the identity behind a LAN-listening ``upsd`` — can
+    unlink this file and leave a symlink. The writer runs as klein (every unit here is
+    ``systemd --user``), so following it wrote a klein-owned file of the attacker's
+    choosing: authorized_keys, the user units, the deployed venv.
+
+    ``O_NOFOLLOW`` refuses the symlink instead. Metadata is still preserved for the
+    ordinary case, and better than before: ``O_TRUNC`` on the existing file keeps its
+    inode, so mode/owner/ACL survive without a rename, and a first-time create inherits
+    the directory's default ACL that ``install.sh`` sets.
+    """
+    _write_state_file(path, json.dumps({"boot_id": boot_id}))
 
 
 def send_boot_audit(

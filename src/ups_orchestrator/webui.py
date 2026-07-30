@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ups_orchestrator.config import Config
+from ups_orchestrator.config import Config, any_disarming
 from ups_orchestrator.nut import read_snapshot
 
 
@@ -174,7 +174,11 @@ def _degraded_banner_html(cfg: Config) -> str:
         f'</span><span class="subj">{html.escape(n.subject)}</span>: {html.escape(n.message)}</div>'
         for n in cfg.degraded
     )
-    return f'<div class="degraded" id="degraded">{items}</div>'
+    # Same fold as the CLI and status renderers. This is the MOST glanceable surface
+    # and the biggest driver of alarm fatigue, so leaving it permanently red for an
+    # advisory-only config would have undone the fix on the other two.
+    sev = "error" if any_disarming(cfg.degraded) else "advisory"
+    return f'<div class="degraded {sev}" id="degraded">{items}</div>'
 
 
 def _render_page(cfg: Config) -> str:
@@ -205,6 +209,7 @@ _INDEX_HTML = """<!doctype html>
  .chartwrap{padding:0 20px 24px}
  .degraded{margin:14px 20px 0;border:1px solid #ef4444;border-radius:10px;padding:10px 14px;
    background:#2a1015}
+ .degraded.advisory{border-color:#fbbf24;background:#2a2410}
  .degraded .item{font-size:12px;margin-top:4px}
  .degraded .item:first-child{margin-top:0}
  .degraded .sev{font-weight:700;text-transform:uppercase;margin-right:6px}

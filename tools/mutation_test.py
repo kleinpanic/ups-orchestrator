@@ -70,9 +70,23 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/events.py",
+        '_probe_write(fd, b"\\x15\\r", deadline_at)',
+        '_probe_write(fd, b"\\r", deadline_at)',
+        "events: probe nudge drops VKILL — a bare CR SUBMITS whatever a human left "
+        "half-typed on the far end's console",
+    ),
+    (
+        "src/ups_orchestrator/audit.py",
+        "os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644",
+        "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644",
+        "audit: state-dir marker follows symlinks again — uid nut redirects klein's "
+        "writer onto an arbitrary file",
+    ),
+    (
         "src/ups_orchestrator/cli.py",
-        "return _verify_serial(machine, stat_fn, deep=args.deep, probe=serial_probe) or rc",
-        "return _verify_serial(machine, stat_fn, deep=False, probe=serial_probe) or rc",
+        "machine, stat_fn, deep=args.deep, timeout=args.timeout, probe=serial_probe",
+        "machine, stat_fn, deep=False, timeout=args.timeout, probe=serial_probe",
         "cli: --deep silently downgraded to the shallow serial check — the operator "
         "asks the far end to answer and gets 'a device node exists'",
     ),
