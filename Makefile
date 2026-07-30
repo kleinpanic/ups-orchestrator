@@ -21,7 +21,8 @@ help:
 	@echo "  coverage             Run pytest with branch coverage + term-missing"
 	@echo "  mutation             Targeted mutation test of critical logic"
 	@echo "  check                All three"
-	@echo "  deploy               Full system install (needs root): sudo make deploy"
+	@echo "  install              Full system install incl. groups/ACLs/sudoers (root): sudo make install"
+	@echo "  deploy               Alias for install (older name)"
 	@echo "  deploy-code          Redeploy just the code into /opt (NO sudo once owned)"
 	@echo "  deploy-user-service  Enable the --user poll-loop service (NO sudo)"
 	@echo "  nut-control-user     Create least-priv NUT control user (root): sudo make nut-control-user"
@@ -29,6 +30,8 @@ help:
 	@echo "  nut-snippets         Print the NUT config changes to apply by hand"
 	@echo "  nut-status           Show NUT/orchestrator unit health + reachability (NO sudo)"
 	@echo "  nut-repair-listen    Restore upsd.conf's loopback LISTEN + restart nut-server (root)"
+	@echo "  nut-driver-cpu       Which usbhid-ups driver is burning CPU, sampled live (NO sudo)"
+	@echo "  nut-repair-driver-spin UPS=x  Add NUT pollonly to one spinning driver + restart it"
 	@echo "  install-config CONFIG=x  Validate then install a config.json into /etc (root)"
 
 venv:
@@ -59,8 +62,13 @@ check: lint type test
 
 # System install (root): venv + /etc config+env + /var/lib state + dispatcher +
 # ACLs + control user, and hands /opt ownership to the installing user.
-deploy:
+install:
 	@deploy/install.sh
+
+# `deploy` predates `install` and is referenced by older docs/notes. Kept as an alias
+# rather than renamed, so an operator following an old runbook does not get
+# "No rule to make target".
+deploy: install
 
 # Redeploy just the code into the existing /opt venv. No sudo once `deploy` has
 # handed /opt to you; falls back to a clear message if you don't own it yet.
@@ -138,3 +146,5 @@ nut-snippets:
 	@echo "  - upsd.users     : merge deploy/nut/upsd.users.snippet ([upsmon_secondary]; set real pw from UPS_NUT_SECONDARY_PASSWORD)"
 	@echo "  - crowdsec guard : deploy/nftables/crowdsec-partof.conf via 'systemctl edit crowdsec-firewall-bouncer' (PartOf=nftables.service)"
 	@echo "  - nut-monitor    : deploy/nut/nut-monitor-network-online.conf drop-in on secondaries (After/Wants=network-online.target)"
+
+.PHONY: help venv lint type test coverage mutation check install deploy deploy-code nut-control-user control deploy-user-service nut-repair-listen nut-driver-cpu nut-repair-driver-spin install-config nut-status nut-snippets

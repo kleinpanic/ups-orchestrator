@@ -69,10 +69,30 @@ setfacl -m u:"$RUN_USER":r  /etc/ups-orchestrator/config.json
 setfacl -R -m u:"$RUN_USER":rwx /var/lib/ups-orchestrator
 setfacl -d -m u:"$RUN_USER":rwx /var/lib/ups-orchestrator
 
-echo ">> sudoers: allow '$RUN_USER' passwordless shutdown (for local shutdown_targets)"
+echo ">> sudoers: passwordless shutdown + the NUT service verbs the repair targets need"
+# Two groups, for two different reasons.
+#
+# The shutdown verbs are for the --user watch service powering off THIS host for a
+# local shutdown_target.
+#
+# The systemctl verbs exist so the repair targets in the Makefile do not each need a
+# root shell. Every one of them is a restart/reload of a NUT unit -- and a LISTEN
+# change needs a full restart, not a reload, which is the bug that took upsd down for
+# two days. Without these, diagnosing NUT means opening a root tmux, which is how a
+# 64%-of-a-core driver spin went unnoticed for two days: nobody wants to keep a root
+# shell open just to look.
+#
+# Deliberately NOT granted: write access to /etc/nut/*.conf. Those stay root:nut 0640,
+# group-READ only. Making them group-writable would hand the `nut` account -- which is
+# upsd, listening on the LAN -- the ability to rewrite a driver's `driver =` line, and
+# drivers are started as root. Config edits keep going through the reviewed scripts
+# under a deliberate `sudo`, not through an ambient group permission.
 cat > /etc/sudoers.d/ups-orchestrator <<SUDOERS
 # Lets the --user watch service power off THIS host for a local shutdown_target.
 $RUN_USER ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown, /sbin/poweroff, /usr/bin/systemctl poweroff
+# NUT service control, so 'make nut-*' diagnostics/repairs need no root shell.
+$RUN_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart nut-server.service, /usr/bin/systemctl restart nut-monitor.service, /usr/bin/systemctl restart nut-driver.target
+$RUN_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart nut-driver@*.service, /usr/bin/systemctl stop nut-driver@*.service, /usr/bin/systemctl start nut-driver@*.service
 SUDOERS
 chmod 0440 /etc/sudoers.d/ups-orchestrator
 visudo -cf /etc/sudoers.d/ups-orchestrator >/dev/null && echo "   sudoers OK" || { echo "   sudoers INVALID — removing"; rm -f /etc/sudoers.d/ups-orchestrator; }

@@ -80,7 +80,13 @@ trap - EXIT
 echo "added pollonly to [$UPS]"
 
 echo "restarting nut-driver@$UPS ..."
-systemctl restart "nut-driver@$UPS.service"
+# `|| true`, deliberately. These units are pulled in by nut-driver.target via
+# nut-driver-enumerator, so a direct restart routinely reports
+# "Job for nut-driver@X.service canceled" and exits NON-ZERO while the driver is
+# in fact restarted and healthy. Under `set -e` that aborted this script after the
+# config was already written, printing a failure for a repair that had worked.
+# The exit code is not the truth here; the checks below are.
+systemctl restart "nut-driver@$UPS.service" 2>&1 | sed 's/^/   /' || true
 sleep 3
 systemctl is-active --quiet "nut-driver@$UPS.service" \
   || { echo "driver did NOT come back; restore with: cp -a $BACKUP $CONF" >&2; exit 1; }
