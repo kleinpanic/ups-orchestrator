@@ -55,3 +55,6 @@ mutants/
 # being walked by `ruff check .` (make lint), so an unrelated agent's half-written
 # file failed the repo's own lint gate.
 .claude/
+
+# mkdocs build output (make docs / mkdocs build)
+site/
