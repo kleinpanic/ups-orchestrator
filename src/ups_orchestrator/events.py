@@ -36,12 +36,14 @@ from enum import Enum
 from pathlib import Path
 
 from ups_orchestrator.config import (
+    SERIAL_DEVICE_SHAPES,
     LoadStepPolicy,
     MonitoredMachine,
     ShutdownGroupPolicy,
     ShutdownTarget,
     UpsConfig,
     canonical_ups_key,
+    is_serial_device_path,
 )
 from ups_orchestrator.notify import Level, Notification, Notifier
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
@@ -368,9 +370,22 @@ def serial_liveness_probe(
         return ProbeResult(outcome, round(time.monotonic() - started, 3), detail)
 
     try:
+        # Independent of the config-side allowlist, on purpose. This function takes a
+        # device as an ARGUMENT and is reachable from callers that never went through
+        # Config.load, so it cannot assume that validation ran. The specific hazard is
+        # /dev/watchdog: a character device under /dev/ that satisfies the S_ISCHR check
+        # below, and which the O_RDWR open + close further down ARMS -- rebooting this
+        # host a minute later. This host is the NUT primary; it must not be rebooted by
+        # a diagnostic.
+        if not is_serial_device_path(device):
+            return _result(
+                ProbeOutcome.NO_TRANSPORT,
+                f"{device} is not a serial console device (expected "
+                f"{SERIAL_DEVICE_SHAPES}); nothing was opened",
+            )
         # Cheapest and most destructive-to-get-wrong check first, and NOT redundant with
-        # the config-side /dev/ prefix check: a path under /dev/ can still be a regular
-        # file, which an unguarded write would truncate and then report success for.
+        # the allowlist above: a path under /dev/tty can still be a regular file, which
+        # an unguarded write would truncate and then report success for.
         mode = os.stat(device).st_mode
         if not stat.S_ISCHR(mode):
             return _result(

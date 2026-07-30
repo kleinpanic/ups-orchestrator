@@ -99,6 +99,42 @@ def _as_bool(value: object, default: bool) -> bool:
     return default
 
 
+SERIAL_DEVICE_SHAPES = "/dev/tty*, /dev/pts/*, /dev/serial/by-id/*, or /dev/serial/by-path/*"
+_SERIAL_DEVICE_PREFIXES = (
+    "/dev/tty",
+    # A pty IS a terminal, and it is the only way to exercise this path without real
+    # hardware — every probe test drives one. It is also legitimate in production for a
+    # socat/ser2net endpoint. Never a watchdog, which is the thing being excluded.
+    "/dev/pts/",
+    "/dev/serial/by-id/",
+    "/dev/serial/by-path/",
+)
+
+
+def is_serial_device_path(device: str) -> bool:
+    """Is this the shape of a serial console device? An ALLOWLIST, not a /dev/ check.
+
+    The guard used to be ``startswith("/dev/")``, which is enough to stop a typo
+    truncating a regular file but not enough to stop it hitting the wrong DEVICE.
+    ``/dev/watchdog`` exists on this host, is a character device, and lives under
+    /dev/, so it satisfied every check — and the probe opens O_RDWR then closes,
+    which ARMS the hardware watchdog and (on a nowayout kernel) reboots the box about
+    a minute later. That is the NUT primary: the one machine whose whole job is to
+    stay up through an outage and bring the others back. A read-only-sounding
+    ``monitor verify --deep`` must not be able to reboot it because of a config typo.
+
+    Deliberately narrow. Every real console path on this deployment is a tty or a
+    /dev/serial/ symlink, and the cost of being wrong here is unbounded.
+
+    A prefix must be followed by something: bare ``/dev/tty`` is the controlling
+    terminal, not a console, and a bare directory is not a device at all.
+    """
+    for prefix in _SERIAL_DEVICE_PREFIXES:
+        if device.startswith(prefix) and len(device) > len(prefix):
+            return True
+    return False
+
+
 def _strict_baud(value: object) -> int | None:
     """Parse a DECLARED baud strictly, or return ``None``.
 
@@ -965,17 +1001,19 @@ def _transport_notices(m: MonitoredMachine) -> tuple[tuple[str, str], ...]:
                         "serial_device and serial_baud.",
                     )
                 )
-        elif not device.startswith("/dev/") or device == "/dev/":
+        elif not is_serial_device_path(device):
             # MED-10 (config half). The serial writer opens the device with mode "wb",
             # which TRUNCATES a regular file — so a typo'd path destroys that file and
             # still reports success. The transport-side guard is 02-07.
             found.append(
                 (
                     "error",
-                    f"declares serial_device {device!r}, which is not an absolute path "
-                    f"under /dev/. The serial writer opens it with mode 'wb', which "
-                    f"TRUNCATES a regular file, so a typo would destroy that file and "
-                    f"still report success. Use the console device path under /dev/.",
+                    f"declares serial_device {device!r}, which is not a serial console "
+                    f"device. Expected {SERIAL_DEVICE_SHAPES}. The writer opens the path "
+                    f"with mode 'wb', which TRUNCATES a regular file, so a typo would "
+                    f"destroy that file and still report success — and a bare /dev/ check "
+                    f"also admitted /dev/watchdog, where opening and closing ARMS the "
+                    f"hardware watchdog and reboots this host about a minute later.",
                 )
             )
         if m.serial_baud is None:

@@ -47,6 +47,22 @@ _LOCK = ROOT / ".mutation-test.lock"
 _IN_FLIGHT: tuple[pathlib.Path, str] | None = None
 
 
+def _write_atomic(path: pathlib.Path, text: str) -> None:
+    """Write via temp+rename, so the destination is never half-written.
+
+    ``Path.write_text`` is open(O_TRUNC) then a buffered write, which fails in two ways
+    this harness cannot afford. A SIGKILL or a full disk between the truncate and the
+    flush leaves a source file EMPTY -- strictly worse than a mutant, and the SKIP
+    detector describes it uselessly. And it gave the signal handler its own race: a
+    TERM arriving after the truncate but before the flush let the handler write the
+    original through a second descriptor, then the unwind flushed the mutated buffer
+    back over it, so the mutant survived the very handler added to prevent that.
+    """
+    tmp = path.with_suffix(path.suffix + ".mutation-tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def _restore_in_flight() -> None:
     """Put back the mutant currently applied, if any. Safe to call twice."""
     global _IN_FLIGHT
@@ -54,7 +70,7 @@ def _restore_in_flight() -> None:
         path, original = _IN_FLIGHT
         _IN_FLIGHT = None
         try:
-            path.write_text(original)
+            _write_atomic(path, original)
         except OSError as exc:  # pragma: no cover — best effort while dying
             print(f"FAILED to restore {path}: {exc}", file=sys.stderr)
 
@@ -69,6 +85,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
+    (
+        "src/ups_orchestrator/config.py",
+        '    "/dev/tty",\n',
+        '    "/dev/",\n',
+        "config: serial allowlist widened back to bare /dev/ — readmits /dev/watchdog, "
+        "which the probe's open+close ARMS, rebooting the NUT primary",
+    ),
     (
         "src/ups_orchestrator/events.py",
         '_probe_write(fd, b"\\x15\\r", deadline_at)',
@@ -722,6 +745,23 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
 
 
 def main() -> int:
+    # A clean tree is a PRECONDITION, not an assumption. This harness takes whatever is
+    # on disk as the baseline it restores to, so a mutant stranded by an earlier SIGKILL
+    # (the one case the lock and the signal handler cannot cover) would be read as the
+    # original and written back after EVERY subsequent entry in that file -- laundering
+    # it into the tree's steady state. The entry that would have caught it goes SKIP,
+    # whose message says "refresh the pattern against the current source", which in that
+    # scenario is precisely the wrong action and would bake the mutant in permanently.
+    if subprocess.run(["git", "diff", "--quiet", "--", "src/"], cwd=ROOT, check=False).returncode:
+        print(
+            "src/ has uncommitted changes, so this run cannot tell your edits from a\n"
+            "mutant stranded by an earlier hard kill -- and it would adopt either one as\n"
+            "the baseline it restores to. Run 'git diff src/' and confirm the changes are\n"
+            "yours, then commit or stash them before rerunning.",
+            file=sys.stderr,
+        )
+        return 2
+
     # Refuse to start while another run holds the tree. Concurrent runs corrupt
     # each other's restores; see the note beside _LOCK.
     try:
@@ -729,7 +769,9 @@ def main() -> int:
     except FileExistsError:
         print(
             f"another mutation run holds {_LOCK}. This harness patches src/ in place,\n"
-            "so two runs corrupt each other. Wait for it, or remove the lock if stale.",
+            "so two runs corrupt each other. Wait for it; if you are sure it is stale,\n"
+            "check 'git diff src/' FIRST -- a lock left by a SIGKILL may have a mutant\n"
+            "stranded beside it -- then remove the lock.",
             file=sys.stderr,
         )
         return 2
@@ -756,7 +798,7 @@ def _run() -> int:
             skipped += 1
             continue
         _IN_FLIGHT = (path, original)
-        path.write_text(original.replace(old, new, 1))
+        _write_atomic(path, original.replace(old, new, 1))
         try:
             # Hard timeout: a mutant can turn a bounded loop into an infinite one
             # (e.g. a guard flip that makes a settle-loop never exit). A hang means
@@ -775,7 +817,7 @@ def _run() -> int:
             returncode = -1  # hang == detectable == killed
             print(f"  KILLED   {desc} (suite hung — mutant caused a non-terminating loop)")
         finally:
-            path.write_text(original)
+            _write_atomic(path, original)
             _IN_FLIGHT = None
         if returncode != 0:
             if returncode != -1:

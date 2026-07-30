@@ -21,6 +21,7 @@ from ups_orchestrator.config import (
     dual_regime_pairs,
     is_disarming,
     is_disarming_severity,
+    is_serial_device_path,
     legacy_only_targets,
     requires_root_escalation,
     unknown_ups_references,
@@ -2710,3 +2711,36 @@ def test_dual_regime_message_names_the_declared_method_after_a_duplicate_disarm(
     (target,) = cfg.upses["cyberpower"].shutdown_targets
     (collision,) = [n for n in target.load_notices if "collides with" in n.message]
     assert "shutdown_method='ssh'" in collision.message
+
+
+def test_watchdog_is_not_a_serial_device_path() -> None:
+    """/dev/watchdog passed the old `/dev/` + S_ISCHR guard, and must not pass now.
+
+    It exists on this host as a character device under /dev/. The probe opens the
+    device O_RDWR and closes it, which ARMS the hardware watchdog — on a nowayout
+    kernel that reboots the box about a minute later. This host is the NUT primary:
+    the machine whose entire job is to survive the outage and bring the others back.
+    A config typo must not let `monitor verify --deep` reboot it.
+    """
+    for hazard in ("/dev/watchdog", "/dev/watchdog0", "/dev/mem", "/dev/sda", "/dev/kmsg"):
+        assert is_serial_device_path(hazard) is False, hazard
+
+
+def test_real_console_paths_are_still_accepted() -> None:
+    """The allowlist must not be so narrow it rejects the deployment's own devices."""
+    for good in (
+        "/dev/ttyUSB0",
+        "/dev/ttyS1",
+        "/dev/ttyAMA0",
+        "/dev/ttyACM0",
+        "/dev/pts/7",  # every probe test drives a pty; also valid for socat/ser2net
+        "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller-if00-port0",
+        "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0",
+    ):
+        assert is_serial_device_path(good) is True, good
+
+
+def test_a_bare_prefix_is_not_a_device() -> None:
+    """`/dev/tty` is the controlling terminal and `/dev/serial/by-id/` is a directory."""
+    for bare in ("/dev/tty", "/dev/pts/", "/dev/serial/by-id/", "/dev/serial/by-path/", "/dev/"):
+        assert is_serial_device_path(bare) is False, bare

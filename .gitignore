@@ -46,6 +46,7 @@ mutants/
 # SIGKILL or power loss can strand one, and a stranded lock is a thing to
 # delete, never to commit.
 .mutation-test.lock
+*.mutation-tmp
 
 # opencode CLI runtime state (from cross-AI reviews)
 .opencode/
