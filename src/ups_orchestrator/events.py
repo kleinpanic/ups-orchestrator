@@ -765,10 +765,52 @@ def _target_location(target: ShutdownTarget) -> str:
     return f"{ssh_dest(target)} (ssh)"
 
 
+# No outage this program should act on lasts a day. A recorded start older than this
+# is not a long outage, it is a stamp that outlived the outage that produced it — a
+# save that failed, a daemon down across the ONLINE transition, or a clock that moved.
+MAX_PLAUSIBLE_OUTAGE_SECONDS = 24 * 3600
+
+
 def _outage_age(state: UpsState, deps: Deps) -> int | None:
+    """Seconds on battery, or ``None`` when that cannot be answered honestly.
+
+    ``min_on_battery_seconds`` is the ONLY gate that stands between a brief sag and
+    shutting two machines down, and it is measured from a wall-clock stamp on a host
+    with no RTC. Both directions of a clock step, and a stamp that outlived its outage,
+    produce a wrong answer here — so each is detected and returns None (which
+    ``_target_should_fire`` reads as "on-battery start was not recorded yet" and
+    refuses to fire) rather than being silently absorbed.
+
+    Returning None on a suspect clock is the conservative direction for THIS program:
+    its purpose is to keep the small devices up, and a shutdown fired on a bad clock is
+    an unplanned outage for a machine that did not need one. A missed shutdown is
+    visible in the countdown embeds; a spurious one is not visible until it has happened.
+    """
     if state.onbatt_since is None:
         return None
-    return max(0, deps.now() - state.onbatt_since)
+    age = deps.now() - state.onbatt_since
+    if age < 0:
+        # The clock stepped BACKWARD. This used to be clamped to 0 with max(), which
+        # restarted the countdown silently and, if it kept happening, meant a real
+        # outage never fired at all.
+        LOG.error(
+            "on-battery start for this UPS is %ds in the FUTURE — the clock stepped "
+            "backward. Refusing to judge the outage age; no target will fire on this "
+            "poll. The countdown restarts from the corrected clock.",
+            -age,
+        )
+        return None
+    if age > MAX_PLAUSIBLE_OUTAGE_SECONDS:
+        LOG.error(
+            "on-battery start for this UPS is %ds old, beyond the %ds plausible "
+            "maximum. Treating it as a STALE stamp rather than a real outage and "
+            "refusing to fire: a stamp this old grants the shutdown gate on the very "
+            "first poll, which would turn a brief sag into a shutdown.",
+            age,
+            MAX_PLAUSIBLE_OUTAGE_SECONDS,
+        )
+        return None
+    return age
 
 
 def _threshold_status(
@@ -1234,6 +1276,49 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
     )
 
 
+# A single failed read is a blip; upsc has its own timeout and the box is a busy Pi.
+# Three consecutive is ~30s at the live poll_seconds and is not a blip.
+UNREADABLE_POLLS_BEFORE_ALARM = 3
+
+
+def _open_comm_alarm_if_persistently_unreadable(
+    ups: UpsConfig, state: UpsState, deps: Deps
+) -> None:
+    """Page COMMUNICATION LOST when WE cannot read the UPS, independent of NUT.
+
+    The closer below exists because NUT cannot be relied on to close this alarm. The
+    same reasoning applies to opening it, and leaving that half to NUT left two holes:
+
+    1. ``upsmon`` reaching ``upsd`` and OUR ``upsc`` reaching ``upsd`` are different
+       code paths. This host has already spent two days in the state where the first
+       worked and the second did not (the upsd LISTEN regression): upsmon was content
+       so no COMMBAD ever fired, every renderer printed "unknown", and Discord — the
+       only interrupting surface — said nothing at all.
+    2. An operator upgrading INTO this fix does so because alarms are already open.
+       Their state.json predates the flag, so every UPS loads ``commbad_notified``
+       False, and a closer that only ever clears has nothing to clear.
+
+    Opening it here makes the poll loop self-sufficient in both directions and makes the
+    upgrade path self-healing.
+    """
+    state.unreadable_polls += 1
+    if state.commbad_notified or state.unreadable_polls < UNREADABLE_POLLS_BEFORE_ALARM:
+        return
+    state.commbad_notified = True
+    _log_event(deps, "commbad", ups, None, "upsc returned nothing for consecutive polls.")
+    deps.notifier.send(
+        Notification(
+            title=f"🔌 {ups.label} — COMMUNICATION LOST",
+            body=(
+                f"No reading from this UPS for {state.unreadable_polls} consecutive polls. "
+                f"Detected by the poll loop: NUT itself may still consider the UPS "
+                f"reachable, so check `upsc {ups.name}` and the driver."
+            ),
+            level=Level.WARNING,
+        )
+    )
+
+
 def _close_comm_alarm_if_recovered(
     ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot
 ) -> None:
@@ -1256,6 +1341,8 @@ def _close_comm_alarm_if_recovered(
     ``upsc`` cannot reach the UPS, so a non-empty one means the data path works end to
     end — driver, upsd and our client.
     """
+    if (snap.status or "").strip():
+        state.unreadable_polls = 0
     if not state.commbad_notified:
         return
     if not (snap.status or "").strip():
@@ -1284,6 +1371,36 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     """
     snap = deps.read_snapshot(ups.name)
     _close_comm_alarm_if_recovered(ups, state, deps, snap)
+    if not (snap.status or "").strip():
+        # UNREADABLE is not the same as ON UTILITY POWER, and conflating them is the
+        # most dangerous bug this file can have.
+        #
+        # `snap.on_battery` is False when status is None (nut.py: `status is not None
+        # and "OB" in status`), so without this guard a single failed `upsc` read during
+        # a real outage fell into the `not on_battery` branch below and called
+        # handle_online: it sent "✅ POWER RESTORED — Back on utility power" while the
+        # grid was down, and reset `onbatt_since` to None and `shutdowns_sent` to [].
+        #
+        # The reset is the part that matters. `min_on_battery_seconds` is measured from
+        # `onbatt_since`, so every unreadable poll restarted the 180s countdown from
+        # zero. At `poll_seconds: 10` a driver that flaps faster than the gate is long
+        # would hold mt and spark below the threshold for an ENTIRE outage — the two
+        # machines this program exists to shut down would never be shut down, and the
+        # last thing the operator would have seen is a success-coloured POWER RESTORED.
+        #
+        # This host has already had days where every `upsc` read was refused (the upsd
+        # LISTEN regression), so this is a state it demonstrably reaches.
+        #
+        # Returning early leaves the outage state exactly as it was: the timer keeps
+        # running, nothing is announced, and nothing fires — we cannot confirm the UPS
+        # is on battery, so we do not act on a reading we do not have.
+        LOG.warning(
+            "%s: unreadable this poll (no status from upsc); holding outage state and "
+            "firing nothing. This is NOT treated as utility power.",
+            ups.name,
+        )
+        _open_comm_alarm_if_persistently_unreadable(ups, state, deps)
+        return
     _record_status_transition(ups, state, deps, snap)
     _check_load_step(ups, state, deps, snap)
     if not snap.on_battery:

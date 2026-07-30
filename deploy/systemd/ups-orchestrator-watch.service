@@ -6,6 +6,14 @@
 # or have the ACL set by deploy/install.sh, to read /etc/ups-orchestrator.env).
 # Enable linger so it runs while logged out.
 [Unit]
+# The shutdown gate measures `min_on_battery_seconds` from a wall-clock stamp, and this
+# host has no RTC — it restores an approximate time at boot and timesyncd steps it later.
+# Starting before that step meant a stamp recorded against the pre-step clock, so the
+# correction alone could satisfy the 180s gate and turn a 10-second sag into a shutdown.
+# Restart=always makes this reachable on any crash-restart during an outage, not just at
+# boot. Ordering after the sync closes the boot case at the source.
+After=time-sync.target
+Wants=time-sync.target
 Description=ups-orchestrator poll loop (policy-gated shutdowns + countdown)
 
 [Service]

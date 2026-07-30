@@ -42,6 +42,10 @@ class UpsState:
     # COMMUNICATION LOST within one second and NONE was ever closed, so the operator
     # carried three open alarms for two days about hardware that was fine.
     commbad_notified: bool = False
+    # Consecutive polls where `upsc` returned nothing. Lets the poll loop OPEN a comm
+    # alarm on its own instead of depending on NUT's COMMBAD, which it explicitly does
+    # not trust to close one. Reset to 0 on the first readable poll.
+    unreadable_polls: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> UpsState:
@@ -67,11 +71,44 @@ class UpsState:
             last_load_step_notified=_opt_int(data.get("last_load_step_notified")),
             onbatt_notified=bool(data.get("onbatt_notified", False)),
             commbad_notified=bool(data.get("commbad_notified", False)),
+            unreadable_polls=_opt_int(data.get("unreadable_polls")) or 0,
         )
 
 
 def _opt_int(value: object) -> int | None:
-    return int(value) if isinstance(value, (int, float)) else None
+    """Coerce to int, or ``None`` for anything that is not a usable integer.
+
+    This shadowed ``config._opt_int`` WITHOUT its hardening, which reverted a fix the
+    project had already made and documented there as F4. Three values reached it:
+
+      ``NaN``       -> ValueError. ``json.loads`` accepts the bare token.
+      ``Infinity``  -> OverflowError, which is an ArithmeticError and NOT a ValueError,
+                       so it walks past a ``except ValueError`` unnoticed.
+      ``true``      -> silently loaded as ``1``, because ``bool`` is a subclass of int.
+
+    The first two crash every writer. ``_read_states`` catches only OSError and
+    JSONDecodeError, so a single such byte in state.json takes down `_cmd_watch` AND
+    every NUT event handler, and the unit's ``Restart=always``/``RestartSec=5`` never
+    trips systemd's rate limiter — it crash-loops forever, showing "activating" rather
+    than "failed", with no page possible because the notifier is never constructed.
+
+    The third is worse than a crash because it is silent and it disarms a safety gate:
+    ``onbatt_since = 1`` makes ``_outage_age`` about 1.8e9 seconds, so
+    ``min_on_battery_seconds`` is satisfied instantly and every target on that UPS
+    becomes eligible the moment it goes on battery — the operator's 3-minute grace,
+    which exists so a sag or a self-test cannot shut machines down, is skipped.
+
+    /var/lib/ups-orchestrator is group-writable by ``nut`` with no sticky bit, and this
+    project already models ``nut`` as the lower-privileged LAN-facing identity.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):  # NaN / ±inf
+            return None
+    return None
 
 
 _ACL_XATTR = "system.posix_acl_access"
@@ -367,15 +404,52 @@ def file_identity(path: Path) -> tuple[int, int, int, int] | None:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+# The marker read in audit.py is bounded for a documented reason, and this file lives
+# in the same group-writable directory and is read far more often — every poll, every
+# save, every NUT event. An unbounded read lets a planted 4GB document OOM the poll loop
+# on a Pi, reproduced every RestartSec=5.
+_MAX_STATE_BYTES = 4 * 1024 * 1024
+
+
 def _read_states(path: Path) -> dict[str, UpsState]:
-    """Parse the state file, or ``{}`` for absent/unreadable/corrupt/wrong-shape."""
+    """Parse the state file, or ``{}`` for absent/unreadable/corrupt/wrong-shape.
+
+    Per-UPS isolation is the point of the loop: a corrupt entry for ONE UPS must not
+    blank the fire-once ledger of the others. A dict comprehension let a single bad
+    value take the whole map down with it, which on this file means losing
+    ``shutdowns_sent`` for UPSes that were mid-outage.
+    """
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        with open(path, "rb") as handle:
+            blob = handle.read(_MAX_STATE_BYTES + 1)
+    except OSError:
+        return {}
+    if len(blob) > _MAX_STATE_BYTES:
+        logger.warning(
+            "state file %s exceeds %d bytes; refusing to parse it and continuing with "
+            "empty state rather than reading it into memory",
+            path,
+            _MAX_STATE_BYTES,
+        )
+        return {}
+    try:
+        raw = json.loads(blob.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("state file %s is unparseable (%s); continuing with empty state", path, exc)
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {name: UpsState.from_dict(data) for name, data in raw.items() if isinstance(data, dict)}
+    states: dict[str, UpsState] = {}
+    for name, data in raw.items():
+        if not isinstance(data, dict):
+            continue
+        try:
+            states[name] = UpsState.from_dict(data)
+        except (ValueError, TypeError, OverflowError) as exc:
+            # Fail closed for THIS UPS only. Losing one entry costs at worst a duplicate
+            # notification for it; losing the map costs every UPS's shutdown ledger.
+            logger.warning("state for UPS %s is malformed (%s); resetting that entry", name, exc)
+    return states
 
 
 class StateStore:
@@ -438,9 +512,23 @@ class StateStore:
         single poll — the next ONBATT/ONLINE transition clears it again on both sides.
         The union therefore always errs toward "already sent".
 
-        Every other field stays last-writer-wins. They are monitoring bookkeeping
+        The ALARM LATCHES are also merged, with OR. ``commbad_notified`` and
+        ``onbatt_notified`` each mean "a page has gone out and is not yet closed", and
+        they are set by the upssched process while being read by the watch loop. Under
+        last-writer-wins the watch loop's stale in-memory ``False`` overwrote a ``True``
+        the event path had just written — and for ``commbad_notified`` that is not a
+        cosmetic loss: the flag IS the thing ``_close_comm_alarm_if_recovered`` reads, so
+        clobbering it leaves a COMMUNICATION LOST page on Discord that nothing can ever
+        close. That is exactly the 2026-07-28 incident, reached through a different door.
+        OR is the safe direction for a latch: if either writer believes an alarm is open,
+        it is open, and the worst case is one redundant close.
+
+        The window is not narrow during an outage. A tick can hold a serial transport
+        (20s timeout) and blocking Discord POSTs, and the event path runs inside it.
+
+        Every remaining field stays last-writer-wins. Those are monitoring bookkeeping
         (notification cadence, load window, status) where a lost update costs a
-        duplicate Discord line, not a duplicate shutdown.
+        duplicate Discord line, not a duplicate shutdown and not an unclosable alarm.
 
         A UPS present on disk but absent here is adopted wholesale: it belongs to a
         writer with a different config view, and rewriting the file would otherwise
@@ -456,6 +544,10 @@ class StateStore:
             for sent in on_disk.shutdowns_sent:
                 if sent not in mine.shutdowns_sent:
                     mine.shutdowns_sent.append(sent)
+            # Latches: OR, never overwrite. See the docstring — losing a True here is
+            # what makes an alarm unclosable.
+            mine.commbad_notified = mine.commbad_notified or on_disk.commbad_notified
+            mine.onbatt_notified = mine.onbatt_notified or on_disk.onbatt_notified
 
     def get(self, ups_name: str) -> UpsState:
         """Return the state for ``ups_name``, creating a blank one on first use."""

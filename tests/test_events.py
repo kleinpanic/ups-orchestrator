@@ -2418,3 +2418,93 @@ def test_commok_clears_the_flag_so_the_tick_does_not_double_send() -> None:
     notifier.sent.clear()
     events_mod.handle_tick(ups, state, deps)
     assert not any("COMMUNICATION RESTORED" in n.title for n in notifier.sent)
+
+
+# --- UNREADABLE is not ON UTILITY POWER ---
+#
+# `snap.on_battery` is False when status is None, so an unreadable UPS used to fall into
+# the "not on battery" branch: it sent POWER RESTORED during a live outage and reset
+# `onbatt_since` and `shutdowns_sent`. Since min_on_battery_seconds is measured FROM
+# onbatt_since, every unreadable poll restarted the 180s countdown — at poll_seconds 10,
+# a driver flapping faster than the gate would hold mt and spark below the threshold for
+# an entire outage. This host has had days where every upsc read was refused.
+
+
+def test_an_unreadable_ups_does_not_reset_the_outage_timer() -> None:
+    ups = make_ups("ups1")
+    state = UpsState(onbatt_since=1000, onbatt_notified=True, shutdowns_sent=["mt"])
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap(""), now=1100)  # unreadable: empty status
+
+    events_mod.handle_tick(ups, state, deps)
+
+    assert state.onbatt_since == 1000, "the 180s countdown was restarted by a failed read"
+    assert state.shutdowns_sent == ["mt"], "the fire-once ledger was wiped by a failed read"
+
+
+def test_an_unreadable_ups_does_not_announce_power_restored() -> None:
+    ups = make_ups("ups1")
+    state = UpsState(onbatt_since=1000, onbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap(""), now=1100)
+
+    events_mod.handle_tick(ups, state, deps)
+
+    titles = [n.title for n in notifier.sent]
+    assert not any("POWER RESTORED" in t for t in titles), titles
+
+
+def test_a_genuine_return_to_utility_power_still_announces() -> None:
+    """The guard must not swallow the real thing it sits next to."""
+    ups = make_ups("ups1")
+    state = UpsState(onbatt_since=1000, onbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL"), now=1100)
+
+    events_mod.handle_tick(ups, state, deps)
+
+    assert any("POWER RESTORED" in n.title for n in notifier.sent)
+    assert state.onbatt_since is None
+
+
+# --- the 180s gate is the ONLY thing between a sag and shutting two machines down ---
+#
+# With the live policy (battery_below 100, runtime_below null) _close_to_empty is a
+# tautology, so the whole firing decision is `on_battery AND age >= 180`. That age comes
+# from a wall-clock stamp on a host with no RTC. All three of these were reachable.
+
+
+def test_a_forward_clock_step_does_not_grant_the_shutdown_gate() -> None:
+    """A stale stamp must not turn the first poll of a brief sag into a shutdown."""
+    # Recorded a full day+ ago: not a long outage, a stamp that outlived its outage.
+    state = UpsState(onbatt_since=1_000_000)
+    deps, _ = make_deps(FakeNotifier(), snap("OB"), now=1_000_000 + 90_000)
+
+    assert events_mod._outage_age(state, deps) is None
+
+
+def test_a_backward_clock_step_is_refused_not_silently_clamped() -> None:
+    """max(0, ...) hid this: the countdown restarted with nothing said."""
+    state = UpsState(onbatt_since=2000)
+    deps, _ = make_deps(FakeNotifier(), snap("OB"), now=1000)  # clock went backwards
+
+    assert events_mod._outage_age(state, deps) is None
+
+
+def test_a_normal_outage_age_is_unaffected() -> None:
+    state = UpsState(onbatt_since=1000)
+    deps, _ = make_deps(FakeNotifier(), snap("OB"), now=1200)
+    assert events_mod._outage_age(state, deps) == 200
+
+
+def test_a_suspect_clock_blocks_firing_rather_than_permitting_it() -> None:
+    """_target_should_fire reads a None age as 'not recorded yet' and refuses."""
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(min_on_battery_seconds=180))
+    state = UpsState(onbatt_since=1_000_000)
+    deps, _ = make_deps(FakeNotifier(), snap("OB"), now=1_000_000 + 90_000)
+    target = _serial_target(baud=115200)
+
+    ok, why = events_mod._target_should_fire(ups, state, deps, target, snap("OB"))
+
+    assert ok is False
+    assert "not recorded yet" in why

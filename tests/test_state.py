@@ -44,6 +44,7 @@ def test_state_save_creates_parent_and_writes_json(tmp_path) -> None:
             "shutdowns_sent": [],
             "onbatt_notified": False,
             "commbad_notified": False,
+            "unreadable_polls": 0,
         }
     }
 
@@ -564,3 +565,32 @@ def test_chown_eperm_warns_when_ownership_actually_flips_even_unprivileged(
 
     assert any("could not preserve owner/group" in rec.message for rec in caplog.records)
     assert any("T-02-23" in rec.message for rec in caplog.records)
+
+
+def test_alarm_latches_survive_another_writer(tmp_path: Path) -> None:
+    """OR-merge, never overwrite.
+
+    commbad_notified is set by the upssched process and read by the watch loop. Under
+    last-writer-wins the watch loop's stale False overwrote the event path's True — and
+    that flag IS what closes a COMMUNICATION LOST page, so losing it left an alarm on
+    Discord that nothing could ever close.
+    """
+    path = tmp_path / "state.json"
+
+    # The event path writes True.
+    other = StateStore(path)
+    other.get("ups1").commbad_notified = True
+    other.get("ups1").onbatt_notified = True
+    other.save()
+
+    # The watch loop still holds its pre-event snapshot, with both False.
+    mine = StateStore(path)
+    mine.get("ups1").commbad_notified = False
+    mine.get("ups1").onbatt_notified = False
+    # Force the "someone else wrote" path.
+    mine._seen = None
+    mine.save()
+
+    reread = StateStore(path)
+    assert reread.get("ups1").commbad_notified is True, "an unclosable alarm was created"
+    assert reread.get("ups1").onbatt_notified is True

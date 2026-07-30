@@ -87,6 +87,20 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "src/ups_orchestrator/events.py",
+        '    if not (snap.status or "").strip():\n        # UNREADABLE is not the same',
+        "    if False:\n        # UNREADABLE is not the same",
+        "events: an unreadable UPS reads as utility power again — sends POWER RESTORED "
+        "mid-outage and restarts the 180s countdown every failed poll",
+    ),
+    (
+        "src/ups_orchestrator/state.py",
+        "    if value is None or isinstance(value, bool):\n        return None",
+        "    if value is None:\n        return None",
+        "state: a bool in state.json loads as onbatt_since=1 — the 180s grace is "
+        "skipped and every target fires the instant the UPS goes on battery",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
         "    if not state.commbad_notified:\n        return",
         "    if True:\n        return",
         "events: the poll loop stops closing an open COMM alarm — NUT cannot close it "

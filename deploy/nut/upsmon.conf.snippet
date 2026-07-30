@@ -25,14 +25,42 @@
 # before choosing @localhost vs @<host>: if the rpi4 is the USB/upsd server,
 # eulerpi5 connects to ups@<rpi4>, not @localhost.
 
-MONITOR ups1@localhost 1 upsmon CHANGE_ME primary
-MONITOR ups2@localhost 1 upsmon CHANGE_ME primary
+MONITOR ups1@localhost 0 upsmon CHANGE_ME primary
+MONITOR ups2@localhost 0 upsmon CHANGE_ME primary
 MONITOR ups3@localhost 0 upsmon CHANGE_ME primary
 
-# MINSUPPLIES = how many powervalue units must remain before this host keeps
-# running. With two powervalue=1 feeds above, 1 means "run until BOTH are gone";
-# raise to 2 for a host that genuinely needs both UPSes up. The default is 1.
-MINSUPPLIES 1
+# ############################################################################
+# MINSUPPLIES 0 IS DELIBERATE. Read this before raising it.
+#
+# MINSUPPLIES is how many powervalue units must remain before upsmon decides
+# this host can no longer be powered and runs SHUTDOWNCMD. `forceshutdown()`
+# is reachable ONLY when a MONITOR line gives this host a non-zero powervalue
+# AND that total can fall below MINSUPPLIES. Setting MINSUPPLIES 0 with every
+# powervalue at 0 makes it unreachable: upsmon still watches, still fires
+# NOTIFYFLAGs, still drives the orchestrator — it just cannot power this box
+# off on its own.
+#
+# That is the intended posture for the host running this orchestrator. It is
+# the machine that has to SURVIVE an outage in order to bring the others back
+# up afterwards, and to keep monitoring while they go down. Anything that can
+# halt it defeats the point of running it.
+#
+# Note this is NOT covered by `shutdown.internal.enabled: false` in the
+# orchestrator's own config. That flag governs the orchestrator's `local`
+# shutdown targets only. upsmon's SHUTDOWNCMD is a separate authority living
+# in THIS file, and nothing in the orchestrator can disarm it.
+#
+# An earlier revision of this snippet shipped two powervalue=1 feeds and
+# MINSUPPLIES 1, which armed exactly that path. Installing from it converted
+# the primary back into a machine that powers itself off, silently, while the
+# operator-facing LOW BATTERY alert still said the shutdown policy decides.
+#
+# Raise this ONLY for a host that genuinely should power itself off when its
+# feeds are gone — and then give the relevant MONITOR lines a powervalue to
+# match. Verify afterwards:
+#     grep -E '^MONITOR|^MINSUPPLIES' /etc/nut/upsmon.conf
+# ############################################################################
+MINSUPPLIES 0
 
 # Route notifications through upssched (which calls the orchestrator). Every
 # NOTIFYFLAG with EXEC must map to an event the orchestrator handles, and every
