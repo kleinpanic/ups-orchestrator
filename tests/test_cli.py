@@ -4,10 +4,13 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from ups_orchestrator import cli
+from ups_orchestrator.config import Config, ConfigNotice
+from ups_orchestrator.notify import Level
 from ups_orchestrator.nut import UpsSnapshot
 
 
@@ -1573,3 +1576,52 @@ def test_watch_keeps_the_last_good_config_when_a_reload_fails(
     # Built ONCE, at startup. The failed reload did not swap the live policy.
     assert seen == [1], seen
     assert any("CONTINUING with the previously loaded policy" in r.message for r in caplog.records)
+
+
+# --- Discord is for interruptions, not for standing conditions ---
+
+
+def test_advisory_only_degrade_is_logged_but_never_pushed(monkeypatch, caplog) -> None:
+    """A permanent advisory must not page on every restart and every config edit.
+
+    The advisory that fires in practice is a machine declaring `none` beside a named
+    UPS — a standing, unchanging condition. It is already on four passive surfaces
+    (journal, `monitor list`, `status`, web UI). Pushing it too meant a Discord alert
+    every service restart, and once the watch loop learned to reload, every config
+    save. That mutes the channel that also carries on-battery and shutdown alerts.
+    """
+    sent: list[object] = []
+    cfg = Config(
+        webhook_url="",
+        upses={"ups1": make_ups("ups1")},
+        degraded=(ConfigNotice(severity="advisory", subject="eulerpi4", message="declares none"),),
+    )
+    deps = SimpleNamespace(notifier=SimpleNamespace(send=sent.append))
+
+    with caplog.at_level("INFO"):
+        cli._notify_degraded(cfg, deps)
+
+    assert sent == []  # nothing interrupted the operator
+    assert any("declares none" in r.message for r in caplog.records)  # but it IS logged
+    assert any("not sending a Discord push" in r.message for r in caplog.records)
+
+
+def test_a_real_disarm_still_pushes(monkeypatch) -> None:
+    """The inverse must survive: something that WAS going to fire no longer will."""
+    sent: list[object] = []
+    cfg = Config(
+        webhook_url="",
+        upses={"ups1": make_ups("ups1")},
+        degraded=(
+            ConfigNotice(severity="error", subject="mt", message="no serial device — disarmed"),
+            ConfigNotice(severity="advisory", subject="eulerpi4", message="declares none"),
+        ),
+    )
+    deps = SimpleNamespace(notifier=SimpleNamespace(send=sent.append))
+
+    cli._notify_degraded(cfg, deps)
+
+    assert len(sent) == 1
+    note = sent[0]
+    assert "disarmed" in note.title  # names the disarm, not a notice count
+    assert note.level is Level.CRITICAL

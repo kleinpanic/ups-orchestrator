@@ -274,6 +274,19 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
     a STARTUP surface only: ``tick`` runs every poll and must not page repeatedly.
     Exactly one notification, never one per notice, and nothing at all when the
     tuple is empty.
+
+    **Advisory-only degrades are logged but NOT pushed to Discord.** Every notice
+    already appears on four passive surfaces — the journal, ``monitor list``,
+    ``status`` and the web UI — and a push is the one surface that interrupts.
+    The advisory that fires here in practice is permanent and unchanging (a machine
+    declaring ``none`` beside a named UPS), so pushing it meant a Discord alert on
+    every service restart and, once the watch loop learned to reload, on every
+    config edit as well — about a condition that had not changed and that the
+    operator had already seen. That is how a channel gets muted, and the same
+    channel carries the on-battery and shutdown-attempt alerts.
+
+    A DISARM still pushes, every time: something that was going to shut a machine
+    down no longer will, which is exactly what an interrupting surface is for.
     """
     if not cfg.degraded:
         return
@@ -286,6 +299,13 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
             LOG.warning("config advisory: %s", n)
     errors = [n for n in cfg.degraded if is_disarming(n)]
     advisories = [n for n in cfg.degraded if not is_disarming(n)]
+    if not errors:
+        LOG.info(
+            "%d config advisory/ies logged; not sending a Discord push (nothing was "
+            "disarmed). See 'ups-orchestrator monitor list'.",
+            len(advisories),
+        )
+        return
     # Discord caps an embed at 25 fields; the overflow is still in the journal and
     # in `monitor list`, so truncating here loses nothing an operator cannot reach.
     shown = list(cfg.degraded)[:20]
@@ -299,11 +319,8 @@ def _notify_degraded(cfg: Config, deps: Deps) -> None:
         body += f" ({overflow} further notice(s) not shown.)"
     deps.notifier.send(
         Notification(
-            title=(
-                f"⚠️ Config degraded at startup — {len(cfg.degraded)} notice(s)"
-                if errors
-                else f"⚠️ Config advisories at startup — {len(cfg.degraded)} notice(s)"
-            ),
+            # Reached only when `errors` is non-empty (advisory-only returned above).
+            title=f"⚠️ Config degraded — {len(errors)} authority/ies disarmed",
             body=body,
             level=Level.CRITICAL if errors else Level.WARNING,
             # F5: Discord renders these in a code-free embed field, and the
@@ -403,6 +420,7 @@ def _cmd_watch() -> int:
     LOG.info("watch: polling %d UPS(es) every %ds", len(cfg.upses), interval)
     cfg_path = _config_path()
     cfg_mtime = _config_mtime(cfg_path)
+    last_degraded = cfg.degraded
     while not stop:
         # The config is re-read when it CHANGES, not once at startup.
         #
@@ -442,7 +460,12 @@ def _cmd_watch() -> int:
                     len(cfg.upses),
                     interval,
                 )
-                _notify_degraded(cfg, deps)
+                # Only when the notice SET changed. A config edit that leaves the
+                # degrade state alone (any edit at all, given the standing advisory)
+                # must not re-announce it — a file save is not a new finding.
+                if cfg.degraded != last_degraded:
+                    last_degraded = cfg.degraded
+                    _notify_degraded(cfg, deps)
         # IF-01: `state.json` has two writers — this process and the `nut` user's
         # upssched dispatcher (also an operator's `remote-shutdown`, which takes the
         # same event path). Without this, the tick's `shutdowns_sent` dedupe was made
