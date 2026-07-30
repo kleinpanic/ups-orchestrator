@@ -652,10 +652,26 @@ def _record_status_transition(
 def handle_onbatt(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     snap = deps.read_snapshot(ups.name)
     now = deps.now()
-    state.onbatt_since = now
-    state.shutdowns_sent = []
-    state.shutdowns_confirmed = []
-    state.shutdown_attempts = {}
+    # Only a NEW outage restarts the clock and the ledgers.
+    #
+    # This reset was unconditional, so a re-delivered ONBATT mid-outage set
+    # `onbatt_since` back to now — restarting the `min_on_battery_seconds` countdown
+    # from zero. That is not hypothetical here: NUT re-issues ONBATT when `nut-monitor`
+    # restarts, which a `nut-server` restart does, and this host has done exactly that
+    # mid-session. Repeated often enough, the 180s gate is never reached and mt and
+    # spark are never shut down for the whole outage.
+    #
+    # Clearing the ledgers had a second failure of its own: the debounced ONBATT arrives
+    # at T+15s (`AT ONBATT * START-TIMER onbatt_grace 15`) while the poll loop can reach
+    # the firing path at T+10s, so with `require_power_outage: false` the loop could fire,
+    # this handler could wipe the fire-once ledger, and the next tick could fire again.
+    # The ledger reset belongs on the TRANSITION, which is what this guard makes it.
+    if state.onbatt_since is None:
+        state.onbatt_since = now
+        state.shutdowns_sent = []
+        state.shutdowns_confirmed = []
+        state.shutdown_attempts = {}
+        state.ledger_cleared = True
     state.last_tick_notified = now  # delay first countdown by one cadence
     state.onbatt_notified = True  # this path pages now, so the poll loop won't re-page
     state.last_status = snap.status
@@ -681,6 +697,7 @@ def handle_online(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
     state.shutdowns_sent = []
     state.shutdowns_confirmed = []
     state.shutdown_attempts = {}
+    state.ledger_cleared = True
     state.last_tick_notified = None
     state.onbatt_notified = False
     state.lowbatt_notified = False
@@ -1508,6 +1525,7 @@ def handle_tick(ups: UpsConfig, state: UpsState, deps: Deps) -> None:
         state.shutdowns_sent = []
         state.shutdowns_confirmed = []
         state.shutdown_attempts = {}
+        state.ledger_cleared = True
         state.last_tick_notified = now
         _log_event(
             deps,

@@ -94,6 +94,25 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/state.py",
+        "            if not mine.ledger_cleared:",
+        "            if True:",
+        "state: the union resurrects a ledger this writer deliberately cleared — mt is "
+        "suppressed by the PREVIOUS outage's dedupe key and the grace is bypassed",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "    if state.onbatt_since is None:\n        state.onbatt_since = now\n"
+        "        state.shutdowns_sent = []\n        state.shutdowns_confirmed = []\n"
+        "        state.shutdown_attempts = {}\n        state.ledger_cleared = True\n"
+        "    state.last_tick_notified = now",
+        "    state.onbatt_since = now\n    state.shutdowns_sent = []\n"
+        "    state.shutdowns_confirmed = []\n    state.shutdown_attempts = {}\n"
+        "    state.ledger_cleared = True\n    state.last_tick_notified = now",
+        "events: a re-delivered ONBATT restarts the 180s countdown again — a upsmon "
+        "restart mid-outage means the gate is never reached",
+    ),
+    (
         "src/ups_orchestrator/events.py",
         "    if state.lowbatt_notified or not snap.low_battery:\n        return",
         "    if True:\n        return",

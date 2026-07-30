@@ -2601,3 +2601,36 @@ def test_returning_to_utility_power_rearms_the_low_battery_page() -> None:
     dispatch("tick", ups, state, deps)  # power returns
 
     assert state.lowbatt_notified is False
+
+
+# --- a re-delivered ONBATT must not restart the 180s countdown ---
+#
+# NUT re-issues ONBATT when nut-monitor restarts, which a nut-server restart does — and
+# this host has done exactly that mid-session. The reset was unconditional, so each
+# re-delivery set onbatt_since back to now. Repeated often enough, the gate is never
+# reached and mt and spark are never shut down for the whole outage.
+
+
+def test_a_redelivered_onbatt_does_not_restart_the_countdown() -> None:
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(onbatt_since=1000, shutdowns_sent=["mt"], shutdowns_confirmed=["mt"])
+    deps, _ = make_deps(FakeNotifier(), snap("OB"), now=1500)
+
+    dispatch("onbatt", ups, state, deps)
+
+    assert state.onbatt_since == 1000, "the countdown was restarted mid-outage"
+    assert state.shutdowns_sent == ["mt"], "the fire-once ledger was wiped mid-outage"
+    assert state.shutdowns_confirmed == ["mt"]
+
+
+def test_a_genuinely_new_outage_still_starts_the_clock() -> None:
+    """The guard must not disable the transition it is narrowing."""
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(onbatt_since=None, shutdowns_sent=["stale"])
+    deps, _ = make_deps(FakeNotifier(), snap("OB"), now=1500)
+
+    dispatch("onbatt", ups, state, deps)
+
+    assert state.onbatt_since == 1500
+    assert state.shutdowns_sent == [], "a new outage must start from a clean ledger"
+    assert state.ledger_cleared is True

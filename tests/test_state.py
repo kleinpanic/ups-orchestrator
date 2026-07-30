@@ -597,3 +597,64 @@ def test_alarm_latches_survive_another_writer(tmp_path: Path) -> None:
     reread = StateStore(path)
     assert reread.get("ups1").commbad_notified is True, "an unclosable alarm was created"
     assert reread.get("ups1").onbatt_notified is True
+
+
+def test_a_cleared_ledger_is_not_resurrected_by_another_writer(tmp_path: Path) -> None:
+    """The union only ever ADDS, so it could not express "this outage is over".
+
+    Sequence that produced it: LOWBATT's dispatcher loads a snapshot, then blocks ~16s
+    in a Discord POST against the switch the outage just killed. Power returns and the
+    watch loop clears the ledgers. The dispatcher then saves, the union re-adds the
+    entries it still held, and last-writer-wins restores onbatt_since. On the next
+    flicker the poll loop sees onbatt_since already set, skips the reset, and mt is
+    suppressed by a dedupe key from the PREVIOUS outage — while every other target's
+    grace is bypassed because the age is measured from the old start.
+    """
+    path = tmp_path / "state.json"
+
+    # The stale writer still holds the previous outage's ledger.
+    stale = StateStore(path)
+    stale.get("ups1").shutdowns_sent = ["mt"]
+    stale.get("ups1").shutdowns_confirmed = ["mt"]
+    stale.save()
+
+    # The watch loop deliberately clears it (power returned).
+    mine = StateStore(path)
+    st = mine.get("ups1")
+    st.shutdowns_sent = []
+    st.shutdowns_confirmed = []
+    st.ledger_cleared = True
+    mine._seen = None  # force the "someone else wrote" path
+    mine.save()
+
+    reread = StateStore(path)
+    assert reread.get("ups1").shutdowns_sent == [], "a cleared ledger came back"
+    assert reread.get("ups1").shutdowns_confirmed == []
+
+
+def test_a_writer_that_did_not_clear_still_unions(tmp_path: Path) -> None:
+    """The guard must not disable the union it is narrowing — T-02-24 still holds."""
+    path = tmp_path / "state.json"
+    other = StateStore(path)
+    other.get("ups1").shutdowns_sent = ["spark"]
+    other.save()
+
+    mine = StateStore(path)
+    mine.get("ups1").shutdowns_sent = ["mt"]  # no ledger_cleared
+    mine._seen = None
+    mine.save()
+
+    reread = StateStore(path)
+    assert sorted(reread.get("ups1").shutdowns_sent) == ["mt", "spark"]
+
+
+def test_the_transient_marker_is_never_persisted(tmp_path: Path) -> None:
+    """It is in-process signalling. Persisted, a later load would claim an authority
+    over another writer's ledger that it does not have."""
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.get("ups1").ledger_cleared = True
+    store.save()
+
+    assert "ledger_cleared" not in json.loads(path.read_text())["ups1"]
+    assert StateStore(path).get("ups1").ledger_cleared is False

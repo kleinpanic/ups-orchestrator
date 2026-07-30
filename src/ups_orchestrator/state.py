@@ -51,6 +51,11 @@ class UpsState:
     # restarting nut-monitor while a UPS is already OB LB consumes it and the CRITICAL
     # page never fires for that outage. The poll loop reads the flag every cycle.
     lowbatt_notified: bool = False
+    # TRANSIENT — set when THIS writer deliberately emptied the shutdown ledgers, and
+    # stripped before persisting (see StateStore.save). It tells _absorb_external_writes
+    # that an on-disk entry is stale rather than news, so the union cannot resurrect a
+    # ledger this writer just cleared. Never round-trips: from_dict does not read it.
+    ledger_cleared: bool = False
     # Targets whose transport returned rc 0. SEPARATE from shutdowns_sent, which means
     # ATTEMPTED and must keep meaning that: it is what releases the local-target hold
     # so a dead remote cannot strand this host (T-02-24). Using one list for both meant
@@ -97,6 +102,9 @@ class UpsState:
                 if isinstance(v, int) and not isinstance(v, bool)
             },
         )
+
+
+_TRANSIENT_FIELDS = frozenset({"ledger_cleared"})
 
 
 def _opt_int(value: object) -> int | None:
@@ -565,12 +573,22 @@ class StateStore:
             if mine is None:
                 self._states[name] = on_disk
                 continue
-            for sent in on_disk.shutdowns_sent:
-                if sent not in mine.shutdowns_sent:
-                    mine.shutdowns_sent.append(sent)
-            for done in on_disk.shutdowns_confirmed:
-                if done not in mine.shutdowns_confirmed:
-                    mine.shutdowns_confirmed.append(done)
+            # A union that only ever ADDS cannot express "this outage is over". Without
+            # this guard the sequence was: LOWBATT's dispatcher loads a snapshot, blocks
+            # ~16s in a Discord POST against the switch the outage just killed; power
+            # returns and the watch loop clears the ledgers; the dispatcher then saves,
+            # the union re-adds the entries it still held, and last-writer-wins restores
+            # onbatt_since. On the next flicker the poll loop sees onbatt_since already
+            # set, skips the reset, and mt is suppressed by a dedupe key from the PREVIOUS
+            # outage — while every other target's grace is bypassed because the age is
+            # measured from the old start. Two failures at once, both unsafe.
+            if not mine.ledger_cleared:
+                for sent in on_disk.shutdowns_sent:
+                    if sent not in mine.shutdowns_sent:
+                        mine.shutdowns_sent.append(sent)
+                for done in on_disk.shutdowns_confirmed:
+                    if done not in mine.shutdowns_confirmed:
+                        mine.shutdowns_confirmed.append(done)
             # Highest attempt count wins, so a retry budget another writer already spent
             # is not handed back by our stale copy.
             for name_, count in on_disk.shutdown_attempts.items():
@@ -588,7 +606,13 @@ class StateStore:
     def save(self) -> None:
         """Atomically persist all UPS states (write to temp, then replace)."""
         self._absorb_external_writes()
-        payload = {name: asdict(st) for name, st in self._states.items()}
+        # `ledger_cleared` is in-process signalling, not state. Persisting it would make
+        # a future load claim an authority over another writer's ledger that it does not
+        # have.
+        payload = {
+            name: {k: v for k, v in asdict(st).items() if k not in _TRANSIENT_FIELDS}
+            for name, st in self._states.items()
+        }
         self._seen = write_text_preserving_metadata(
             self.path, json.dumps(payload, indent=2, sort_keys=True) + "\n"
         )
