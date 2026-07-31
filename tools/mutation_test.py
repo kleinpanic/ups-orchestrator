@@ -94,6 +94,20 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/cli.py",
+        '        _sd_notify("WATCHDOG=1")',
+        "        pass  # mutated — no watchdog ping",
+        "cli: the watch loop stops pinging the systemd watchdog — a wedged poll loop "
+        "looks healthy forever again",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
+        "    if state.recent_loads_at is not None and now - state.recent_loads_at > max_age:",
+        "    if False:",
+        "events: a stale load window is compared again — a restart pages about a load "
+        "change that finished hours ago",
+    ),
+    (
         "src/ups_orchestrator/state.py",
         "            if not mine.ledger_cleared:",
         "            if True:",

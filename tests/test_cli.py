@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1625,3 +1626,59 @@ def test_a_real_disarm_still_pushes(monkeypatch) -> None:
     note = sent[0]
     assert "disarmed" in note.title  # names the disarm, not a notice count
     assert note.level is Level.CRITICAL
+
+
+# --- systemd could see this process EXIT but never see it WEDGE ---
+
+
+def test_sd_notify_is_a_noop_outside_systemd(monkeypatch) -> None:
+    """Running by hand, or under a systemd too old to set NOTIFY_SOCKET, must not fail."""
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    cli._sd_notify("READY=1")  # must not raise
+
+
+def test_sd_notify_never_raises_on_a_dead_socket(monkeypatch, tmp_path) -> None:
+    """A watchdog ping that cannot be sent must not be what takes the daemon down."""
+    monkeypatch.setenv("NOTIFY_SOCKET", str(tmp_path / "definitely-not-a-socket"))
+    cli._sd_notify("WATCHDOG=1")  # must not raise
+
+
+def test_sd_notify_sends_the_payload_to_the_socket(monkeypatch, tmp_path) -> None:
+    sock_path = tmp_path / "notify.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(str(sock_path))
+    server.settimeout(3)
+    try:
+        monkeypatch.setenv("NOTIFY_SOCKET", str(sock_path))
+        cli._sd_notify("WATCHDOG=1")
+        assert server.recv(64) == b"WATCHDOG=1"
+    finally:
+        server.close()
+
+
+def test_the_watch_loop_pings_only_after_a_completed_sweep(env_config, monkeypatch) -> None:
+    """The ping must mean "a full poll of every UPS finished", not "the process exists".
+
+    A ping on a timer or a background thread would keep reporting healthy while the loop
+    was wedged in a blocking serial read — which is the exact failure WatchdogSec is
+    being added to catch.
+    """
+    env_config.write_text(json.dumps({"poll_seconds": 5, "upses": {"ups1": {"label": "U1"}}}))
+    order: list[str] = []
+    monkeypatch.setattr(cli, "dispatch", lambda *_a, **_k: order.append("tick"))
+    monkeypatch.setattr(cli, "_sd_notify", lambda msg: order.append(msg))
+
+    slices = {"n": 0}
+
+    def fake_sleep(_secs: float) -> None:
+        slices["n"] += 1
+        if slices["n"] >= 6:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["watch"])
+
+    assert order[0] == "READY=1", order[:3]
+    assert order[1] == "tick", "READY must precede the first sweep"
+    assert order[2] == "WATCHDOG=1", "the ping must follow the sweep, not precede it"

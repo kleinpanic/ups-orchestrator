@@ -29,9 +29,20 @@ StartLimitBurst=5
 Description=ups-orchestrator poll loop (policy-gated shutdowns + countdown)
 
 [Service]
-Type=simple
 EnvironmentFile=/etc/ups-orchestrator.env
 ExecStart=/usr/local/bin/ups-orchestrator watch
+# Type=notify + WatchdogSec: systemd could previously see this process EXIT but never
+# see it WEDGE. Restart=always covers a crash; nothing covered a poll loop stuck in a
+# blocking read on a serial line or a hung subprocess — and a wedged loop stops polling
+# every UPS, so during an outage it fires nothing and reports nothing while the unit
+# still shows "active (running)".
+#
+# The ping is sent after each COMPLETED sweep of every UPS, so the watchdog measures the
+# property that matters rather than mere process liveness. 120s is four times the default
+# poll interval, which tolerates a slow poll on a loaded Pi without tolerating a wedge.
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
 Restart=always
 RestartSec=5
 

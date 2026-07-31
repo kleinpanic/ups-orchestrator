@@ -190,6 +190,34 @@ def _maintenance_path() -> Path:
     return _BASE / "maintenance.json"
 
 
+def _sd_notify(message: str) -> None:
+    """Send one sd_notify datagram, or do nothing outside systemd.
+
+    Stdlib only — no python-systemd dependency for eight lines of protocol.
+
+    This exists so ``WatchdogSec`` can be set on the watch unit. Before it, systemd could
+    see the process EXIT but not the process WEDGE: `Restart=always` handles a crash, and
+    nothing at all handled a poll loop stuck in a blocking read on a serial line or a
+    hung subprocess. A wedged loop stops polling every UPS, so during an outage it fires
+    nothing and reports nothing while systemd shows the unit healthy.
+
+    An abstract socket (leading NUL, Linux-specific) is what systemd normally hands out;
+    the path form is handled too. Failures are swallowed by design: a watchdog ping that
+    cannot be sent must never be the thing that takes the daemon down.
+    """
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as sock:
+            sock.connect(addr)
+            sock.sendall(message.encode())
+    except OSError:
+        pass
+
+
 def _config_mtime(path: Path) -> float | None:
     """``st_mtime`` of the config, or ``None`` if it cannot be stat'd.
 
@@ -419,6 +447,10 @@ def _cmd_watch() -> int:
     signal.signal(signal.SIGINT, _sig)
 
     LOG.info("watch: polling %d UPS(es) every %ds", len(cfg.upses), interval)
+    # Type=notify: tell systemd we are up only once the config loaded and the first
+    # poll is about to run, so a unit that comes up and immediately dies on a bad
+    # config is not reported as having started successfully.
+    _sd_notify("READY=1")
     cfg_path = _config_path()
     cfg_mtime = _config_mtime(cfg_path)
     last_degraded = cfg.degraded
@@ -483,6 +515,10 @@ def _cmd_watch() -> int:
             store.save()
         except OSError as exc:
             LOG.warning("Failed to persist state: %s", exc)
+        # Deliberately AFTER the sweep, not on a timer: the ping means "a full poll of
+        # every UPS completed", which is the property worth watchdogging. A ping from a
+        # background thread would keep saying "alive" while the loop was wedged.
+        _sd_notify("WATCHDOG=1")
         # Sleep in short slices so SIGTERM is honoured promptly.
         for _ in range(interval):
             if stop:
