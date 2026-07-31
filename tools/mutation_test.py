@@ -95,6 +95,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "src/ups_orchestrator/events.py",
+        "                another_declaration_fires=True,",
+        "                another_declaration_fires=False,",
+        "events: a name collision claims the box stays up again — it is actually shut "
+        "down by the OTHER declaration's command, which the alert then never mentions",
+    ),
+    (
+        "src/ups_orchestrator/events.py",
         "    if Threshold.UNKNOWN in (battery, runtime):\n        return False, reasons",
         "    if False:\n        return False, reasons",
         "events: a configured-but-unreadable threshold silently degrades the AND to the "

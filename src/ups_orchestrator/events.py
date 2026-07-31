@@ -1106,6 +1106,8 @@ def _report_unprojectable(
     deps: Deps | None,
     reason: str,
     state: UpsState | None = None,
+    *,
+    another_declaration_fires: bool = False,
 ) -> None:
     """Report a machine this UPS considered and then did NOT project.
 
@@ -1145,8 +1147,28 @@ def _report_unprojectable(
     _notify(
         deps,
         Notification(
-            title=f"❗ {ups.label} — {machine.name} will NOT be shut down",
-            body=f"{machine.name} was not projected onto a shutdown target: {reason}",
+            title=(
+                f"❗ {ups.label} — {machine.name} is shut down by a DIFFERENT declaration"
+                if another_declaration_fires
+                else f"❗ {ups.label} — {machine.name} will NOT be shut down"
+            ),
+            # "will NOT be shut down" is false for a NAME COLLISION, and false in the
+            # direction that hides the real risk. `seen` is seeded from this UPS's
+            # ENABLED legacy shutdown_targets, so when an enrolled machine collides with
+            # one, the box IS still shut down — by the older declaration's command and
+            # transport, not the one the operator just enrolled. Telling them the machine
+            # will never be shut down sends them to fix the opposite problem.
+            body=(
+                (
+                    f"{machine.name} was NOT projected from its monitored_machines "
+                    f"record, but another enabled declaration of the same name on this "
+                    f"UPS still fires — so the box IS shut down, by that declaration's "
+                    f"command and transport rather than this record's. Reason this "
+                    f"record was dropped: {reason}"
+                )
+                if another_declaration_fires
+                else f"{machine.name} was not projected onto a shutdown target: {reason}"
+            ),
             level=Level.CRITICAL,
         ),
     )
@@ -1227,9 +1249,11 @@ def _machine_targets(
                 ups,
                 m,
                 deps,
-                "it has a duplicate shutdown target name on this UPS; rename it or that "
-                "machine will never be shut down",
+                "a declaration of this name on this UPS was already projected or is an "
+                "enabled legacy shutdown_target; rename one of them so the record you "
+                "edit is the one that fires",
                 state=state,
+                another_declaration_fires=True,
             )
             continue
         seen.add(key)

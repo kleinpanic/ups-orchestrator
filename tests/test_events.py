@@ -1075,7 +1075,7 @@ def test_machine_targets_duplicate_name_not_swallowed(caplog) -> None:
         targets = _project(make_ups("ups1"), (_mt(), _mt()))
 
     assert [t.name for t in targets] == ["mt"]
-    assert "mt" in caplog.text and "duplicate" in caplog.text.lower()
+    assert "mt" in caplog.text and "already projected" in caplog.text.lower()
 
 
 def test_machine_targets_ignore_disabled_legacy_same_name() -> None:
@@ -1227,8 +1227,10 @@ def test_duplicate_projected_name_does_not_swallow_other_machine() -> None:
     assert calls == ["mt", "spark"]
     blocked = [data for ev, data in seen if ev == "shutdown_target_blocked"]
     assert [d["target"] for d in blocked] == ["mt"]
-    assert "duplicate" in str(blocked[0]["reason"]).lower()
-    assert any("mt" in note.body and "duplicate" in note.body.lower() for note in notifier.sent)
+    assert "already projected" in str(blocked[0]["reason"]).lower()
+    # The alert must say the box IS still shut down, by the other declaration — the
+    # old text claimed the opposite and sent the operator to fix the wrong problem.
+    assert any("mt" in note.body and "the box IS shut down" in note.body for note in notifier.sent)
 
 
 def test_projected_target_blocked_when_policy_disabled() -> None:
@@ -1488,7 +1490,7 @@ def test_machine_targets_without_deps_reports_through_the_log_alone(caplog) -> N
         assert [t.name for t in _project(make_ups("ups1"), (_mt(), _mt()))] == ["mt"]
         assert _project(make_ups("ups1"), (_mt(baud=None),)) == []
 
-    assert "duplicate" in caplog.text.lower()
+    assert "already projected" in caplog.text.lower()
     assert "baud" in caplog.text.lower()
 
 
@@ -2743,3 +2745,26 @@ def test_both_configured_thresholds_must_be_met() -> None:
 def test_no_configured_threshold_never_fires() -> None:
     group = _group(battery_below=None, runtime_below=None)
     assert events_mod._close_to_empty(group, snap("OB", charge=1, runtime=1))[0] is False
+
+
+def test_a_name_collision_does_not_claim_the_box_stays_up() -> None:
+    """ "will NOT be shut down" was false, and false in the dangerous direction.
+
+    `seen` is seeded from this UPS's ENABLED legacy shutdown_targets, so a collision
+    drops the machine record while the LEGACY target still fires — the box goes down via
+    the older declaration's command and transport. Telling the operator the machine will
+    never be shut down sends them to fix the opposite problem, and leaves the real risk
+    (an unexpected command running on that box) unmentioned.
+    """
+    legacy = ShutdownTarget(name="mt", kind="remote", enabled=True, host="mt", cmd="/sbin/halt")
+    ups = make_ups("ups1", targets=(legacy,), shutdown_policy=shutdown_policy(enabled=False))
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, _low(), countdown_every=0, monitored_machines=(_mt(),))
+
+    list(events_mod._machine_targets(ups, deps.monitored_machines, deps))
+
+    pages = [n for n in notifier.sent if "mt" in n.title]
+    assert pages, [n.title for n in notifier.sent]
+    assert "will NOT be shut down" not in pages[0].title, pages[0].title
+    assert "DIFFERENT declaration" in pages[0].title
+    assert "the box IS shut down" in pages[0].body
