@@ -848,31 +848,57 @@ def _outage_age(state: UpsState, deps: Deps) -> int | None:
     return age
 
 
+class Threshold(Enum):
+    """Why a threshold did or did not contribute to the close-to-empty decision.
+
+    DISABLED and UNKNOWN were both ``None`` before, and they are opposites. "The
+    operator turned this gate off" means the OTHER gate decides alone, which is correct.
+    "The UPS stopped reporting the value this gate reads" means we cannot evaluate a gate
+    the operator DID configure — and silently falling back to the other one turns a
+    two-condition AND into a single condition without saying so.
+
+    Latent on the current config, which leaves ``runtime_below`` unset. It becomes live
+    the moment ``runtime_below`` is restored as the real gate: a UPS that stops reporting
+    ``battery.runtime`` would quietly drop back to ``battery_below``, which on this
+    deployment is 100 and therefore always true.
+    """
+
+    DUE = "due"
+    NOT_DUE = "not_due"
+    DISABLED = "disabled"
+    UNKNOWN = "unknown"
+
+
 def _threshold_status(
     label: str, value: int | None, threshold: int | None, render: Callable[[int], str]
-) -> tuple[bool | None, str]:
+) -> tuple[Threshold, str]:
     if threshold is None:
-        return None, f"{label} threshold disabled"
+        return Threshold.DISABLED, f"{label} threshold disabled"
     if value is None:
-        return None, f"{label} unknown"
-    due = value <= threshold
-    return due, f"{label} {render(value)} <= {render(threshold)}"
+        return Threshold.UNKNOWN, f"{label} unknown but its threshold is set"
+    if value <= threshold:
+        return Threshold.DUE, f"{label} {render(value)} <= {render(threshold)}"
+    return Threshold.NOT_DUE, f"{label} {render(value)} <= {render(threshold)}"
 
 
 def _close_to_empty(group: ShutdownGroupPolicy, snap: UpsSnapshot) -> tuple[bool, str]:
-    battery_due, battery_reason = _threshold_status(
+    battery, battery_reason = _threshold_status(
         "battery", snap.charge, group.battery_below, lambda pct: f"{pct}%"
     )
-    runtime_due, runtime_reason = _threshold_status(
+    runtime, runtime_reason = _threshold_status(
         "runtime", snap.runtime_seconds, group.runtime_below, fmt_duration
     )
-    known = [result for result in (battery_due, runtime_due) if result is not None]
-    reasons = [battery_reason, runtime_reason]
-    if not known:
-        return False, "; ".join(reasons)
-    if battery_due is not None and runtime_due is not None:
-        return battery_due and runtime_due, "; ".join(reasons)
-    return bool(known[0]), "; ".join(reasons)
+    reasons = "; ".join((battery_reason, runtime_reason))
+    # Fail CLOSED on a configured-but-unreadable threshold. This program exists to keep
+    # the small devices up; a shutdown fired on a gate we could not actually evaluate is
+    # an unplanned outage for a machine that did not need one, and the countdown embeds
+    # make a missed shutdown visible in a way a spurious one never is.
+    if Threshold.UNKNOWN in (battery, runtime):
+        return False, reasons
+    verdicts = [v for v in (battery, runtime) if v is not Threshold.DISABLED]
+    if not verdicts:
+        return False, reasons
+    return all(v is Threshold.DUE for v in verdicts), reasons
 
 
 def _target_should_fire(

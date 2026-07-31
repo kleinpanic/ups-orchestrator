@@ -2695,3 +2695,51 @@ def test_a_shutdown_failure_pages_even_when_notify_is_off() -> None:
     assert any("shutdown FAILED" in n.title for n in notifier.sent), [
         n.title for n in notifier.sent
     ]
+
+
+# --- "threshold disabled" and "value unknown" are opposites, not the same thing ---
+
+
+def _group(**kw):  # noqa: ANN202
+    from ups_orchestrator.config import ShutdownGroupPolicy
+
+    return ShutdownGroupPolicy(**{"enabled": True, **kw})
+
+
+def test_a_disabled_threshold_lets_the_other_one_decide() -> None:
+    """The operator turned this gate off, so the other decides alone. Unchanged."""
+    group = _group(battery_below=20, runtime_below=None)
+    due, _why = events_mod._close_to_empty(group, snap("OB", charge=10, runtime=99999))
+    assert due is True
+
+
+def test_a_configured_but_unreadable_threshold_fails_closed() -> None:
+    """The UPS stopped reporting the value a CONFIGURED gate reads.
+
+    Both cases used to return None, so this silently fell back to the other gate —
+    turning a two-condition AND into one condition with nothing said. On this deployment
+    that fallback would be `battery_below: 100`, i.e. always true.
+    """
+    group = _group(battery_below=100, runtime_below=300)
+    import dataclasses as _dc
+
+    # Start from the shared helper so every other field keeps its usual value; only the
+    # runtime is blanked, which is the case under test.
+    snapshot = _dc.replace(snap("OB", charge=90), runtime_seconds=None)
+
+    due, why = events_mod._close_to_empty(group, snapshot)
+
+    assert due is False, "fired on a gate that could not be evaluated"
+    assert "unknown but its threshold is set" in why
+
+
+def test_both_configured_thresholds_must_be_met() -> None:
+    group = _group(battery_below=20, runtime_below=300)
+    assert events_mod._close_to_empty(group, snap("OB", charge=10, runtime=200))[0] is True
+    assert events_mod._close_to_empty(group, snap("OB", charge=10, runtime=9999))[0] is False
+    assert events_mod._close_to_empty(group, snap("OB", charge=90, runtime=200))[0] is False
+
+
+def test_no_configured_threshold_never_fires() -> None:
+    group = _group(battery_below=None, runtime_below=None)
+    assert events_mod._close_to_empty(group, snap("OB", charge=1, runtime=1))[0] is False

@@ -94,6 +94,13 @@ def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
 # (file, original_substring, mutated_substring, description)
 MUTATIONS: list[tuple[str, str, str, str]] = [
     (
+        "src/ups_orchestrator/events.py",
+        "    if Threshold.UNKNOWN in (battery, runtime):\n        return False, reasons",
+        "    if False:\n        return False, reasons",
+        "events: a configured-but-unreadable threshold silently degrades the AND to the "
+        "other gate — on this config that gate is battery_below 100, i.e. always true",
+    ),
+    (
         "src/ups_orchestrator/cli.py",
         '        _sd_notify("WATCHDOG=1")',
         "        pass  # mutated — no watchdog ping",
