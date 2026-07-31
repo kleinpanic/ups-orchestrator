@@ -56,6 +56,16 @@ class UpsState:
     # that an on-disk entry is stale rather than news, so the union cannot resurrect a
     # ledger this writer just cleared. Never round-trips: from_dict does not read it.
     ledger_cleared: bool = False
+    # Cooldown map for the "will NOT be shut down" page, keyed by machine name. It used
+    # to live on `Deps`, which `_build_deps` rebuilds on every config reload and every
+    # restart — so the cooldown for a PERMANENT config fact (a duplicate machine name)
+    # was discarded and re-paged CRITICAL every 10s poll after any edit. `_check_load_step`
+    # already keeps its cooldown here; this one should always have.
+    unprojectable_notified: dict[str, int] = field(default_factory=dict)
+    # When `recent_loads` was last appended to. Without it, a daemon stopped at 22:00 with
+    # load 60% and started at 08:00 at 30% compared against a TEN HOUR OLD peak and paged
+    # "a device may have lost power" about the current steady state.
+    recent_loads_at: int | None = None
     # Targets whose transport returned rc 0. SEPARATE from shutdowns_sent, which means
     # ATTEMPTED and must keep meaning that: it is what releases the local-target hold
     # so a dead remote cannot strand this host (T-02-24). Using one list for both meant
@@ -70,6 +80,7 @@ class UpsState:
         raw_sent = data.get("shutdowns_sent", [])
         raw_confirmed = data.get("shutdowns_confirmed", [])
         raw_attempts = data.get("shutdown_attempts", {})
+        raw_unproj = data.get("unprojectable_notified", {})
         sent = [str(x) for x in raw_sent] if isinstance(raw_sent, list) else []
         raw_recent = data.get("recent_loads", [])
         recent = (
@@ -93,6 +104,12 @@ class UpsState:
             commbad_notified=bool(data.get("commbad_notified", False)),
             unreadable_polls=_opt_int(data.get("unreadable_polls")) or 0,
             lowbatt_notified=bool(data.get("lowbatt_notified", False)),
+            recent_loads_at=_opt_int(data.get("recent_loads_at")),
+            unprojectable_notified={
+                str(k): int(v)
+                for k, v in (raw_unproj.items() if isinstance(raw_unproj, dict) else ())
+                if isinstance(v, int) and not isinstance(v, bool)
+            },
             shutdowns_confirmed=[str(x) for x in raw_confirmed]
             if isinstance(raw_confirmed, list)
             else [],

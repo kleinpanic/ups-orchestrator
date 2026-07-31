@@ -502,6 +502,10 @@ class Deps:
     onbatt_notify_grace: int = 20
     event_log: EventLogger = _noop_event_log
     load_step: LoadStepPolicy = field(default_factory=LoadStepPolicy)
+    # The configured poll cadence. Used to decide when a persisted load window is too
+    # old to compare against — the window is a count of polls, so its age in seconds is
+    # only knowable here.
+    poll_seconds: int = 30
     sample_path: Path | None = None  # recorder JSONL, for draw-history sparklines
     # Enrolled machines, projected onto ephemeral shutdown targets by
     # ``_machine_targets``. Empty by default so a handler built without config
@@ -930,26 +934,40 @@ def _notify_shutdown_attempt(
 def _notify_shutdown_result(
     ups: UpsConfig, deps: Deps, target: ShutdownTarget, rc: int, err: str, where: str
 ) -> None:
-    if not ups.shutdown_policy.notify:
-        return
-    if rc == 0:
-        _notify(
-            deps,
-            Notification(
-                title=f"🛑 {ups.label} — shutdown sent to {target.name}",
-                body=f"Graceful shutdown issued to {where}.",
-                level=Level.CRITICAL,
-            ),
-        )
-    else:
+    """Report the outcome. A FAILURE is not gated by ``notify``.
+
+    ``shutdown_policy.notify`` exists to turn down the routine attempt/success chatter.
+    Gating the FAILURE on it too meant an operator quieting that chatter also silently
+    disabled the only page for "we tried to shut mt down and it did not work" — the one
+    outcome on this path that always needs a human. Note `_report_unprojectable` already
+    ignores `notify` entirely for the same reason, so the two were inconsistent.
+    """
+    if rc != 0:
         _notify(
             deps,
             Notification(
                 title=f"❗ {ups.label} — shutdown FAILED for {target.name}",
-                body=f"rc={rc}; stderr={err or '(none)'}",
+                body=(
+                    f"The shutdown command to {where} returned {rc}."
+                    + (f"\n```text\n{err[:500]}\n```" if err else "")
+                    + "\n\nThis is reported regardless of `shutdown_policy.notify`, "
+                    "which only silences routine attempt and success messages."
+                ),
                 level=Level.CRITICAL,
             ),
         )
+        return
+    # Only the success path remains: rc != 0 returned above.
+    if not ups.shutdown_policy.notify:
+        return
+    _notify(
+        deps,
+        Notification(
+            title=f"🛑 {ups.label} — shutdown sent to {target.name}",
+            body=f"Graceful shutdown issued to {where}.",
+            level=Level.CRITICAL,
+        ),
+    )
 
 
 def _fire_target(
@@ -1057,7 +1075,11 @@ def _may_attempt(state: UpsState, name: str) -> bool:
 
 
 def _report_unprojectable(
-    ups: UpsConfig, machine: MonitoredMachine, deps: Deps | None, reason: str
+    ups: UpsConfig,
+    machine: MonitoredMachine,
+    deps: Deps | None,
+    reason: str,
+    state: UpsState | None = None,
 ) -> None:
     """Report a machine this UPS considered and then did NOT project.
 
@@ -1081,12 +1103,19 @@ def _report_unprojectable(
     # LO-02: the event line is written every time (it is the audit trail); the PAGE is
     # rate-limited, exactly as `_check_load_step` does it. This path is re-reached on
     # every poll for the whole outage.
+    # The cooldown lives in PERSISTED state when one is available, and only falls back
+    # to the Deps-scoped map for the callers that have no state (the CLI preview, tests).
+    # `_build_deps` runs on every config reload and every restart, so a Deps-scoped
+    # cooldown was discarded each time — and the condition it rate-limits (a duplicate
+    # machine name) is a permanent config fact, not an event. The result was a CRITICAL
+    # page every poll after any unrelated config edit.
     key = f"{ups.name}/{machine.name}"
-    last = deps.unprojectable_notified.get(key)
+    cooldowns = state.unprojectable_notified if state is not None else deps.unprojectable_notified
+    last = cooldowns.get(key)
     now = deps.now()
     if last is not None and now - last < deps.unprojectable_cooldown:
         return
-    deps.unprojectable_notified[key] = now
+    cooldowns[key] = now
     _notify(
         deps,
         Notification(
@@ -1098,7 +1127,10 @@ def _report_unprojectable(
 
 
 def _machine_targets(
-    ups: UpsConfig, machines: Sequence[MonitoredMachine], deps: Deps | None = None
+    ups: UpsConfig,
+    machines: Sequence[MonitoredMachine],
+    deps: Deps | None = None,
+    state: UpsState | None = None,
 ) -> Iterator[ShutdownTarget]:
     """Project this UPS's push-managed machines onto ephemeral shutdown targets.
 
@@ -1150,6 +1182,7 @@ def _machine_targets(
                     deps,
                     "its declared serial_baud could not be parsed; declare a positive "
                     "integer serial_baud (must match the far end's getty rate)",
+                    state=state,
                 )
                 continue
             target = ShutdownTarget(
@@ -1170,6 +1203,7 @@ def _machine_targets(
                 deps,
                 "it has a duplicate shutdown target name on this UPS; rename it or that "
                 "machine will never be shut down",
+                state=state,
             )
             continue
         seen.add(key)
@@ -1178,7 +1212,7 @@ def _machine_targets(
 
 def _run_shutdown_targets(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnapshot) -> None:
     """Fire due targets — remotes first, locals only once all remotes are sent."""
-    projected = _machine_targets(ups, deps.monitored_machines, deps)
+    projected = _machine_targets(ups, deps.monitored_machines, deps, state)
     enabled = [t for t in (*ups.shutdown_targets, *projected) if t.effective_enabled]
     # Serial is network-independent; ssh dies with the switch. Fire serial first so a
     # collapsing network can't strand a shutdown. The sort is stable, so declared
@@ -1285,8 +1319,25 @@ def _check_load_step(ups: UpsConfig, state: UpsState, deps: Deps, snap: UpsSnaps
     if load is None:
         return
     policy = ups.load_step if ups.load_step is not None else deps.load_step
+    now = deps.now()
     window = list(state.recent_loads)
+    # Drop a window that is older than the span it claims to describe. `recent_loads`
+    # carried no timestamps, so a daemon stopped at 22:00 with load 60% and started at
+    # 08:00 at 30% compared against a TEN HOUR OLD peak and paged "a device on this UPS
+    # may have lost power" — about the current steady state, ten hours after the change.
+    # The comparison is only meaningful across consecutive polls.
+    max_age = max(1, policy.window_polls) * max(1, deps.poll_seconds) * 2
+    if state.recent_loads_at is not None and now - state.recent_loads_at > max_age:
+        LOG.info(
+            "%s: discarding a %ds-old load window (max %ds) rather than comparing "
+            "against a stale peak",
+            ups.name,
+            now - state.recent_loads_at,
+            max_age,
+        )
+        window = []
     state.recent_loads = (window + [load])[-max(1, policy.window_polls) :]
+    state.recent_loads_at = now
     if not policy.enabled or not window:
         return
     peak = max(window)

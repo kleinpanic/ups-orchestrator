@@ -249,6 +249,7 @@ def _build_deps(cfg: Config, *, dry_run: bool = False) -> Deps:
         )
 
     return Deps(
+        poll_seconds=cfg.poll_seconds,
         notifier=notifier,
         countdown_every=cfg.countdown_every_seconds,
         onbatt_notify_grace=cfg.onbatt_notify_grace_seconds,

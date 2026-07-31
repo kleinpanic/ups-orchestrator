@@ -2634,3 +2634,64 @@ def test_a_genuinely_new_outage_still_starts_the_clock() -> None:
     assert state.onbatt_since == 1500
     assert state.shutdowns_sent == [], "a new outage must start from a clean ledger"
     assert state.ledger_cleared is True
+
+
+# --- alerts about STANDING conditions must not re-page on every restart ---
+
+
+def test_a_stale_load_window_is_discarded_rather_than_compared() -> None:
+    """`recent_loads` carried no timestamps.
+
+    A daemon stopped at 22:00 with load 60% and started at 08:00 at 30% compared the new
+    reading against a TEN HOUR OLD peak and paged "a device on this UPS may have lost
+    power" — about the current steady state, ten hours after the change. The comparison
+    is only meaningful across consecutive polls.
+    """
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(recent_loads=[60, 60, 60], recent_loads_at=1000)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL", load=30), now=1000 + 36_000, countdown_every=0)
+
+    dispatch("tick", ups, state, deps)
+
+    assert not any("load dropped" in n.title for n in notifier.sent), [
+        n.title for n in notifier.sent
+    ]
+
+
+def test_a_fresh_load_window_still_detects_a_real_drop() -> None:
+    """The age bound must not disable the detector it is narrowing."""
+    ups = make_ups("ups1", shutdown_policy=shutdown_policy(enabled=False))
+    state = UpsState(recent_loads=[60, 60, 60], recent_loads_at=1000)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, snap("OL", load=30), now=1030, countdown_every=0)
+
+    dispatch("tick", ups, state, deps)
+
+    assert any("load dropped" in n.title for n in notifier.sent)
+
+
+def test_a_shutdown_failure_pages_even_when_notify_is_off() -> None:
+    """`notify: false` silences routine chatter, not "we tried and it did not work".
+
+    Gating the failure on the same flag meant an operator turning down attempt noise
+    also disabled the only page for a shutdown that did not happen — the one outcome on
+    this path that always needs a human. `_report_unprojectable` already ignored the
+    flag, so the two were inconsistent.
+    """
+    import dataclasses
+
+    ups = make_ups(
+        "ups1",
+        shutdown_policy=dataclasses.replace(shutdown_policy(), notify=False),
+        targets=(_serial_target(baud=115200),),
+    )
+    state = UpsState(onbatt_since=1, onbatt_notified=True)
+    notifier = FakeNotifier()
+    deps, _ = make_deps(notifier, _low(), now=1000, serial_rc=1, countdown_every=0)
+
+    dispatch("tick", ups, state, deps)
+
+    assert any("shutdown FAILED" in n.title for n in notifier.sent), [
+        n.title for n in notifier.sent
+    ]
