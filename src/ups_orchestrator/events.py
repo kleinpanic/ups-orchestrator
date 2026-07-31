@@ -889,12 +889,16 @@ def _close_to_empty(group: ShutdownGroupPolicy, snap: UpsSnapshot) -> tuple[bool
         "runtime", snap.runtime_seconds, group.runtime_below, fmt_duration
     )
     reasons = "; ".join((battery_reason, runtime_reason))
-    # Fail CLOSED on a configured-but-unreadable threshold. This program exists to keep
-    # the small devices up; a shutdown fired on a gate we could not actually evaluate is
-    # an unplanned outage for a machine that did not need one, and the countdown embeds
-    # make a missed shutdown visible in a way a spurious one never is.
-    if Threshold.UNKNOWN in (battery, runtime):
-        return False, reasons
+    # DISABLED is dropped, so the other gate decides alone — that is the operator turning
+    # a gate off. UNKNOWN is KEPT, so `all(... is DUE)` is False whenever a CONFIGURED
+    # threshold could not be read: fail closed. This program exists to keep the small
+    # devices up, and a shutdown fired on a gate we could not evaluate is an unplanned
+    # outage for a machine that did not need one.
+    #
+    # An earlier version had an explicit `if UNKNOWN in (...): return False` above this.
+    # A surviving mutant proved it was dead code — removing it changed no behaviour and
+    # no test — because the `all()` below already produces exactly that answer. Kept as
+    # one expression rather than two paths that must agree.
     verdicts = [v for v in (battery, runtime) if v is not Threshold.DISABLED]
     if not verdicts:
         return False, reasons

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from ups_orchestrator import state as state_mod
-from ups_orchestrator.state import StateStore
+from ups_orchestrator.state import StateStore, UpsState
 
 
 def test_save_fsyncs_before_replace(monkeypatch, tmp_path) -> None:
@@ -660,3 +660,25 @@ def test_the_transient_marker_is_never_persisted(tmp_path: Path) -> None:
 
     assert "ledger_cleared" not in json.loads(path.read_text())["ups1"]
     assert StateStore(path).get("ups1").ledger_cleared is False
+
+
+def test_a_bool_in_state_json_does_not_become_a_timestamp() -> None:
+    """`true` is an int subclass, so it silently loaded as onbatt_since=1.
+
+    That makes the outage age ~1.8e9 seconds, so min_on_battery_seconds is satisfied
+    instantly and every target fires the moment the UPS goes on battery — the 3-minute
+    grace, which exists so a sag cannot shut machines down, skipped entirely.
+    """
+    st = UpsState.from_dict({"onbatt_since": True, "last_tick_notified": False})
+    assert st.onbatt_since is None
+    assert st.last_tick_notified is None
+
+
+def test_non_finite_numbers_in_state_json_do_not_crash_the_daemon() -> None:
+    """json.loads accepts the bare NaN/Infinity tokens; int() on either raises.
+
+    _read_states caught only OSError and JSONDecodeError, so one such byte took down the
+    watch loop AND every NUT event handler, crash-looping forever at RestartSec=5.
+    """
+    assert UpsState.from_dict({"onbatt_since": float("nan")}).onbatt_since is None
+    assert UpsState.from_dict({"onbatt_since": float("inf")}).onbatt_since is None

@@ -102,10 +102,10 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/ups_orchestrator/events.py",
-        "    if Threshold.UNKNOWN in (battery, runtime):\n        return False, reasons",
-        "    if False:\n        return False, reasons",
-        "events: a configured-but-unreadable threshold silently degrades the AND to the "
-        "other gate — on this config that gate is battery_below 100, i.e. always true",
+        "    verdicts = [v for v in (battery, runtime) if v is not Threshold.DISABLED]",
+        "    verdicts = [v for v in (battery, runtime) if v is Threshold.DUE]",
+        "events: UNKNOWN is dropped from the fold like DISABLED — a configured but "
+        "unreadable threshold silently stops constraining the shutdown",
     ),
     (
         "src/ups_orchestrator/cli.py",
