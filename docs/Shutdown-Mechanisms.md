@@ -98,6 +98,26 @@ block the local target — only a push that has not yet been *attempted* does �
 so a hung or unreachable machine slows the watcher's own shutdown by its
 timeout, but can never prevent it.
 
+## A failed shutdown is retried
+
+A transport that returns non-zero is **not** treated as a completed shutdown. Each
+target gets up to three attempts per outage, and only a return code of 0 marks it done.
+
+This distinction is load-bearing. The ledger that releases the local-target hold means
+ATTEMPTED — it exists so a dead remote cannot strand the host running this program.
+Using that same ledger as the fire-once key gave every machine exactly one attempt per
+outage: for an `ssh` target that is a single ~20 s window (`ConnectTimeout=10`), and on
+a deployment where the LAN runs off the shortest-runtime UPS, that is precisely the
+window most likely to fail transiently. Failing it once meant the machine stayed up for
+the whole outage while still drawing from the battery.
+
+The budget is what keeps the original intent — a box that cannot be reached must not be
+hammered on every poll for the rest of the outage.
+
+A **failure always pages**, regardless of `shutdown_policy.notify`. That flag silences
+routine attempt and success messages; "we tried to shut this machine down and it did not
+work" is the one outcome on this path that always needs a human.
+
 ## What the SSH path actually does
 
 `_default_ssh_shutdown` runs, per target:

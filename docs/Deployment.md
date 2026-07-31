@@ -316,10 +316,38 @@ This installs:
     until somebody restarted the unit.
 
     The loop also **closes a `COMMUNICATION LOST` alert itself** once the UPS reads
-    again. NUT cannot always do it: `upsmon` fires `COMMOK` only on a lost→ok
-    transition it observed, so restarting `nut-monitor` (which a `nut-server`
-    restart does) leaves the alarm permanently open. The poll loop reads every UPS
-    every cycle, so it sees the recovery directly.
+    again, and **opens one** after three consecutive unreadable polls. NUT cannot be
+    relied on for either: `upsmon` fires `COMMOK` only on a lost→ok transition it
+    observed, so restarting `nut-monitor` (which a `nut-server` restart does) leaves
+    the alarm permanently open — and `upsmon` reaching `upsd` is a different code
+    path from *this program* reaching `upsd`, so there are states where upsmon is
+    content and every reading here is blank. The same backstop exists for **LOW
+    BATTERY**, for the same reason.
+
+    It is also **watchdogged**. The unit is `Type=notify` with `WatchdogSec=120`,
+    and the ping is sent after each *completed* sweep of every UPS — not on a timer,
+    because a timer would keep reporting healthy while the loop was wedged in a
+    blocking serial read. Before this, systemd could see the process exit but never
+    see it hang, and a hung loop polls nothing while still showing `active (running)`.
+
+### When the orchestrator itself dies
+
+`ups-orchestrator-alert@.service` is an `OnFailure=` handler that posts straight to
+the Discord webhook. It reads the webhook from the env file and shells out to `curl`
+— no venv, no package import, no config read — because the config is the most likely
+thing to be broken when it runs.
+
+It exists because the orchestrator cannot report its own death: an unloadable config
+makes the watch loop and every NUT event handler exit before a notifier is ever
+constructed, so a crash-loop is otherwise completely silent and the next real outage
+produces no alerts and no shutdowns.
+
+`StartLimitIntervalSec=300` / `StartLimitBurst=5` are what make that reachable. They
+live in `[Unit]`, not `[Service]` — systemd silently ignores them in `[Service]` and
+keeps its 10s default, which at `RestartSec=5` can never trip, so the unit would loop
+in `activating` forever and `OnFailure=` would never fire.
+
+One page per unit per hour; the journal line is written every time regardless.
 - `ups-orchestrator-recorder.service`: one-second UPS telemetry samples for
   power-loss forensics. It retains twenty 50 MB historical segments plus the
   active file (roughly two weeks at the live three-UPS record size) and records
