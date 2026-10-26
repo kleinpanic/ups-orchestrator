@@ -2590,8 +2590,37 @@ def test_non_finite_numbers_degrade_across_every_int_field(tmp_path: Path) -> No
     assert cfg.onbatt_notify_grace_seconds == 20
     # Each falls back to that field's OWN default, not to a shared zero.
     assert cfg.shutdown_policy.min_on_battery_seconds == 120
-    assert cfg.shutdown_policy.external.battery_below is None
-    assert cfg.shutdown_policy.external.runtime_below is None
+    # Present but unusable thresholds fail CLOSED (never met), not open (disabled).
+    assert cfg.shutdown_policy.external.battery_below == -1
+    assert cfg.shutdown_policy.external.runtime_below == -1
+
+
+def test_an_unparseable_threshold_fails_closed_instead_of_disabling_its_gate() -> None:
+    """`"300s"` read as None — DISABLED — so the battery gate decided alone and the
+    group fired with the runtime the operator asked for never checked."""
+    from ups_orchestrator.config import ShutdownPolicy
+    from ups_orchestrator.events import _close_to_empty
+    from ups_orchestrator.nut import UpsSnapshot
+
+    policy = ShutdownPolicy.from_dict({"external": {"battery_below": 100, "runtime_below": "300s"}})
+    snap = UpsSnapshot("OB DISCHRG", 99, 3000, 20, 0.0)
+    due, reason = _close_to_empty(policy.external, snap)
+    assert due is False
+    assert "battery 99% <= 100%" in reason and "runtime 50m" in reason
+    # null and blank still mean "this gate is off", and absent still means the default.
+    assert (
+        ShutdownPolicy.from_dict({"external": {"runtime_below": None}}).external.runtime_below
+        is None
+    )
+    assert (
+        ShutdownPolicy.from_dict({"external": {"runtime_below": " "}}).external.runtime_below
+        is None
+    )
+    assert ShutdownPolicy.from_dict({"external": {}}).external.runtime_below == 300
+    assert (
+        ShutdownPolicy.from_dict({"external": {"runtime_below": "240"}}).external.runtime_below
+        == 240
+    )
 
 
 # --- INV-DECLARED, on an ALREADY-DISARMED machine ----------------------------

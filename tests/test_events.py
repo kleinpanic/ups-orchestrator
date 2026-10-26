@@ -2768,3 +2768,11 @@ def test_a_name_collision_does_not_claim_the_box_stays_up() -> None:
     assert "will NOT be shut down" not in pages[0].title, pages[0].title
     assert "DIFFERENT declaration" in pages[0].title
     assert "the box IS shut down" in pages[0].body
+
+
+def test_a_threshold_that_is_not_due_says_so_in_its_reason() -> None:
+    # The NOT_DUE branch rendered `<=`, so a blocked target logged and paged
+    # "battery 80% <= 20%" — the opposite of why it was blocked.
+    verdict, reason = events_mod._threshold_status("battery", 80, 20, lambda p: f"{p}%")
+    assert verdict is events_mod.Threshold.NOT_DUE
+    assert reason == "battery 80% > 20%"
