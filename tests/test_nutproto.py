@@ -30,6 +30,7 @@ from ups_orchestrator.nutproto import (
     ClientListResult,
     FsdResult,
     connect,
+    instcmd,
     list_clients,
     logout,
     set_fsd,
@@ -306,7 +307,12 @@ def test_the_transport_is_a_required_argument() -> None:
     any test that forgot to inject — and the effect of reaching it is a real,
     irreversible FSD on a real UPS.
     """
-    for func, param in ((set_fsd, "send"), (list_clients, "send_block"), (logout, "send")):
+    for func, param in (
+        (set_fsd, "send"),
+        (instcmd, "send"),
+        (list_clients, "send_block"),
+        (logout, "send"),
+    ):
         sig = inspect.signature(func)
         assert param in sig.parameters, f"{func.__name__} lost its transport parameter"
         assert sig.parameters[param].default is inspect.Parameter.empty, (
@@ -468,3 +474,50 @@ def test_logout_is_sent_verbatim_and_never_raises() -> None:
     failing = RecordingSend([], raises=OSError("already closed"))
     assert "LOGOUT failed" in logout(failing)
     assert failing.lines == ["LOGOUT"]
+
+
+# --- INSTCMD ------------------------------------------------------------------
+
+
+def test_instcmd_sends_username_password_then_the_command() -> None:
+    send = RecordingSend(["OK", "OK", "OK"])
+    result = instcmd(send, user=USER, password=PASSWORD, upsname=UPS, command="beeper.mute")
+    assert send.lines == [f"USERNAME {USER}", f"PASSWORD {PASSWORD}", f"INSTCMD {UPS} beeper.mute"]
+    assert result.ok is True
+
+
+def test_instcmd_accepts_a_tracking_ack_only_on_the_command_line() -> None:
+    send = RecordingSend(["OK", "OK", "OK TRACKING 0f3a"])
+    assert instcmd(send, user=USER, password=PASSWORD, upsname=UPS, command="x.y").ok is True
+    send = RecordingSend(["OK TRACKING 0f3a"])
+    result = instcmd(send, user=USER, password=PASSWORD, upsname=UPS, command="x.y")
+    assert result.ok is False and result.failed_line == "USERNAME"
+    assert send.lines == [f"USERNAME {USER}"]  # the password never went on the wire
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "detail"),
+    [
+        ({"upsname": "ups\nFSD other"}, "invalid UPS name"),
+        ({"command": "beeper.mute\nFSD other"}, "invalid command"),
+        ({"user": "u\nFSD other"}, "username contains"),
+        ({"password": "p\nFSD other"}, "password contains"),
+    ],
+)
+def test_instcmd_refuses_injectable_input_and_sends_nothing(kwargs, detail) -> None:
+    send = RecordingSend(["OK", "OK", "OK"])
+    args = {"user": USER, "password": PASSWORD, "upsname": UPS, "command": "beeper.mute"}
+    result = instcmd(send, **{**args, **kwargs})
+    assert result.ok is False and result.failed_line == "VALIDATION"
+    assert detail in result.detail
+    assert send.lines == []
+
+
+def test_instcmd_failure_never_carries_the_password() -> None:
+    send = RecordingSend(["OK", f"ERR ACCESS-DENIED {PASSWORD}"])
+    result = instcmd(send, user=USER, password=PASSWORD, upsname=UPS, command="beeper.mute")
+    assert result.ok is False and result.failed_line == "PASSWORD"
+    assert PASSWORD not in result.detail
+    raising = RecordingSend([], raises=OSError(f"reset while sending {PASSWORD}"))
+    result = instcmd(raising, user=USER, password=PASSWORD, upsname=UPS, command="beeper.mute")
+    assert result.ok is False and PASSWORD not in result.detail
