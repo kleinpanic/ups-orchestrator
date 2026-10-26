@@ -4041,3 +4041,27 @@ def test_remove_reports_loudly_when_the_remote_disarm_could_not_run(
     assert "NOT disarmed" in out
     assert "STILL armed" in out
     assert "disable --now nut-monitor" in out  # the exact manual step
+
+
+def test_add_refuses_a_secondary_user_that_would_inject_upsd_users(
+    cfg_path, add_env, monkeypatch
+) -> None:
+    # `[<user>]` is a section header in the primary's upsd.users: a `]` plus a
+    # newline grants the secondary account whatever directives follow.
+    _write_config(
+        cfg_path,
+        extra={
+            "nut_server": {
+                "listen": ["127.0.0.1", "192.168.1.125"],
+                "secondary_user": "u]\n    instcmds = ALL\n#",
+            }
+        },
+    )
+    ssh = FakeSSH([])
+    monkeypatch.setattr(cli, "_monitor_run_ssh", ssh)
+    rc = cli.main(
+        ["monitor", "add", "mt", "--ssh", "mt", "--ups", "cyberpower", "--ip", "192.168.1.114"]
+    )
+    assert rc == 2
+    assert add_env["users"].read_text() == ""
+    assert ssh.calls == []

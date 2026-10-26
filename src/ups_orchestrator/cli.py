@@ -1170,7 +1170,7 @@ def _resolve_primary_ip(cfg: Config, override: str | None, toward_ip: str) -> st
         return override.strip() if _valid_ip(override) else None
     for addr in cfg.nut_server.listen:
         if addr not in ("127.0.0.1", "::1", "localhost") and _valid_ip(addr):
-            return addr
+            return addr.strip()
     if _valid_ip(toward_ip):
         rc, out, _err = _monitor_run_local_probe(["ip", "-o", "route", "get", toward_ip])
         if rc == 0:
@@ -1886,12 +1886,12 @@ def _monitor_remove(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
 
 
 def _valid_ip(value: str) -> bool:
-    """Any IP literal. Used where either family is legitimate (LISTEN, --primary-ip)."""
-    try:
-        ipaddress.ip_address(value.strip())
-    except ValueError:
-        return False
-    return True
+    """Any IP literal. Used where either family is legitimate (LISTEN, --primary-ip).
+
+    Delegates to ``nutclient.valid_ip`` so the zone-id and control-character rules
+    the remote-shell and NUT-config sinks depend on are spelled once.
+    """
+    return nutclient.valid_ip(value)
 
 
 def _valid_saddr_ip(value: str) -> bool:
@@ -2401,6 +2401,13 @@ def _monitor_add(cfg: Config, cfg_path: Path, argv: list[str]) -> int:
         return 2
 
     ns = cfg.nut_server
+    # `secondary_user` is rendered as the `[<user>]` section header in the primary's
+    # upsd.users and onto the secondary's MONITOR line; a `]` or newline in it would
+    # write further directives (e.g. `instcmds = ALL`) for an account whose password
+    # lives on the secondary.
+    if not nutclient.valid_nut_name(ns.secondary_user):
+        LOG.error("monitor add: invalid nut_server.secondary_user %r", ns.secondary_user)
+        return 2
 
     # LO-C1: a dry run prints the plan and TOUCHES NOTHING — the remote included.
     # This print used to sit BELOW steps 7 and 8, i.e. below two SSH round-trips into

@@ -28,11 +28,15 @@ fi
 # T-03-08: UPSD_LAN_IP is written verbatim into a NUT config as root. A newline
 # would inject an arbitrary directive, so reject anything that is not a bare
 # address before it can reach the file.
-# Delegates to the stdlib rather than a character-class guess: the earlier
-# `case` accepted `...`, `::::` and `1.2.3.4.5.6` while its error message claimed
-# they were not bare IPs, and it rejected a legitimate IPv6 zone id.
+# Delegates to the package's own predicate rather than a character-class guess:
+# the earlier `case` accepted `...`, `::::` and `1.2.3.4.5.6`, and the stdlib-only
+# check that replaced it validated only the text BEFORE a `%`, so a zone id of
+# `x<newline>LISTEN 0.0.0.0` went into the file verbatim.
 _valid_addr() {
-  "$PY" -P -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1].split("%")[0])' "$1" 2>/dev/null
+  "$PY" -P -c 'import sys
+from ups_orchestrator.nutclient import valid_ip
+a = sys.argv[1]
+sys.exit(0 if valid_ip(a) and a == a.strip() else 1)' "$1" 2>/dev/null
 }
 
 # Reuse whatever LAN address is already configured. If there is none, pass
