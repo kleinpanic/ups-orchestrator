@@ -438,6 +438,24 @@ def test_reload_is_inert_while_the_file_does_not_exist_yet(tmp_path) -> None:
     assert store.reload_if_changed() is False  # our own write is not "external"
 
 
+def test_save_without_an_acl_never_runs_the_acl_helpers(monkeypatch, tmp_path, caplog) -> None:
+    # A file with no POSIX ACL has nothing to carry. Shelling out anyway warned
+    # "getfacl unavailable" on every save (every poll) on a host without the `acl`
+    # package, drowning the HI-02 warning that does matter.
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    calls: list[object] = []
+    monkeypatch.setattr(state_mod.subprocess, "run", lambda *a, **_k: calls.append(a))
+    monkeypatch.setattr(state_mod, "_has_posix_acl", lambda _p: False)
+    store = StateStore(path)
+    store.get("ups1").onbatt_since = 1
+    with caplog.at_level("WARNING"):
+        store.save()
+    assert calls == []
+    assert caplog.records == []
+    assert json.loads(path.read_text())["ups1"]["onbatt_since"] == 1
+
+
 def test_save_completes_when_the_acl_helpers_hang(monkeypatch, tmp_path, caplog) -> None:
     # MED-02. _copy_acl is on StateStore.save, which the watch loop runs every poll.
     # An unbounded getfacl on a stale NFS/CIFS mount or a wedged FUSE filesystem
@@ -457,6 +475,8 @@ def test_save_completes_when_the_acl_helpers_hang(monkeypatch, tmp_path, caplog)
         raise subprocess.TimeoutExpired(cmd=argv[0], timeout=kw.get("timeout") or 0)
 
     monkeypatch.setattr(state_mod.subprocess, "run", _hung)
+    # The helpers only run for a destination that carries an ACL to preserve.
+    monkeypatch.setattr(state_mod, "_has_posix_acl", lambda _p: True)
     with caplog.at_level("WARNING"):
         store.save()  # must return, not hang and not raise
 
@@ -648,6 +668,29 @@ def test_a_writer_that_did_not_clear_still_unions(tmp_path: Path) -> None:
 
     reread = StateStore(path)
     assert sorted(reread.get("ups1").shutdowns_sent) == ["mt", "spark"]
+
+
+def test_a_clear_stops_suppressing_the_union_once_it_is_saved(tmp_path: Path) -> None:
+    """The watch loop never reloads its own writes, so a `ledger_cleared` that outlived
+    the save that persisted it kept the union off for the whole outage: a target the
+    event path fired mid-tick was dropped by the next save and fired a second time."""
+    path = tmp_path / "state.json"
+    watch = StateStore(path)
+    st = watch.get("ups1")
+    st.onbatt_since = 2000
+    st.ledger_cleared = True  # outage detected by the poll loop
+    watch.save()
+    watch.reload_if_changed()  # top of the next tick: our own write, no reload
+
+    other = StateStore(path)  # `remote-shutdown` fires spark mid-tick
+    other.get("ups1").shutdowns_sent.append("spark")
+    other.get("ups1").shutdowns_confirmed.append("spark")
+    other.save()
+
+    watch.save()  # end of the tick
+    reread = StateStore(path).get("ups1")
+    assert reread.shutdowns_sent == ["spark"]
+    assert reread.shutdowns_confirmed == ["spark"]
 
 
 def test_the_transient_marker_is_never_persisted(tmp_path: Path) -> None:
