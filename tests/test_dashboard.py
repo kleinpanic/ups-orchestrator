@@ -96,6 +96,16 @@ def test_post_png_noop_without_webhook() -> None:
     assert post_png("", b"x") == (False, 0)
 
 
+def test_post_png_refuses_an_unusable_url_without_raising(monkeypatch) -> None:
+    def _no_network(*_a, **_k):
+        raise AssertionError("urlopen must not be reached")
+
+    monkeypatch.setattr("urllib.request.urlopen", _no_network)
+    # The typo raised ValueError carrying the token; file:// raised TypeError.
+    assert post_png("https//discord.com/api/webhooks/1/SECRETTOKEN", b"x") == (False, 0)
+    assert post_png("file:///etc/passwd", b"x") == (False, 0)
+
+
 def test_post_png_sets_user_agent(monkeypatch) -> None:
     # Discord's edge 403s the default python-urllib UA; the custom one is required.
     import ups_orchestrator.dashboard as dash
