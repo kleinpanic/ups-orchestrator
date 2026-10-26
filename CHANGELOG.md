@@ -46,7 +46,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sparkline from the recorder samples. Honors `NO_COLOR`/non-TTY; `--watch`
   refreshes without flicker.
 
+### Security
+- `control` and `selftest` no longer run `upscmd -u USER -p PASSWORD`, which exposed
+  the NUT admin password to every local user via `/proc/<pid>/cmdline`; instant
+  commands are now sent over the NUT protocol (`nutproto.instcmd`).
+- IPv6 zone ids (`fe80::1%…`) are restricted to interface-name characters and control
+  characters are refused in every IP check. `ipaddress` accepts any text after `%`,
+  which let a `--primary-ip`/`nut_server.listen` value inject commands into the remote
+  `upsc` probe and directives into `upsmon.conf`/`upsd.conf` (including via
+  `deploy/repair-upsd-listen.sh`, run as root).
+- `monitor add` refuses a `nut_server.secondary_user` that is not a NUT name; it is a
+  `[section]` header in `upsd.users`.
+- `power-dashboard`/daily-report image posts use the same webhook URL guard as the
+  notifier, so a malformed URL no longer raises with the token in the traceback.
+
 ### Fixed
+- A shutdown fired by another process mid-tick is no longer dropped from the
+  fire-once ledger (and re-fired) after the watch loop's first ledger clear.
+- An unparseable `battery_below`/`runtime_below` fails closed instead of silently
+  disabling that gate; the NOT_DUE reason now reads `>` instead of `<=`.
+- Non-finite NUT readings (`inf`/`nan`) parse as unknown instead of crashing
+  `read_snapshot` or emitting invalid JSON from `/api/status`.
+- State saves only run `getfacl`/`setfacl` when the file carries an ACL.
+- `maintenance begin --hours nan` and an unwritable marker exit cleanly.
 - **ON BATTERY notification grace**: the poll loop paged Discord the instant it saw
   on-battery, so grid blips *and the orchestrator's own battery self-tests* (which
   transfer to battery for a few seconds) fired false ON BATTERY / POWER RESTORED
