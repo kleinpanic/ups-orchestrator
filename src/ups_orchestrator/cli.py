@@ -954,7 +954,9 @@ def _cmd_maintenance(argv: list[str]) -> int:
 
     max_hours = audit.MAX_MAINTENANCE_SECONDS / 3600.0
     if args.action == "begin":
-        if args.hours <= 0:
+        # `not (> 0)` rather than `<= 0`: NaN passes both bounds checks otherwise and
+        # write_maintenance then refused it with a traceback.
+        if not args.hours > 0:
             _say("maintenance: --hours must be greater than 0")
             return 2
         # Bounded because this suppresses outage alerting; read_maintenance
@@ -963,7 +965,11 @@ def _cmd_maintenance(argv: list[str]) -> int:
             _say(f"maintenance: --hours must be at most {max_hours:g} (re-run to extend)")
             return 2
         until = now + args.hours * 3600.0
-        audit.write_maintenance(path, until=until, reason=args.reason)
+        try:
+            audit.write_maintenance(path, until=until, reason=args.reason)
+        except OSError as exc:  # a planted symlink/FIFO is refused by raising
+            _say(f"maintenance: could not write {path}: {exc}")
+            return 1
         _log_maintenance("maintenance_begin", until=until, reason=args.reason)
         _say(
             f"maintenance window open until "

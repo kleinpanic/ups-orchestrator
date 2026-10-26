@@ -1690,3 +1690,16 @@ def test_the_watch_loop_pings_only_after_a_completed_sweep(env_config, monkeypat
     assert order[0] == "READY=1", order[:3]
     assert order[1] == "tick", "READY must precede the first sweep"
     assert order[2] == "WATCHDOG=1", "the ping must follow the sweep, not precede it"
+
+
+def test_maintenance_begin_refuses_nan_hours_without_a_traceback(env_config, capsys) -> None:
+    # NaN slipped past both `<= 0` and `> max` and write_maintenance then raised.
+    assert cli.main(["maintenance", "begin", "--hours", "nan"]) == 2
+    assert "greater than 0" in capsys.readouterr().out
+
+
+def test_maintenance_begin_reports_an_unwritable_marker(env_config, tmp_path, capsys) -> None:
+    marker = tmp_path / "maintenance.json"
+    marker.symlink_to(tmp_path / "elsewhere.json")  # write_maintenance refuses symlinks
+    assert cli.main(["maintenance", "begin", "--hours", "1"]) == 1
+    assert "could not write" in capsys.readouterr().out
