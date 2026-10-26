@@ -40,6 +40,13 @@ jobs:
       - name: Pytest (with branch coverage gate)
         run: pytest -q --cov --cov-report=term-missing --cov-fail-under=85
 
+      # Runtime deps are empty by design, so this audits what CI and contributors
+      # actually install: the dev tooling and the optional dashboard extra.
+      - name: Dependency audit (pip-audit)
+        run: |
+          python -m pip install pip-audit
+          pip-audit --skip-editable
+
   secrets:
     runs-on: ubuntu-latest
     steps:
