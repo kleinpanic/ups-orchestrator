@@ -9,7 +9,7 @@ and **`serial`**/**`ssh`** are the orchestrator's own opt-in push transports —
 gated by a central policy that requires the UPS to be both on battery and
 close to empty, and disabled by default. It runs well on a Raspberry Pi and has
 no runtime dependencies beyond the standard library and NUT's
-`upsc`/`upscmd` CLIs.
+`upsc` CLI.
 
 ## Architecture at a glance
 

@@ -341,13 +341,36 @@ class ShutdownGroupPolicy:
             return cls(battery_below=default_battery, runtime_below=default_runtime)
         return cls(
             enabled=_as_bool(data.get("enabled"), False),
-            battery_below=(
-                _opt_int(data.get("battery_below")) if "battery_below" in data else default_battery
-            ),
-            runtime_below=(
-                _opt_int(data.get("runtime_below")) if "runtime_below" in data else default_runtime
-            ),
+            battery_below=_threshold(data, "battery_below", default_battery),
+            runtime_below=_threshold(data, "runtime_below", default_runtime),
         )
+
+
+# A threshold no reading can meet (charge and runtime are never negative).
+_UNMEETABLE = -1
+
+
+def _threshold(data: dict[str, object], key: str, default: int | None) -> int | None:
+    """One shutdown-group threshold: absent → default, null/blank → disabled.
+
+    A value that is present but will not parse (``"300s"``, ``"5m"``, ``true``) used
+    to read as ``None`` — DISABLED — so the OTHER gate decided alone and the group
+    fired on battery charge with the runtime the operator asked for never checked.
+    It now fails closed: the gate can never be met, and the load says so.
+    """
+    if key not in data:
+        return default
+    raw = data[key]
+    parsed = _opt_int(raw)
+    if parsed is None and raw is not None and not (isinstance(raw, str) and not raw.strip()):
+        logger.warning(
+            "shutdown threshold %s=%r is not an integer; that gate can never be met, so "
+            "this shutdown group will not fire until it is fixed (use null to disable it)",
+            key,
+            raw,
+        )
+        return _UNMEETABLE
+    return parsed
 
 
 @dataclass(frozen=True)

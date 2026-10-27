@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 
 UPSC_BIN = shutil.which("upsc") or "/bin/upsc"
-UPSCMD_BIN = shutil.which("upscmd") or "/bin/upscmd"
 
 LOG = logging.getLogger("ups_orchestrator.nut")
 
@@ -46,22 +46,34 @@ def _note_upsc_success(ups_name: str) -> None:
 def upscmd(
     ups_name: str, command: str, *, user: str, password: str, timeout: float = 15.0
 ) -> tuple[int, str, str]:
-    """Run an instant command via ``upscmd`` (e.g. ``test.battery.start.quick``).
+    """Run an instant command (e.g. ``test.battery.start.quick``) on ``upsd``.
 
     Needs a NUT admin account (``instcmds``/``actions`` in ``upsd.users``); the
     credentials are the caller's responsibility and must never be logged. Returns
     ``(returncode, stdout, stderr)``; a non-zero code on failure.
+
+    Speaks the NUT protocol directly instead of running the ``upscmd`` binary: its
+    only non-interactive way to take a password is ``-p <password>`` on argv, where
+    any local user can read it from ``/proc/<pid>/cmdline``. ``ups_name`` keeps
+    ``upscmd``'s ``<ups>[@<host>[:<port>]]`` form, defaulting to the local ``upsd``.
     """
+    # Imported here: nutproto -> nutclient -> config, and config sits below nut.
+    from ups_orchestrator import nutproto
+
+    name, _, server = ups_name.partition("@")
+    host, _, port = server.partition(":")
     try:
-        result = subprocess.run(
-            [UPSCMD_BIN, "-u", user, "-p", password, ups_name, command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        with nutproto.connect(
+            host or nutproto.DEFAULT_HOST,
+            int(port) if port else nutproto.DEFAULT_PORT,
+            timeout,
+        ) as (send, _block):
+            result = nutproto.instcmd(
+                send, user=user, password=password, upsname=name, command=command
+            )
+    except (OSError, ValueError) as exc:
         return 1, "", str(exc)
-    return result.returncode, result.stdout.strip(), result.stderr.strip()
+    return (0, "OK", "") if result.ok else (1, "", result.detail)
 
 
 def upsc_var(ups_name: str, key: str, timeout: float = 10.0) -> str | None:
@@ -216,21 +228,26 @@ class UpsSnapshot:
 
 
 def _as_int(value: str | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(float(value))
-    except ValueError:
-        return None
+    number = _as_float(value)
+    return None if number is None else int(number)
 
 
 def _as_float(value: str | None) -> float | None:
+    """Parse a NUT value, or ``None``. Non-finite values are ``None`` as well.
+
+    ``float()`` accepts ``inf``/``nan`` (and ``1e999`` overflows to ``inf``).
+    ``int(inf)`` raised OverflowError — not the ValueError caught here — out of
+    ``read_snapshot`` and failed every tick, event and web request for that UPS;
+    a ``nan`` reached ``/api/status`` as a bare ``NaN``, which is not JSON, so the
+    dashboard's ``fetch().json()`` rejected and the page stopped updating.
+    """
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except ValueError:
         return None
+    return number if math.isfinite(number) else None
 
 
 def read_snapshot(ups_name: str) -> UpsSnapshot:

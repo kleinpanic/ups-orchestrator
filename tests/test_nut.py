@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from ups_orchestrator import nut
+import contextlib
+
+from ups_orchestrator import nut, nutproto
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
 
@@ -124,32 +126,61 @@ def test_load_assessment_thresholds() -> None:
     assert snap.load_is_high is False
 
 
-def test_upscmd_success_and_failure(monkeypatch) -> None:
-    class Result:
-        def __init__(self, rc, out="", err=""):
-            self.returncode, self.stdout, self.stderr = rc, out, err
+class _FakeUpsd:
+    """Stands in for ``nutproto.connect``: records the address and every line sent."""
 
-    calls = []
+    def __init__(self, responses: list[str], *, refuse: bool = False) -> None:
+        self.responses = list(responses)
+        self.refuse = refuse
+        self.address: tuple[object, ...] = ()
+        self.lines: list[str] = []
 
-    def fake_run(args, **_kw):
-        calls.append(args)
-        return Result(0, "OK\n", "")
+    @contextlib.contextmanager
+    def __call__(self, *address: object):
+        self.address = address
+        if self.refuse:
+            raise ConnectionRefusedError(111, "Connection refused")
 
-    monkeypatch.setattr(nut.subprocess, "run", fake_run)
+        def send(line: str) -> str:
+            self.lines.append(line)
+            return self.responses.pop(0)
+
+        yield send, None
+
+
+def test_upscmd_never_puts_the_password_on_a_command_line(monkeypatch) -> None:
+    # The `upscmd` binary only takes a password non-interactively as `-p <pw>`,
+    # which any local user can read from /proc/<pid>/cmdline. No process at all
+    # may be spawned now; the conftest tripwire fails the test if one is.
+    upsd = _FakeUpsd(["OK", "OK", "OK"])
+    monkeypatch.setattr(nutproto, "connect", upsd)
     rc, out, err = nut.upscmd("ups1", "test.battery.start.quick", user="admin", password="pw")
-    assert rc == 0 and out == "OK"
-    assert calls[0][:1] == [nut.UPSCMD_BIN]
-    assert "admin" in calls[0] and "pw" in calls[0]
-    assert calls[0][-2:] == ["ups1", "test.battery.start.quick"]
+    assert (rc, out, err) == (0, "OK", "")
+    assert upsd.address == (nutproto.DEFAULT_HOST, nutproto.DEFAULT_PORT, 15.0)
+    assert upsd.lines == ["USERNAME admin", "PASSWORD pw", "INSTCMD ups1 test.battery.start.quick"]
 
 
-def test_upscmd_handles_oserror(monkeypatch) -> None:
-    def boom(*_a, **_k):
-        raise OSError("upscmd missing")
+def test_upscmd_honours_a_host_and_port_in_the_ups_name(monkeypatch) -> None:
+    upsd = _FakeUpsd(["OK", "OK", "OK TRACKING 1a2b"])
+    monkeypatch.setattr(nutproto, "connect", upsd)
+    rc, _out, _err = nut.upscmd("ups1@nas:3494", "beeper.mute", user="u", password="p")
+    assert rc == 0
+    assert upsd.address == ("nas", 3494, 15.0)
+    assert upsd.lines[-1] == "INSTCMD ups1 beeper.mute"
 
-    monkeypatch.setattr(nut.subprocess, "run", boom)
+
+def test_upscmd_reports_a_refusal_without_the_password(monkeypatch) -> None:
+    upsd = _FakeUpsd(["OK", "ERR ACCESS-DENIED"])
+    monkeypatch.setattr(nutproto, "connect", upsd)
+    rc, _out, err = nut.upscmd("ups1", "beeper.mute", user="u", password="hunter2")
+    assert rc == 1 and "ACCESS-DENIED" in err and "hunter2" not in err
+    assert len(upsd.lines) == 2  # stopped at the refused PASSWORD line
+
+
+def test_upscmd_handles_an_unreachable_upsd(monkeypatch) -> None:
+    monkeypatch.setattr(nutproto, "connect", _FakeUpsd([], refuse=True))
     rc, _out, err = nut.upscmd("ups1", "x", user="u", password="p")
-    assert rc == 1 and "upscmd missing" in err
+    assert rc == 1 and "refused" in err
 
 
 class _R:
@@ -195,6 +226,18 @@ def test_numeric_parsers_reject_garbage() -> None:
     assert nut._as_int(None) is None
     assert nut._as_float("nope") is None
     assert nut._as_float(None) is None
+
+
+def test_non_finite_values_parse_as_unknown_instead_of_raising(monkeypatch) -> None:
+    # int(float("inf")) raised OverflowError, which escaped read_snapshot; a NaN
+    # reached /api/status as bare `NaN`, which is not valid JSON.
+    for raw in ("inf", "-inf", "nan", "1e999"):
+        assert nut._as_int(raw) is None
+        assert nut._as_float(raw) is None
+    values = {"ups.status": "OL", "battery.runtime": "inf", "input.voltage": "nan"}
+    monkeypatch.setattr(nut, "upsc_vars", lambda _name: values)
+    snap = read_snapshot("ups1")
+    assert snap.runtime_seconds is None and snap.input_voltage is None
 
 
 # --- upsc failure is no longer silent ----------------------------------------

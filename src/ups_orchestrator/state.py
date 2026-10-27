@@ -307,7 +307,12 @@ def replace_preserving_metadata(tmp_path: Path, dest_path: Path) -> None:
         # (HI-02). `setfacl --set-file` also rewrites the mode bits from the ACL, and
         # the chmod that follows re-applies the destination's own mode — whose group
         # bits are the destination's mask — so the net ACL is unchanged either way.
-        acl_carried = _copy_acl(dest_path, tmp_path)
+        #
+        # Only when there IS an ACL to carry. Shelling out unconditionally warned
+        # "getfacl unavailable" on every save — every poll — on a host without the
+        # `acl` package even though the file had nothing to lose, burying the one
+        # warning that matters (HI-02's withheld group bits) in noise.
+        acl_carried = _has_posix_acl(dest_path) and _copy_acl(dest_path, tmp_path)
         try:
             os.chmod(tmp_path, _preserved_mode(dest_path, st, acl_carried=acl_carried))
         except OSError as exc:
@@ -633,3 +638,9 @@ class StateStore:
         self._seen = write_text_preserving_metadata(
             self.path, json.dumps(payload, indent=2, sort_keys=True) + "\n"
         )
+        # The clear is on disk now, so it has done its job. Left set, it disabled the
+        # union for the rest of this process's life (the watch loop never reloads its
+        # own writes): a `remote-shutdown` or event dispatch that fired a target
+        # mid-tick was dropped by our next save, and the next tick fired it AGAIN.
+        for st in self._states.values():
+            st.ledger_cleared = False

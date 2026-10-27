@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 
 from ups_orchestrator.config import Config
+from ups_orchestrator.notify import usable_webhook_url
 from ups_orchestrator.nut import UpsSnapshot, read_snapshot
 
 # Per-UPS line colours, assigned in config order and reused for the cards.
@@ -437,8 +438,14 @@ def post_png(
     avatar_url: str = "",
     timeout: float = 15.0,
 ) -> tuple[bool, int]:
-    """Upload the PNG to a Discord webhook as an attachment. Returns (ok, status)."""
-    if not webhook_url:
+    """Upload the PNG to a Discord webhook as an attachment. Returns (ok, status).
+
+    Gated on the same ``usable_webhook_url`` as the notifier (F1): a scheme typo
+    (``https//…``) made ``Request`` raise a ValueError whose message — and so the
+    daily report's traceback in the journal — carried the whole URL, token included,
+    and ``file://`` raised TypeError from ``200 <= None``.
+    """
+    if not usable_webhook_url(webhook_url):
         return False, 0
     payload: dict[str, object] = {"username": username}
     if content:

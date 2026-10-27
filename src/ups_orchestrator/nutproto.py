@@ -91,6 +91,7 @@ _LINE_PASSWORD = "PASSWORD"
 _LINE_FSD = "FSD"
 _LINE_VALIDATION = "VALIDATION"
 _LINE_LIST_CLIENT = "LIST CLIENT"
+_LINE_INSTCMD = "INSTCMD"
 
 
 # --- injected transport types (mirror nutclient's runner types) ----------------
@@ -230,6 +231,55 @@ def set_fsd(send: Send, *, user: str, password: str, upsname: str) -> FsdResult:
             detail = f"{name} refused: {_scrub(response.strip(), password)!r}"
             return FsdResult(ok=False, upsname=upsname, failed_line=name, detail=detail)
     return FsdResult(ok=True, upsname=upsname, failed_line="", detail=f"FSD set on {upsname}")
+
+
+def instcmd(send: Send, *, user: str, password: str, upsname: str, command: str) -> FsdResult:
+    """Run one instant command (``INSTCMD <upsname> <command>``). Returns, never raises.
+
+    The protocol-level replacement for shelling out to ``upscmd -u USER -p PASSWORD``,
+    which put the NUT admin password on argv — readable by every local user through
+    ``/proc/<pid>/cmdline`` and ``ps`` for as long as the command ran. Here the
+    password only ever crosses the socket. Same validation and stop-at-first-refusal
+    discipline as :func:`set_fsd`; the result reuses :class:`FsdResult` because it
+    carries the same fields (and, like it, never the credential).
+    """
+    for value, what in ((upsname, "UPS name"), (command, "command")):
+        if not valid_nut_name(value):
+            return FsdResult(
+                ok=False,
+                upsname=upsname,
+                failed_line=_LINE_VALIDATION,
+                detail=f"invalid {what}: {value!r}",
+            )
+    for value, what in ((user, "username"), (password, "password")):
+        if not _valid_credential(value):
+            return FsdResult(
+                ok=False,
+                upsname=upsname,
+                failed_line=_LINE_VALIDATION,
+                detail=f"{what} contains a control character",
+            )
+
+    exchange = (
+        (_LINE_USERNAME, f"USERNAME {user}"),
+        (_LINE_PASSWORD, f"PASSWORD {password}"),
+        (_LINE_INSTCMD, f"INSTCMD {upsname} {command}"),
+    )
+    for name, line in exchange:
+        try:
+            response = send(line)
+        except Exception as exc:
+            detail = f"{name} failed: {type(exc).__name__}: {_scrub(str(exc), password)}"
+            return FsdResult(ok=False, upsname=upsname, failed_line=name, detail=detail)
+        reply = response.strip()
+        # INSTCMD alone may answer `OK TRACKING <id>` (a server with tracking enabled).
+        tracked = name == _LINE_INSTCMD and reply.startswith("OK TRACKING ")
+        if reply != _OK and not tracked:
+            detail = f"{name} refused: {_scrub(response.strip(), password)!r}"
+            return FsdResult(ok=False, upsname=upsname, failed_line=name, detail=detail)
+    return FsdResult(
+        ok=True, upsname=upsname, failed_line="", detail=f"{command} sent to {upsname}"
+    )
 
 
 def list_clients(send_block: SendBlock, *, upsname: str) -> ClientListResult:

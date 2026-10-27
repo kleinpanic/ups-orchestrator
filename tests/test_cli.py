@@ -25,6 +25,10 @@ def env_config(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("UPS_ORCH_EVENT_LOG", str(tmp_path / "events.jsonl"))
     monkeypatch.setenv("UPS_ORCH_NOTIFICATION_LOG", str(tmp_path / "notify.jsonl"))
     monkeypatch.setenv("UPS_ORCH_SAMPLES", str(tmp_path / "samples.jsonl"))
+    # Without these two, `boot-audit` and `maintenance` fell back to the live
+    # /var/lib marker (or, off-box, a file in the repo root) and the suite wrote it.
+    monkeypatch.setenv("UPS_ORCH_BOOT_AUDIT_STATE", str(tmp_path / "boot-audit.json"))
+    monkeypatch.setenv("UPS_ORCH_MAINTENANCE_STATE", str(tmp_path / "maintenance.json"))
     return cfg
 
 
@@ -83,11 +87,15 @@ def test_audit_command_prints(env_config, monkeypatch, capsys) -> None:
     assert capsys.readouterr().out.strip()
 
 
-def test_boot_audit_command(env_config, monkeypatch) -> None:
+def test_boot_audit_command(env_config, monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("ups_orchestrator.audit._current_boot_id", lambda: "b1")
     monkeypatch.setattr("ups_orchestrator.audit._journal_current_boot", lambda: [])
     monkeypatch.setattr("ups_orchestrator.audit.read_snapshot", lambda _n: _SNAP)
+    monkeypatch.setattr(cli, "_BASE", tmp_path / "repo")
+    monkeypatch.setattr(cli, "_BOOT_AUDIT_MARKER", tmp_path / "var" / "boot-audit.json")
     assert cli.main(["boot-audit"]) == 0
+    assert (tmp_path / "boot-audit.json").exists()  # the fixture's marker, nothing else
+    assert not (tmp_path / "repo").exists() and not (tmp_path / "var").exists()
 
 
 def test_notify_test_print(env_config, monkeypatch, capsys) -> None:
@@ -1682,3 +1690,16 @@ def test_the_watch_loop_pings_only_after_a_completed_sweep(env_config, monkeypat
     assert order[0] == "READY=1", order[:3]
     assert order[1] == "tick", "READY must precede the first sweep"
     assert order[2] == "WATCHDOG=1", "the ping must follow the sweep, not precede it"
+
+
+def test_maintenance_begin_refuses_nan_hours_without_a_traceback(env_config, capsys) -> None:
+    # NaN slipped past both `<= 0` and `> max` and write_maintenance then raised.
+    assert cli.main(["maintenance", "begin", "--hours", "nan"]) == 2
+    assert "greater than 0" in capsys.readouterr().out
+
+
+def test_maintenance_begin_reports_an_unwritable_marker(env_config, tmp_path, capsys) -> None:
+    marker = tmp_path / "maintenance.json"
+    marker.symlink_to(tmp_path / "elsewhere.json")  # write_maintenance refuses symlinks
+    assert cli.main(["maintenance", "begin", "--hours", "1"]) == 1
+    assert "could not write" in capsys.readouterr().out

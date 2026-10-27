@@ -878,7 +878,7 @@ def _threshold_status(
         return Threshold.UNKNOWN, f"{label} unknown but its threshold is set"
     if value <= threshold:
         return Threshold.DUE, f"{label} {render(value)} <= {render(threshold)}"
-    return Threshold.NOT_DUE, f"{label} {render(value)} <= {render(threshold)}"
+    return Threshold.NOT_DUE, f"{label} {render(value)} > {render(threshold)}"
 
 
 def _close_to_empty(group: ShutdownGroupPolicy, snap: UpsSnapshot) -> tuple[bool, str]:
